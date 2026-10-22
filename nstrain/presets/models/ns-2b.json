@@ -1,0 +1,22 @@
+{
+ "vocab_size": 130560,
+ "D": 2048,
+ "num_layers": 24,
+ "D_ff": 1024,
+ "D_key": 2048,
+ "D_value": 2048,
+ "hippocampal_heads": 8,
+ "hippocampal_pkm_value_dim": 1024,
+ "lexical_memory_rows": [
+  130560,
+  262139,
+  344951
+ ],
+ "lexical_memory_head_dims": [
+  128,
+  16,
+  16
+ ],
+ "rope_max_seq_len": 32768,
+ "rope_base": 500000.0
+}

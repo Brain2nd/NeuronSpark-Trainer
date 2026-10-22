@@ -1,0 +1,12 @@
+{
+ "vocab_size": 130560,
+ "num_layers": 8,
+ "hippocampal_pool_value_residual_anchor": [[0.5, 0.5]],
+ "lexical_memory_rows": [
+  130560,
+  262139,
+  344951
+ ],
+ "rope_max_seq_len": 32768,
+ "rope_base": 500000.0
+}

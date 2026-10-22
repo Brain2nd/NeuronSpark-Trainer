@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nstrain"
+version = "1.0.0"
+description = "The trainer of NeuronSpark language models: streaming data lines, CUDA-graph training, exact resume, supervision"
+readme = "README.md"
+license = {file = "LICENSE"}
+requires-python = ">=3.10"
+# The training environment provides torch, triton, numpy, safetensors, wandb, tokenizers, pyarrow, huggingface_hub
+# and NeuronSpark; they are not declared here, so installing the trainer never changes a pinned version (a different
+# tokenizers version makes every data line refuse to load).
+dependencies = []
+
+[project.urls]
+Repository = "https://github.com/Brain2nd/NeuronSpark-Trainer"
+
+[project.scripts]
+nstrain = "nstrain.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["nstrain*"]
+
+[tool.setuptools.package-data]
+nstrain = ["presets/models/*.json"]
