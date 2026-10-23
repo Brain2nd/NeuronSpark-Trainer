@@ -17,8 +17,9 @@ Trainer (``python -m nstrain train RUN``, own session, output appended to ``<run
   needs a human); exit 0 (done, stopped, data exhausted) ends the line;
 * exit 3 (another process on the GPU, or the GPU lease held): wait until the GPU is free (nvidia-smi on the training
   device; when nvidia-smi itself fails the wait ends and the trainer's own check decides, a counted failure), pause,
-  relaunch; exit 4 (another trainer still holds the line, e.g. one writing its last checkpoint): wait for it; neither
-  is a failure;
+  relaunch; any other abnormal exit while another process is on the GPU (a kernel fault under time-slicing, see
+  nstrain.gpu) is handled the same way; exit 4 (another trainer still holds the line, e.g. one writing its last
+  checkpoint): wait for it; none of these is a failure;
 * exit 5 (not enough disk space for the next checkpoints): stop, the line needs the operator;
 * watchdog: a heartbeat older than ``supervisor.stall_s`` (and older than this launch) means a stalled trainer (e.g. a
   GPU hang): SIGKILL by PID, restart like a crash; a trainer that does not exit within 120 s of the kill is reported
@@ -363,6 +364,10 @@ class LineSupervisor:
                 self.record(state="needs operator")
                 self.event("needs operator", msg)
                 return rc
+            if rc not in (exits.GPU_BUSY, exits.LINE_BUSY) and gpu_state() == "busy":
+                self.say(f"trainer exited {rc} after {time.time() - start:.0f} s with another process on the GPU; "
+                         f"not a failure (latest {self.latest()})")
+                rc = exits.GPU_BUSY
             if rc == exits.GPU_BUSY:
                 self.record(state="waiting for the GPU")
                 failed = []
