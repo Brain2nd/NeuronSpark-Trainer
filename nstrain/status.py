@@ -73,7 +73,8 @@ def format_status(s: dict) -> str:
     if sup is not None:
         L.append(f"  supervisor pid {sup['pid']} {'running' if sup['alive'] else 'not running'} ({sup.get('state')}); "
                  f"launches {sup.get('launches')}, failures without progress {sup.get('fails')}, "
-                 f"trainer pid {sup.get('trainer_pid')}")
+                 f"trainer pid {sup.get('trainer_pid')}"
+                 + (" (beside other processes)" if sup.get("gpu") == "shared" else ""))
         if sup.get("last_event"):
             e = sup["last_event"]
             L.append(f"  last event {e['time']}: {e['event']}: {e['message']}")

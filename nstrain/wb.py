@@ -168,10 +168,14 @@ class Tracker:
 
     # ------------------------------------------------------------------ use
     def check_replay(self, step: int, metrics: dict, keys=("train/loss", "train/grad_norm"),
-                     rtol: float = 1e-3) -> bool:
-        """True if ``step`` is not on the server or matches it; consumed entries are dropped."""
+                     rtol: float = 1e-3, shared: int = None) -> bool:
+        """True if ``step`` is not on the server or matches it; consumed entries are dropped.  ``shared``: the GPU mode
+        of this computation (``sys/gpu_shared``); a server row of the other mode used the other micro-batch shape, so
+        it is not compared (a different split of the same update)."""
         row = self.replay.pop(step, None)
         if row is None:
+            return True
+        if shared is not None and int(row.get("sys/gpu_shared") or 0) != shared:
             return True
         for k in keys:
             a, b = row.get(k), metrics.get(k)

@@ -15,7 +15,8 @@
     nstrain status RUN [--json]
     nstrain stop RUN [--at-cycle-end K | --now]   nstrain rollback RUN --to UPDATE [--force]
     nstrain bench --model ns-2b --seq-len 4096 --rows 4 --accum 4 [--ac none|dendritic|all] [--profile]
-    nstrain tune RUN [--margin-gib 10] [--dry-run]   the fastest shape per length that fits the GPU, into run.json
+    nstrain tune RUN [--margin-gib 10] [--dry-run] [--shared]   the fastest shape per length that fits the GPU (beside
+                                                    other processes: --shared), into run.json
     nstrain presets
 
 RUN is a line's run directory (or its run.json).  Host settings: nstrain.host.
@@ -149,12 +150,17 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--ac", default="none", help="activation recomputation: none, dendritic, all, or the number of "
                                                 "dendritic layers recomputed")
     p.add_argument("--profile", action="store_true")
+    p.add_argument("--shared", action="store_true", help="beside other processes on the GPU (no check for them)")
+    p.add_argument("--max-gib", type=float, help="PyTorch memory cap of the process (out of memory past it)")
     p.add_argument("--top", type=int, default=60)
     p = sub.add_parser("tune", help="the fastest shape of every sequence length that fits the GPU, into run.json")
     p.add_argument("run")
     p.add_argument("--margin-gib", type=float, default=10.0)
     p.add_argument("--updates", type=int, default=4, help="complete updates per measured shape (the first is warm-up)")
     p.add_argument("--dry-run", action="store_true", help="measure and report only")
+    p.add_argument("--shared", action="store_true",
+                   help="the shapes beside other processes, leaving guards.share_reserve_gb to them "
+                        "(lengths.<L>.shared)")
     sub.add_parser("presets")
     return ap
 
@@ -318,17 +324,23 @@ def _dispatch(a) -> int:
         print(ops.rollback(a.run, a.to, a.force))
         return 0
     if a.cmd == "bench":
+        import signal
+        from nstrain.proc import TUNE, die_with_parent
+        die_with_parent(TUNE, signal.SIGTERM)                       # a tune's measurement ends with the tune
         from nstrain import bench
         from nstrain import config
         model = config.load(a.run).model if a.run else a.model
         if a.profile:
             bench.profile(model, a.rows, a.seq_len, a.ac, a.top)
         else:
-            bench.bench(model, a.rows, a.seq_len, a.accum, a.updates, a.ac, a.result, a.skip)
+            bench.bench(model, a.rows, a.seq_len, a.accum, a.updates, a.ac, a.result, a.skip, a.shared, a.max_gib)
         return 0
     if a.cmd == "tune":
+        import signal
+        from nstrain.proc import SUPERVISOR, die_with_parent
+        die_with_parent(SUPERVISOR, signal.SIGTERM)                 # a supervisor's tune ends with the supervisor
         from nstrain import bench
-        bench.tune(a.run, a.margin_gib, a.updates, write=not a.dry_run)
+        bench.tune(a.run, a.margin_gib, a.updates, write=not a.dry_run, shared=a.shared)
         return 0
     if a.cmd == "presets":
         from nstrain import model

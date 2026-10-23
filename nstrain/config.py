@@ -13,14 +13,19 @@ produces lives next to it (checkpoints/, run.log, heartbeat, wandb_run.json, sup
      "tokens_per_update": 1048576,            # the same for every sequence length
      "lengths": {"4096": {"micro_rows": 4, "activation_checkpointing": false},
                  "32768": {"micro_rows": 1, "activation_checkpointing": 3}},   # false | k (the first k dendritic
-                                                    # layers) | true (every dendritic layer) | "all" (every layer)
+                                                    # layers) | true (every dendritic layer) | "all" (every layer);
+                                                    # optional "shared": {micro_rows, activation_checkpointing,
+                                                    # reserve_gb}, the shape beside other processes measured for
+                                                    # that reserve (`nstrain tune --shared`)
      "optimizer": {"peak_lr": 3e-4, "betas": [0.9, 0.95], "eps": 1e-8, "weight_decay": 0.1,
                    "lexical_lr_mult": 8.0, "grad_clip": 1.0},
      "schedule": [{"from": 0, "to": 2e9, "kind": "warmup"}, {"from": 2e9, "to": null, "kind": "constant"}],
      "checkpoints": {"every_tokens": 2e9, "keep_last": 3},
      "validation": {"every_tokens": 2e9, "rows": 16},
      "stop_at_tokens": null,                  # no update starts at or past it
-     "guards": {"max_skipped_in_a_row": 10, "gpu_check_every": 50, "allow_shared_gpu": false},
+     "guards": {"max_skipped_in_a_row": 10, "gpu_check_every": 50, "allow_shared_gpu": false,
+                "share_reserve_gb": null},    # null: the GPU to itself; a number: train beside other processes
+                                              # while they use at most this much memory (see nstrain.gpu)
      "supervisor": {"max_fails": 5, "stall_s": 1800, "restart_pause_s": 30, "gpu_wait_s": 60, "prepare": true,
                     "preparer": {"lookahead": 1, "min_free_gb": 200, "dl_workers": 8, "tok_workers": 8, "rayon": 8}},
      "allow_changes": [],                     # FROZEN keys allowed to differ from the line's checkpoints (on purpose)
@@ -51,9 +56,19 @@ RUN_FILE = "run.json"
 
 
 @dataclass
-class Length:
+class Shape:
     micro_rows: int
     activation_checkpointing: Union[bool, str, int] = False
+
+
+@dataclass
+class SharedShape(Shape):
+    reserve_gb: Optional[float] = None              # the reserve it was measured for (guards.share_reserve_gb)
+
+
+@dataclass
+class Length(Shape):
+    shared: Optional[SharedShape] = None            # the shape beside other processes (guards.share_reserve_gb)
 
 
 @dataclass
@@ -83,6 +98,7 @@ class Guards:
     max_skipped_in_a_row: int = 10
     gpu_check_every: int = 50
     allow_shared_gpu: bool = False
+    share_reserve_gb: Optional[float] = None
 
 
 @dataclass
@@ -139,14 +155,18 @@ class RunConfig:
     def ckpt_dir(self) -> Path:
         return self.run_dir / "checkpoints"
 
-    def length(self, seq_len: int) -> Length:
+    def length(self, seq_len: int, shared: bool = False) -> Shape:
+        """The engine shape of a sequence length: its own, or (``shared``) the one beside other processes."""
         if seq_len not in self.lengths:
             raise ValueError(f"{self.name}: no settings for sequence length {seq_len} "
                              f"(lengths: {sorted(self.lengths)})")
-        return self.lengths[seq_len]
+        s = self.lengths[seq_len]
+        if shared and s.shared is None:
+            raise ValueError(f"{self.name}: lengths.{seq_len} has no shared shape (`nstrain tune --shared`)")
+        return s.shared if shared else s
 
-    def accum(self, seq_len: int) -> int:
-        return self.tokens_per_update // (self.length(seq_len).micro_rows * seq_len)
+    def accum(self, seq_len: int, shared: bool = False) -> int:
+        return self.tokens_per_update // (self.length(seq_len, shared).micro_rows * seq_len)
 
     def to_dict(self) -> dict:
         """The JSON form (as in run.json; stored in every checkpoint)."""
@@ -237,15 +257,21 @@ def validate(c: RunConfig) -> List[str]:
     if not c.lengths:
         p.append("lengths: at least one sequence length")
     for L, s in c.lengths.items():
-        if L <= 0 or s.micro_rows <= 0:
-            p.append(f"lengths.{L}: sequence length and micro_rows must be positive")
-        elif c.tokens_per_update % (s.micro_rows * L):
-            p.append(f"lengths.{L}: tokens_per_update {c.tokens_per_update} is not a multiple of micro_rows x seq_len "
-                     f"= {s.micro_rows * L}")
-        a = s.activation_checkpointing
-        if not (isinstance(a, bool) or a == "all" or (isinstance(a, int) and a >= 1)):
-            p.append(f"lengths.{L}.activation_checkpointing must be false, true, \"all\" or a number of dendritic "
-                     "layers >= 1")
+        for where, x in ((f"lengths.{L}", s), (f"lengths.{L}.shared", s.shared)):
+            if x is None:
+                continue
+            if L <= 0 or x.micro_rows <= 0:
+                p.append(f"{where}: sequence length and micro_rows must be positive")
+            elif c.tokens_per_update % (x.micro_rows * L):
+                p.append(f"{where}: tokens_per_update {c.tokens_per_update} is not a multiple of micro_rows x "
+                         f"seq_len = {x.micro_rows * L}")
+            a = x.activation_checkpointing
+            if not (isinstance(a, bool) or a == "all" or (isinstance(a, int) and a >= 1)):
+                p.append(f"{where}.activation_checkpointing must be false, true, \"all\" or a number of dendritic "
+                         "layers >= 1")
+            r = getattr(x, "reserve_gb", None)
+            if r is not None and not r > 0:
+                p.append(f"{where}.reserve_gb must be positive (or null)")
     o = c.optimizer
     if not o.peak_lr > 0:
         p.append("optimizer.peak_lr must be positive")
@@ -266,6 +292,10 @@ def validate(c: RunConfig) -> List[str]:
     g = c.guards
     if g.max_skipped_in_a_row < 0 or g.gpu_check_every < 1:
         p.append("guards: max_skipped_in_a_row >= 0, gpu_check_every >= 1")
+    if g.share_reserve_gb is not None and not g.share_reserve_gb > 0:
+        p.append("guards.share_reserve_gb must be positive (or null)")
+    if g.share_reserve_gb is not None and g.allow_shared_gpu:
+        p.append("guards: share_reserve_gb and allow_shared_gpu exclude each other")
     s = c.supervisor
     if s.max_fails < 1 or not s.stall_s > 0 or s.restart_pause_s < 0 or not s.gpu_wait_s > 0:
         p.append("supervisor: max_fails >= 1, stall_s and gpu_wait_s positive, restart_pause_s >= 0")

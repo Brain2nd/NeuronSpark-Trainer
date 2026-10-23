@@ -27,10 +27,14 @@ waiting for data).  Each cycle end and each change of sequence length (a stage e
 of the old length, also when that update's checkpoint was a rolling one or the run resumed from it) is a kept
 checkpoint; the data preparer is told a cycle is consumed only after that checkpoint is on disk, and is told the cycle
 in training when the trainer starts.  Exit codes (nstrain.exits): 0 done / stopped / the line's data is exhausted, 3
-another process uses the GPU, 4 another trainer holds the line, 5 not enough disk space for the next checkpoints
-(checked after every update; a checkpoint is written while there is room), 1 failure (also when nvidia-smi fails: at
-start, or at three checks in a row, then after a checkpoint).  Started by a supervisor (``NSTRAIN_SUPERVISOR_PID``),
-the trainer gets SIGTERM when the supervisor dies.
+another process uses the GPU (beside other processes: they use more than ``guards.share_reserve_gb``), 4 another
+trainer holds the line, 5 not enough disk space for the next checkpoints (checked after every update; a checkpoint is
+written while there is room), 6 beside other processes, and they left (relaunch with the GPU to itself), 1 failure
+(also when nvidia-smi fails: at start, or at three checks in a row, then after a checkpoint).  The GPU is checked every
+``guards.gpu_check_every`` updates; a change of the GPU's occupancy ends the run with a checkpoint.  Beside other
+processes (``$NSTRAIN_GPU_MODE=shared``, set by the supervisor, see nstrain.gpu) every length trains with its
+``shared`` shape.  Started by a supervisor (``NSTRAIN_SUPERVISOR_PID``), the trainer gets SIGTERM when the supervisor
+dies.
 """
 from __future__ import annotations
 
@@ -58,7 +62,8 @@ from nstrain.ckpt import Checkpoints, snapshot
 from nstrain.data.batches import Line, Prefetch, val_rows
 from nstrain.engine import StepEngine
 from nstrain.flat_adamw import FlatAdamW
-from nstrain.gpu import GpuBusy, GpuCheckFailed, lease, other_processes
+from nstrain.gpu import (GPU_MODE, GpuBusy, GpuCheckFailed, GpuFree, beside_limit_gib, cap_memory, lease,
+                         other_processes, others_gb)
 from nstrain.wb import RunRecord, Tracker
 
 
@@ -119,15 +124,26 @@ class Trainer:
         except BlockingIOError:
             raise LineBusy(f"another trainer holds {self.root / 'trainer.lock'}") from None
         self._beat("start")
+        self.shared = os.environ.get(GPU_MODE) == "shared"
+        if self.shared and c.guards.share_reserve_gb is None:
+            raise RuntimeError(f"${GPU_MODE}=shared needs guards.share_reserve_gb")
         if not c.guards.allow_shared_gpu:                           # before any CUDA initialisation
             self._lease = lease(str(self.root))
             others = other_processes(exclude_pid=os.getpid())
-            if others:
+            if self.shared and not others:
+                raise GpuFree("no other process on the GPU: the line trains with the GPU to itself")
+            if self.shared and others_gb(exclude_pid=os.getpid()) > c.guards.share_reserve_gb:
+                raise GpuBusy(f"other processes on the GPU use more than the {c.guards.share_reserve_gb:g} GB "
+                              f"reserved for them: {others}")
+            if others and not self.shared:
                 raise GpuBusy(f"other processes on the GPU: {others}; training needs the GPU to itself "
                               "(guards.allow_shared_gpu overrides)")
         problems = preflight(c)
         if problems:
             raise RuntimeError("cannot start: " + "; ".join(problems))
+        if self.shared:                                              # out of memory before the reserve is touched
+            total = torch.cuda.get_device_properties(torch.cuda.current_device()).total_memory / 2**30
+            cap_memory(beside_limit_gib(total, c.guards.share_reserve_gb))
         self.model_cfg = c.model
         self.ckpts = Checkpoints(c.ckpt_dir, keep_last=c.checkpoints.keep_last)
         self.line = Line(c.data_work, c.tokens_per_update, seed=c.data_seed)
@@ -351,12 +367,12 @@ class Trainer:
             torch.cuda.empty_cache()
         c = self.cfg
         self._beat(f"capturing the {L} engine")
-        s = c.length(L)
+        s, accum = c.length(L, self.shared), c.accum(L, self.shared)
         M.recompute(self.model, s.activation_checkpointing)
         t0 = time.time()
-        self.engine = StepEngine(self.model, self.opt, s.micro_rows, L, c.accum(L), c.optimizer.grad_clip)
-        print(f"engine {c.accum(L)} x {s.micro_rows} x {L} captured in {time.time() - t0:.0f} s, "
-              f"{torch.cuda.memory_allocated() / 2**30:.1f} GiB", flush=True)
+        self.engine = StepEngine(self.model, self.opt, s.micro_rows, L, accum, c.optimizer.grad_clip)
+        print(f"engine {accum} x {s.micro_rows} x {L}{' (beside other processes)' if self.shared else ''} captured "
+              f"in {time.time() - t0:.0f} s, {torch.cuda.memory_allocated() / 2**30:.1f} GiB", flush=True)
         self._beat(f"{L} engine captured")
         return self.engine
 
@@ -390,7 +406,7 @@ class Trainer:
         if L not in self.val:
             self.val[L] = val_rows(self.cfg.val_work, L, rows)
         out, tot, n = {}, 0.0, 0
-        mb = self.cfg.length(L).micro_rows
+        mb = self.cfg.length(L, self.shared).micro_rows
         for name, arr in self.val[L].items():
             self._beat(f"validation {name}")
             s, k = 0.0, 0
@@ -420,20 +436,24 @@ class Trainer:
         print(f"update {self.update}: stage end ({self.prev_shape['seq_len']} -> {u.seq_len}), kept checkpoint",
               flush=True)
 
-    def _gpu_check(self, row: dict) -> list:
-        """Other processes on the GPU ([] if none); a failed check counts, three in a row raise."""
+    def _gpu_check(self, row: dict):
+        """(other processes on the GPU, their memory in GB beside them, else 0), or None when the check failed; a
+        failed check counts, three in a row raise."""
         try:
             busy = other_processes(exclude_pid=os.getpid())
+            gb = others_gb(exclude_pid=os.getpid()) if self.shared and busy else 0.0
         except GpuCheckFailed as e:
             self.gpu_check_fails += 1
             row["sys/gpu_check_failed"] = self.gpu_check_fails
             print(f"update {self.update}: {e} ({self.gpu_check_fails} in a row)", flush=True)
             if self.gpu_check_fails >= 3:
                 raise
-            return []
+            return None
         self.gpu_check_fails = 0
         row["sys/other_gpu_processes"] = len(busy)
-        return busy
+        if self.shared:
+            row["sys/other_gpu_gb"] = gb
+        return busy, gb
 
     def run(self) -> int:
         if self.finished:
@@ -475,7 +495,7 @@ class Trainer:
                    "data/sample": u.next, "perf/update_s": now - last_t,
                    "perf/tok_per_s": u.inputs.numel() / max(now - last_t, 1e-9)}
             last_t = now
-            if not diverged and not self.wb.check_replay(self.update, row):
+            if not diverged and not self.wb.check_replay(self.update, row, shared=int(self.shared)):
                 diverged = True                                      # resumed run is not the same computation
                 print(f"update {self.update}: replay differs from the server's copy; switching to a new run",
                       flush=True)
@@ -485,12 +505,16 @@ class Trainer:
             if self.tokens >= next_val:
                 row.update(self._validate(u.seq_len))
                 next_val += val_every
-            busy, check_failed = [], False
+            seen, check_failed = None, False                         # (other processes, their GB) when checked
             if self.update % c.guards.gpu_check_every == 0 and not c.guards.allow_shared_gpu:
                 try:
-                    busy = self._gpu_check(row)
+                    seen = self._gpu_check(row)
                 except GpuCheckFailed:
                     check_failed = True
+            busy = seen[0] if seen else []
+            left = self.shared and seen is not None and not busy
+            crowded = self.shared and seen is not None and seen[1] > c.guards.share_reserve_gb
+            row["sys/gpu_shared"] = int(self.shared)
             self.wb.log(self.update, row)
             self.rows.append((self.update, row))
             self._beat("update")
@@ -505,9 +529,17 @@ class Trainer:
             if check_failed and not stop:
                 print(f"update {self.update}: the GPU cannot be checked; checkpoint and stop (failure)", flush=True)
                 rc = exits.FAILURE
-            elif busy and not stop:
+            elif busy and not self.shared and not stop:
                 print(f"update {self.update}: other processes on the GPU: {busy}; checkpoint and stop", flush=True)
                 rc = exits.GPU_BUSY
+            elif crowded and not stop:
+                print(f"update {self.update}: the other processes on the GPU use {seen[1]:.1f} GB, more than the "
+                      f"{c.guards.share_reserve_gb:g} GB reserved for them; checkpoint and stop", flush=True)
+                rc = exits.GPU_BUSY
+            elif left and not stop:
+                print(f"update {self.update}: the other processes left the GPU; checkpoint and continue with the GPU "
+                      "to itself", flush=True)
+                rc = exits.GPU_FREE
             elif not self._room(2) and not stop:
                 print(f"update {self.update}: {self._space_message(2)}; checkpoint and stop", flush=True)
                 rc = exits.NEEDS_OPERATOR
@@ -543,6 +575,9 @@ def main(run) -> int:
     except GpuBusy as e:
         print(f"trainer: {e}", flush=True)
         return exits.GPU_BUSY
+    except GpuFree as e:
+        print(f"trainer: {e}", flush=True)
+        return exits.GPU_FREE
     except LineBusy as e:
         print(f"trainer: {e}", flush=True)
         return exits.LINE_BUSY

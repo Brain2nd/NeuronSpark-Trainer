@@ -36,6 +36,7 @@ from nstrain import gpu
 from nstrain import model as M
 from nstrain.engine import StepEngine
 from nstrain.flat_adamw import FlatAdamW
+from nstrain.proc import SUPERVISOR, TUNE
 
 
 _LEASE = []                                                          # held for the life of the process
@@ -54,13 +55,16 @@ def setting(ac):
     return named[ac]
 
 
-def _setup(model_spec, rows: int, seq_len: int, ac: str):
-    """The model on the GPU, which it must have to itself (the lease, then no other compute process)."""
+def _setup(model_spec, rows: int, seq_len: int, ac: str, shared: bool = False, max_gib: float = None):
+    """The model on the GPU, which it must have to itself (the lease, then no other compute process), or beside other
+    processes (``shared``: the lease only); ``max_gib``: PyTorch's memory in this process is capped there."""
     if not _LEASE:
         _LEASE.append(gpu.lease("bench"))
         others = gpu.other_processes(exclude_pid=os.getpid())
-        if others:
+        if others and not shared:
             raise gpu.GpuBusy(f"other processes on the GPU: {others}")
+    if max_gib is not None:
+        gpu.cap_memory(max_gib)
     from neuronspark.utils.calibration import CALIBRATION_ROWS
     dev = torch.device("cuda")
     cfg = model_spec if isinstance(model_spec, dict) else M.model_config(model_spec)
@@ -77,10 +81,11 @@ def _setup(model_spec, rows: int, seq_len: int, ac: str):
 
 
 def bench(model_spec, rows: int, seq_len: int, accum: int, updates: int = 12, ac: str = "none",
-          result: bool = False, skip: int = 5) -> float:
+          result: bool = False, skip: int = 5, shared: bool = False, max_gib: float = None) -> float:
     """``model_spec``: a preset name, a model-config file or a model-config dict; the median over the updates after
-    the first ``skip``; ``result``: also print the measurement as one ``BENCH_RESULT {json}`` line (for ``tune``)."""
-    cfg, model, opt, g = _setup(model_spec, rows, seq_len, ac)
+    the first ``skip``; ``result``: also print the measurement as one ``BENCH_RESULT {json}`` line (for ``tune``);
+    ``shared``: beside other processes on the GPU; ``max_gib``: out of memory past this much PyTorch memory."""
+    cfg, model, opt, g = _setup(model_spec, rows, seq_len, ac, shared, max_gib)
     t0 = time.time()
     eng = StepEngine(model, opt, rows, seq_len, accum)
     print(f"captured in {time.time() - t0:.1f} s; allocated {torch.cuda.memory_allocated() / 2**30:.1f} GiB, "
@@ -177,7 +182,7 @@ def _name(k, n: int) -> str:
     return "every layer" if k == "all" else ("none" if k == 0 else f"{k} of {n} dendritic layers")
 
 
-CONTEXT_GIB = 2.0                       # the CUDA context and the libraries beside PyTorch's allocator
+CONTEXT_GIB = gpu.CONTEXT_GIB
 
 
 def _gpu_total_gib() -> float:
@@ -190,12 +195,16 @@ def _gpu_total_gib() -> float:
 OUT_OF_MEMORY = ("out of memory", "CUBLAS_STATUS_ALLOC_FAILED")
 
 
-def _measure(run_dir, seq_len: int, rows: int, accum: int, ac: str, updates: int, skip: int = 1) -> Optional[dict]:
+def _measure(run_dir, seq_len: int, rows: int, accum: int, ac: str, updates: int, skip: int = 1,
+             max_gib: float = None) -> Optional[dict]:
     """One candidate in its own process: its BENCH_RESULT, or None when it does not fit the GPU's memory.  Any other
-    failure is a defect of the code at that shape and raises: a shape the memory allows must run."""
+    failure is a defect of the code at that shape and raises: a shape the memory allows must run.  ``max_gib``: beside
+    other processes, with PyTorch's memory capped there (a shape over it runs out of memory in its own process)."""
     p = subprocess.run([sys.executable, "-m", "nstrain", "bench", "--run", str(run_dir), "--seq-len", str(seq_len),
                         "--rows", str(rows), "--accum", str(accum), "--ac", ac, "--updates", str(updates), "--skip",
-                        str(skip), "--result"], capture_output=True, text=True, timeout=7200)
+                        str(skip), "--result"] + (["--shared", "--max-gib", f"{max_gib:.3f}"] if max_gib else []),
+                       capture_output=True, text=True, timeout=7200,
+                       env={k: v for k, v in dict(os.environ, **{TUNE: str(os.getpid())}).items() if k != SUPERVISOR})
     for line in reversed(p.stdout.splitlines()):
         if line.startswith("BENCH_RESULT "):
             return json.loads(line[len("BENCH_RESULT "):])
@@ -210,18 +219,31 @@ def _measure(run_dir, seq_len: int, rows: int, accum: int, ac: str, updates: int
                        f"{why[-1][:300] if why else 'no output'}")
 
 
-def tune(run, margin_gib: float = 10.0, updates: int = 4, write: bool = True) -> Dict:
+def tune(run, margin_gib: float = 10.0, updates: int = 4, write: bool = True, shared: bool = False) -> Dict:
     """The fastest fitting (micro_rows, recomputation) of every sequence length of the line (see the module
-    documentation); written into run.json when ``write``."""
+    documentation); written into run.json when ``write``.  ``shared``: the shapes beside other processes, which leave
+    ``guards.share_reserve_gb`` of the GPU's memory to them (measured beside whatever runs there), written as the
+    lengths' ``shared`` shapes (also on a line with checkpoints)."""
     from nstrain.ckpt import Checkpoints
     cfg = C.load(run)
-    if write and Checkpoints(cfg.ckpt_dir).complete():
-        raise RuntimeError(f"{cfg.name} has checkpoints: micro_rows is fixed for the life of the line")
-    if gpu.lease_holder() is not None or gpu.other_processes():
-        raise RuntimeError("another process uses the GPU: tune measures on a GPU nothing else uses")
-    limit = _gpu_total_gib() - margin_gib - CONTEXT_GIB
-    print(f"GPU {gpu.device()}: shapes fit below {limit:.1f} GiB reserved (margin {margin_gib:g} GiB)", flush=True)
+    if gpu.lease_holder() is not None:
+        raise RuntimeError("another nstrain process holds the GPU")
+    if shared:
+        reserve = cfg.guards.share_reserve_gb
+        if reserve is None:
+            raise RuntimeError(f"{cfg.name}: guards.share_reserve_gb is not set")
+        limit = gpu.beside_limit_gib(_gpu_total_gib(), reserve, margin_gib)
+        print(f"GPU {gpu.device()}: shapes beside other processes fit below {limit:.1f} GiB reserved ({reserve:g} GB "
+              f"left to them, margin {margin_gib:g} GiB)", flush=True)
+    else:
+        if write and Checkpoints(cfg.ckpt_dir).complete():
+            raise RuntimeError(f"{cfg.name} has checkpoints: micro_rows is fixed for the life of the line")
+        if gpu.other_processes():
+            raise RuntimeError("another process uses the GPU: tune measures on a GPU nothing else uses")
+        limit = _gpu_total_gib() - margin_gib - CONTEXT_GIB
+        print(f"GPU {gpu.device()}: shapes fit below {limit:.1f} GiB reserved (margin {margin_gib:g} GiB)", flush=True)
     tpu, chosen = cfg.tokens_per_update, {}
+    cap = limit if shared else None                                  # beside others: out of memory at the limit
     for L in sorted(cfg.lengths):
         rows = [r for r in (2 ** i for i in range(16)) if r * L <= tpu and tpu % (r * L) == 0]
         if not rows:
@@ -233,7 +255,7 @@ def tune(run, margin_gib: float = 10.0, updates: int = 4, write: bool = True) ->
             """Peak reserved GiB of r rows with setting k (an int, or "all"); None when it does not run."""
             if (k, r) not in probes:
                 print(f"  {L}: probe {r} rows, recompute {_name(k, n)}", flush=True)
-                m = _measure(cfg.run_dir, L, r, 1, _arg(k, n), 2) if r in rows else None
+                m = _measure(cfg.run_dir, L, r, 1, _arg(k, n), 2, max_gib=cap) if r in rows else None
                 probes[(k, r)] = None if m is None else m["peak_reserved_gib"]
                 if m is not None:
                     print(f"    peak reserved {m['peak_reserved_gib']:.1f} GiB", flush=True)
@@ -277,7 +299,8 @@ def tune(run, margin_gib: float = 10.0, updates: int = 4, write: bool = True) ->
         for r, k in cands:
             while True:
                 print(f"  {L}: measure {r} rows, recompute {_name(k, n)}", flush=True)
-                m = _measure(cfg.run_dir, L, r, tpu // (r * L), _arg(k, n), updates)    # a complete update
+                m = _measure(cfg.run_dir, L, r, tpu // (r * L), _arg(k, n), updates,    # a complete update
+                             max_gib=cap)
                 if m is not None and m["peak_reserved_gib"] <= limit:
                     print(f"    {m['tok_s']:,.0f} tok/s, peak reserved {m['peak_reserved_gib']:.1f} GiB", flush=True)
                     found.append((r, k, m))
@@ -294,8 +317,17 @@ def tune(run, margin_gib: float = 10.0, updates: int = 4, write: bool = True) ->
         print(f"length {L}: {best[0]} rows, recompute {_name(best[1], n)}: {best[2]['tok_s']:,.0f} tok/s, peak "
               f"reserved {best[2]['peak_reserved_gib']:.1f} GiB", flush=True)
     if write:
+        now = C.load(run)                                            # run.json as it is now (edited meanwhile?)
+        if (now.model, now.tokens_per_update, sorted(now.lengths)) != (cfg.model, cfg.tokens_per_update,
+                                                                       sorted(cfg.lengths)):
+            raise RuntimeError(f"{now.run_dir / C.RUN_FILE} changed its model, tokens per update or lengths while "
+                               "the shapes were measured; nothing written")
         for L, (r, ac, _) in chosen.items():
-            cfg.lengths[L] = C.Length(micro_rows=r, activation_checkpointing=ac)
-        C.save(cfg)
-        print(f"{cfg.run_dir / C.RUN_FILE}: lengths {cfg.to_dict()['lengths']}", flush=True)
+            if shared:
+                now.lengths[L].shared = C.SharedShape(micro_rows=r, activation_checkpointing=ac,
+                                                      reserve_gb=cfg.guards.share_reserve_gb)
+            else:
+                now.lengths[L] = C.Length(micro_rows=r, activation_checkpointing=ac, shared=now.lengths[L].shared)
+        C.save(now)
+        print(f"{now.run_dir / C.RUN_FILE}: lengths {now.to_dict()['lengths']}", flush=True)
     return {L: {"micro_rows": r, "recompute": ac, **m} for L, (r, ac, m) in chosen.items()}

@@ -20,6 +20,12 @@ Trainer (``python -m nstrain train RUN``, own session, output appended to ``<run
   relaunch; any other abnormal exit while another process is on the GPU (a kernel fault under time-slicing, see
   nstrain.gpu) is handled the same way; exit 4 (another trainer still holds the line, e.g. one writing its last
   checkpoint): wait for it; none of these is a failure;
+* with ``guards.share_reserve_gb`` (re-read at every such decision), instead of waiting for a free GPU the trainer
+  is relaunched beside the other processes (``$NSTRAIN_GPU_MODE=shared``) as soon as they use at most the reserve,
+  with each length's shape measured for that reserve (``nstrain tune --shared``, run here beside them when missing:
+  ended when they leave meanwhile or after TUNE_DEADLINE_S; a failed one leaves the line waiting for a free GPU);
+  exit 6 (they left) relaunches it with the GPU to itself; after SHARED_CRASHES crashes beside them without progress
+  the line waits for a free GPU (an event); the counts of failures and crashes start again whenever the line moves;
 * exit 5 (not enough disk space for the next checkpoints): stop, the line needs the operator;
 * watchdog: a heartbeat older than ``supervisor.stall_s`` (and older than this launch) means a stalled trainer (e.g. a
   GPU hang): SIGKILL by PID, restart like a crash; a trainer that does not exit within 120 s of the kill is reported
@@ -60,9 +66,11 @@ from typing import Callable, List, Optional
 from nstrain import config as C
 from nstrain import exits, host
 from nstrain.data.preparer import HELD_BY_PARENT, release_consumed, serve
-from nstrain.gpu import GpuCheckFailed, lease_holder, other_processes
+from nstrain.gpu import GPU_MODE, GpuCheckFailed, lease_holder, other_processes, others_gb
 from nstrain.proc import SUPERVISOR
 
+SHARED_CRASHES = 3                      # crashes beside other processes without progress, then wait for a free GPU
+TUNE_DEADLINE_S = 7200.0                # measuring the shapes beside other processes takes at most this long
 KILL_WAIT_S = 120
 START_WAIT_S = 60.0
 LOG_MAX = 256 << 20
@@ -215,6 +223,34 @@ def gpu_state() -> str:
         return "failed"
 
 
+def others_outside(pgid: int) -> Optional[bool]:
+    """Whether a compute process outside the process group ``pgid`` (a tune and its measurement) is on the GPU; None
+    when nvidia-smi fails."""
+    try:
+        rows = other_processes()
+    except GpuCheckFailed:
+        return None
+    for r in rows:
+        try:
+            if os.getpgid(int(r.split(",")[0])) == pgid:
+                continue
+        except (ValueError, OSError):
+            pass
+        return True
+    return False
+
+
+def others_memory() -> Optional[float]:
+    """GB the other compute processes on the GPU use; None when it is not known (nvidia-smi failed) or another nstrain
+    process holds the GPU lease (no line trains beside it)."""
+    if lease_holder() is not None:
+        return None
+    try:
+        return others_gb()
+    except GpuCheckFailed:
+        return None
+
+
 def line_held(root: Path) -> bool:
     """Another process holds the line's trainer.lock."""
     p = root / "trainer.lock"
@@ -323,9 +359,121 @@ class LineSupervisor:
                 return True
         return False
 
+    def tune_cmd(self) -> List[str]:
+        return [sys.executable, "-u", "-m", "nstrain", "tune", str(self.root), "--shared"]
+
+    def _reserve(self) -> Optional[float]:
+        """guards.share_reserve_gb as run.json has it now (it may be edited while the line runs); the last value read
+        when run.json cannot be read."""
+        try:
+            self.reserve = C.load(self.root).guards.share_reserve_gb
+        except (OSError, ValueError) as e:
+            self.say(f"run.json cannot be read ({e}); keeping guards.share_reserve_gb {self.reserve}")
+        return self.reserve
+
+    def _shapes_for(self, reserve: float) -> bool:
+        """Every length has a shape beside other processes measured for this reserve."""
+        try:
+            cfg = C.load(self.root)
+        except (OSError, ValueError):
+            return False
+        return all(x.shared is not None and x.shared.reserve_gb == reserve for x in cfg.lengths.values())
+
+    def _end_group(self, proc: subprocess.Popen) -> None:
+        """SIGTERM to a process group (a tune and its measurement), SIGKILL after 60 s."""
+        for sig, wait in ((signal.SIGTERM, 60.0), (signal.SIGKILL, KILL_WAIT_S)):
+            try:
+                os.killpg(proc.pid, sig)
+            except ProcessLookupError:
+                return
+            try:
+                proc.wait(wait)
+                return
+            except subprocess.TimeoutExpired:
+                pass
+        self.say(f"the measurement {proc.pid} does not exit after SIGKILL (stuck in the driver?)")
+
+    def _measure_shared(self) -> str:
+        """The shapes beside other processes measured (``nstrain tune --shared``, beside them): "done"; "failed" (a
+        failure, or not done within TUNE_DEADLINE_S: once per supervisor, the line then waits for a free GPU); "free"
+        (the other processes left meanwhile: the measurement is ended); "stop"."""
+        if self.stop:
+            return "stop"
+        self.record(state="measuring the shapes beside other processes")
+        self.say("measuring the shapes beside other processes (nstrain tune --shared)")
+        proc = subprocess.Popen(self.tune_cmd(), stdout=self.log, stderr=subprocess.STDOUT, start_new_session=True,
+                                env=dict(os.environ, **{SUPERVISOR: str(os.getpid())}))
+        deadline, outcome, why = time.time() + TUNE_DEADLINE_S, None, None
+        while proc.poll() is None:
+            if self.stop.sleep(self.cfg.supervisor.gpu_wait_s) or self.stop:
+                outcome = "stop"
+            elif others_outside(proc.pid) is False:
+                outcome = "free"
+            elif time.time() > deadline:
+                outcome, why = "failed", f"not done after {TUNE_DEADLINE_S:.0f} s"
+            if outcome is not None:
+                self._end_group(proc)
+                break
+        if outcome is None:
+            outcome = "done" if proc.returncode == 0 else "failed"
+            why = f"exit {_code(proc.returncode)}"
+        if outcome == "free":
+            self.say("the other processes left the GPU; measurement ended")
+        if outcome == "failed":
+            self.tune_failed = True
+            msg = f"measuring the shapes beside other processes failed ({why}, see run.log); waiting for a free GPU"
+            self.say(msg)
+            self.event("tune failed", msg)
+        return outcome
+
+    def _place(self, beside: int) -> Optional[str]:
+        """Where the trainer runs after another process took the GPU: "exclusive" once the GPU is free (or nvidia-smi
+        fails: the trainer's own check decides), "shared" as soon as the line may train beside the other processes
+        (``guards.share_reserve_gb`` set, their memory within it, shapes measured for that reserve, fewer than
+        SHARED_CRASHES crashes beside them without progress); None on a stop."""
+        reserve = self._reserve()
+        self.record(state="waiting for the GPU")
+        if reserve is None:
+            self.say("another process is using the GPU; waiting for it to finish")
+        elif beside >= SHARED_CRASHES:
+            msg = f"{beside} crashes beside other processes without progress; waiting for the GPU to be free"
+            self.say(msg)
+            self.event("shared crashes", msg)
+            reserve = None
+        told = False
+        while True:
+            g = gpu_state()
+            if g != "busy":
+                if g == "failed":
+                    self.say("nvidia-smi failed; relaunching (the trainer's own check decides)")
+                return "exclusive"
+            if reserve is not None:
+                gb = others_memory()
+                if gb is not None and gb <= reserve:
+                    ready = self._shapes_for(reserve)
+                    if not ready and not self.tune_failed:
+                        outcome = self._measure_shared()
+                        if outcome == "stop":
+                            return None
+                        if outcome == "free":
+                            return "exclusive"
+                        ready = outcome == "done" and self._shapes_for(reserve)
+                    if ready:
+                        self.say(f"other processes use {gb:.1f} GB of the {reserve:g} GB reserved for them; "
+                                 "training beside them")
+                        return "shared"
+                    reserve = None
+                elif not told:
+                    used = "an unknown amount" if gb is None else f"{gb:.1f} GB"
+                    self.say(f"other processes use {used}, more than the {reserve:g} GB reserved for them; waiting")
+                    told = True
+            if self.stop or self.stop.sleep(self.cfg.supervisor.gpu_wait_s):
+                return None
+
     def _trainer_loop(self) -> int:
         s = self.cfg.supervisor
-        fails = 0
+        fails, beside, mode = 0, 0, "exclusive"                     # beside: crashes in shared mode without progress
+        self.tune_failed, self.reserve = False, self.cfg.guards.share_reserve_gb
         while True:
             if self.stop:
                 self.say("stopped on request")
@@ -333,13 +481,15 @@ class LineSupervisor:
             self.open_log()
             start, before = time.time(), self.latest()
             proc = subprocess.Popen(self.trainer_cmd(), stdout=self.log, stderr=subprocess.STDOUT,
-                                    start_new_session=True, env=dict(os.environ, **{SUPERVISOR: str(os.getpid())}))
+                                    start_new_session=True,
+                                    env=dict(os.environ, **{SUPERVISOR: str(os.getpid()), GPU_MODE: mode}))
             self.stop.child = proc
             if self.stop:                                            # a stop that came before child was set
                 proc.send_signal(signal.SIGTERM)
             self.record(trainer_pid=proc.pid, trainer_started=_now(), launches=self.state["launches"] + 1,
-                        state="training")
-            self.say(f"trainer started (pid {proc.pid}, latest {before})")
+                        state="training", gpu=mode)
+            self.say(f"trainer started (pid {proc.pid}, latest {before}"
+                     f"{', beside other processes' if mode == 'shared' else ''})")
             if self._watch(proc, start) == "stuck":
                 msg = (f"trainer {proc.pid} does not exit {KILL_WAIT_S} s after SIGKILL (stuck in the driver?); "
                        "stopping")
@@ -349,7 +499,9 @@ class LineSupervisor:
                 return 1
             rc = _code(proc.wait())
             self.stop.child = None
-            self.record(trainer_pid=None, last_exit=rc)
+            self.record(trainer_pid=None, last_exit=rc, gpu=None)
+            if self.latest() != before:                              # the line moved: the counts start again
+                fails = beside = 0
             if self.stop:
                 self.say(f"stopped on request (trainer exit {rc})")
                 return rc
@@ -364,24 +516,24 @@ class LineSupervisor:
                 self.record(state="needs operator")
                 self.event("needs operator", msg)
                 return rc
+            if rc == exits.GPU_FREE:
+                self.say("the other processes left the GPU; relaunching with the GPU to itself")
+                mode, beside = "exclusive", 0
+                self.stop.sleep(s.restart_pause_s)
+                continue
             if rc not in (exits.GPU_BUSY, exits.LINE_BUSY) and gpu_state() == "busy":
+                if mode == "shared":
+                    beside += 1
                 self.say(f"trainer exited {rc} after {time.time() - start:.0f} s with another process on the GPU; "
                          f"not a failure (latest {self.latest()})")
                 rc = exits.GPU_BUSY
             if rc == exits.GPU_BUSY:
-                self.record(state="waiting for the GPU")
-                failed = []
-
-                def busy():
-                    g = gpu_state()
-                    if g == "failed":
-                        failed.append(1)
-                    return g == "busy"
-                if self._wait("another process is using the GPU; waiting for it to finish", busy, s.gpu_wait_s):
+                mode = self._place(beside)
+                if mode is None:
                     self.say("stopped on request while waiting for the GPU")
                     return 0
-                if failed:
-                    self.say("nvidia-smi failed; relaunching (the trainer's own check decides)")
+                if mode == "exclusive":
+                    beside = 0
                 self.stop.sleep(s.restart_pause_s)
                 continue
             if rc == exits.LINE_BUSY:
@@ -391,7 +543,7 @@ class LineSupervisor:
                     self.say("stopped on request while waiting for the line")
                     return 0
                 continue
-            fails = 1 if self.latest() != before else fails + 1
+            fails += 1
             self.record(fails=fails, state="restarting")
             self.say(f"trainer exited {rc} after {time.time() - start:.0f} s (failure {fails} of {s.max_fails} "
                      f"without progress; latest {self.latest()})")
