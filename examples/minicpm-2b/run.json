@@ -1,0 +1,95 @@
+{
+ "name": "trunk",
+ "model": {
+  "vocab_size": 130560,
+  "D": 2048,
+  "num_layers": 24,
+  "D_ff": 1024,
+  "D_key": 2048,
+  "D_value": 2048,
+  "hippocampal_heads": 8,
+  "hippocampal_pkm_value_dim": 1024,
+  "lexical_memory_rows": [
+   130560,
+   262139,
+   344951
+  ],
+  "lexical_memory_head_dims": [
+   128,
+   16,
+   16
+  ],
+  "rope_max_seq_len": 32768,
+  "rope_base": 500000.0
+ },
+ "data_work": "/data/lines/trunk",
+ "val_work": "/data/lines/trunk",
+ "tokens_per_update": 1048576,
+ "lengths": {
+  "4096": {
+   "micro_rows": 8,
+   "activation_checkpointing": 3
+  }
+ },
+ "optimizer": {
+  "peak_lr": 0.0003,
+  "betas": [
+   0.9,
+   0.95
+  ],
+  "eps": 1e-08,
+  "weight_decay": 0.1,
+  "lexical_lr_mult": 8.0,
+  "grad_clip": 1.0
+ },
+ "schedule": [
+  {
+   "from": 0,
+   "to": 2000000000.0,
+   "kind": "warmup"
+  },
+  {
+   "from": 2000000000.0,
+   "to": null,
+   "kind": "constant"
+  }
+ ],
+ "wandb": {
+  "project": "ns-pretrain",
+  "entity": null,
+  "retry_s": 7200.0
+ },
+ "seed": 0,
+ "data_seed": 0,
+ "fork_from": null,
+ "checkpoints": {
+  "every_tokens": 200000000.0,
+  "keep_last": 3
+ },
+ "validation": {
+  "every_tokens": 2000000000.0,
+  "rows": 16
+ },
+ "stop_at_tokens": null,
+ "guards": {
+  "max_skipped_in_a_row": 10,
+  "gpu_check_every": 1,
+  "allow_shared_gpu": false
+ },
+ "supervisor": {
+  "max_fails": 5,
+  "stall_s": 1800.0,
+  "restart_pause_s": 5.0,
+  "gpu_wait_s": 5.0,
+  "prepare": true,
+  "preparer": {
+   "lookahead": 1,
+   "min_free_gb": 200.0,
+   "dl_workers": 8,
+   "tok_workers": 8,
+   "rayon": 8
+  }
+ },
+ "allow_changes": [],
+ "print_every": 10
+}

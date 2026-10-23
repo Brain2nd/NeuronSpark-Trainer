@@ -147,6 +147,7 @@ nstrain/status.py      status                      nstrain/bench.py       throug
 nstrain/gpu.py         the GPU lease and checks    nstrain/host.py        host settings
 nstrain/data/          data lines: sources, mixture, hf, tokenize, work, stream, batches, preparer
 nstrain/presets/       model configurations
+examples/minicpm-2b/   a 2B line on the open MiniCPM corpora: run.json and the commands
 ```
 
 ## Citation
