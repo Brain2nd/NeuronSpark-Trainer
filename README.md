@@ -1,5 +1,7 @@
 # NeuronSpark-Trainer
 
+[![License: CC BY-NC-SA 4.0](https://img.shields.io/badge/License-CC%20BY--NC--SA%204.0-lightgrey.svg)](https://creativecommons.org/licenses/by-nc-sa/4.0/)
+
 The trainer of [NeuronSpark](https://github.com/Brain2nd/NeuronSpark) language models: streaming data lines built from
 the open MiniCPM corpora, the training step as CUDA graphs, exact resume from any checkpoint, trunk and branch lines,
 one continuous W&B record per line, and a supervisor that keeps a line running unattended.  One package, one command:
