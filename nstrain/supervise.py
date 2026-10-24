@@ -21,11 +21,13 @@ Trainer (``python -m nstrain train RUN``, own session, output appended to ``<run
   nstrain.gpu) is handled the same way; exit 4 (another trainer still holds the line, e.g. one writing its last
   checkpoint): wait for it; none of these is a failure;
 * with ``guards.share_reserve_gb`` (re-read at every such decision), instead of waiting for a free GPU the trainer
-  is relaunched beside the other processes (``$NSTRAIN_GPU_MODE=shared``) as soon as they use at most the reserve,
-  with each length's shape measured for that reserve (``nstrain tune --shared``, run here beside them when missing:
-  ended when they leave meanwhile or after TUNE_DEADLINE_S; a failed one leaves the line waiting for a free GPU);
-  exit 6 (they left) relaunches it with the GPU to itself; after SHARED_CRASHES crashes beside them without progress
-  the line waits for a free GPU (an event); the counts of failures and crashes start again whenever the line moves;
+  is relaunched beside the other processes (``$NSTRAIN_GPU_MODE=shared``) as soon as its shapes fit beside them
+  (they use at most the reserve plus the tune's margin, nstrain.gpu.fits_beside), with each length's shape measured
+  for that reserve (``nstrain tune --shared``, run here beside them when missing: ended when they leave meanwhile or
+  after TUNE_DEADLINE_S; a failed one leaves the line waiting for a free GPU); the trainer then holds the GPU's memory
+  less the reserve and does not stop for them; exit 6 (they left) relaunches it with the GPU to itself; after
+  SHARED_CRASHES crashes beside them without progress the line waits for a free GPU (an event); the counts of
+  failures and crashes start again whenever the line moves;
 * exit 5 (not enough disk space for the next checkpoints): stop, the line needs the operator;
 * watchdog: a heartbeat older than ``supervisor.stall_s`` (and older than this launch) means a stalled trainer (e.g. a
   GPU hang): SIGKILL by PID, restart like a crash; a trainer that does not exit within 120 s of the kill is reported
@@ -66,7 +68,8 @@ from typing import Callable, List, Optional
 from nstrain import config as C
 from nstrain import exits, host
 from nstrain.data.preparer import HELD_BY_PARENT, release_consumed, serve
-from nstrain.gpu import GPU_MODE, GpuCheckFailed, lease_holder, other_processes, others_gb
+from nstrain.gpu import (GPU_MODE, TUNE_MARGIN_GIB, GpuCheckFailed, fits_beside, lease_holder, other_processes,
+                         others_gb)
 from nstrain.proc import SUPERVISOR
 
 SHARED_CRASHES = 3                      # crashes beside other processes without progress, then wait for a free GPU
@@ -429,7 +432,7 @@ class LineSupervisor:
     def _place(self, beside: int) -> Optional[str]:
         """Where the trainer runs after another process took the GPU: "exclusive" once the GPU is free (or nvidia-smi
         fails: the trainer's own check decides), "shared" as soon as the line may train beside the other processes
-        (``guards.share_reserve_gb`` set, their memory within it, shapes measured for that reserve, fewer than
+        (``guards.share_reserve_gb`` set, the shapes measured for that reserve fit beside them, fewer than
         SHARED_CRASHES crashes beside them without progress); None on a stop."""
         reserve = self._reserve()
         self.record(state="waiting for the GPU")
@@ -449,7 +452,7 @@ class LineSupervisor:
                 return "exclusive"
             if reserve is not None:
                 gb = others_memory()
-                if gb is not None and gb <= reserve:
+                if gb is not None and fits_beside(gb, reserve):
                     ready = self._shapes_for(reserve)
                     if not ready and not self.tune_failed:
                         outcome = self._measure_shared()
@@ -459,13 +462,14 @@ class LineSupervisor:
                             return "exclusive"
                         ready = outcome == "done" and self._shapes_for(reserve)
                     if ready:
-                        self.say(f"other processes use {gb:.1f} GB of the {reserve:g} GB reserved for them; "
-                                 "training beside them")
+                        self.say(f"other processes use {gb:.1f} GB ({reserve:g} GB reserved for them); training "
+                                 "beside them")
                         return "shared"
                     reserve = None
                 elif not told:
                     used = "an unknown amount" if gb is None else f"{gb:.1f} GB"
-                    self.say(f"other processes use {used}, more than the {reserve:g} GB reserved for them; waiting")
+                    self.say(f"other processes use {used}, more than the {reserve:g} GB reserved for them and the "
+                             f"shapes' margin of {TUNE_MARGIN_GIB:g} GiB; waiting")
                     told = True
             if self.stop or self.stop.sleep(self.cfg.supervisor.gpu_wait_s):
                 return None

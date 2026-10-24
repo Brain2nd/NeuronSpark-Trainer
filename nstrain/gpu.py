@@ -4,11 +4,15 @@ When the GPU is time-sliced with another process, the driver's preemption of the
 default the trainer refuses to start beside another process and checkpoints and exits (nstrain.exits.GPU_BUSY) when
 one appears; the supervisor waits for the GPU to be free.  With ``guards.share_reserve_gb`` the supervisor instead
 relaunches the trainer beside the other processes (``$NSTRAIN_GPU_MODE=shared``) with the lengths' ``shared`` shapes,
-which leave that much memory to them, while they stay within it; when they leave, the trainer checkpoints and exits
-(nstrain.exits.GPU_FREE) and is relaunched with the GPU to itself.  The lease (an exclusive lock on
-``$NSTRAIN_GPU_LOCK_DIR`` (default /tmp) ``/nstrain-gpu<index>.lock``, taken before any CUDA initialisation and held
-for the life of the process) closes the window in which two trainers (or a trainer and ``nstrain bench``) both see a
-free GPU at start.
+measured to fit while the other processes use up to the reserve plus the tune's margin (:func:`fits_beside`).  The
+trainer then holds all of the GPU's memory but what the other processes may still take, the reserve less what they use
+(:func:`hold_memory`): they cannot grow past the reserve (an allocation past it fails in them, not in the line), and
+the line does not stop for them (memory they already used past the reserve when the line started stays theirs until
+they free it); when they leave, the trainer checkpoints and exits (nstrain.exits.GPU_FREE) and is relaunched with the
+GPU to itself.  The lease (an
+exclusive lock on ``$NSTRAIN_GPU_LOCK_DIR`` (default /tmp) ``/nstrain-gpu<index>.lock``, taken before any CUDA
+initialisation and held for the life of the process) closes the window in which two trainers (or a trainer and
+``nstrain bench``) both see a free GPU at start.
 """
 from __future__ import annotations
 
@@ -34,6 +38,7 @@ class GpuFree(RuntimeError):
 
 GPU_MODE = "NSTRAIN_GPU_MODE"           # "shared": the trainer runs beside other processes (set by the supervisor)
 CONTEXT_GIB = 2.0                       # the CUDA context and the libraries beside PyTorch's allocator
+TUNE_MARGIN_GIB = 10.0                  # what `nstrain tune` leaves free beside a shape's peak (by default)
 
 
 def beside_limit_gib(total_gib: float, reserve_gb: float, margin_gib: float = 0.0) -> float:
@@ -48,6 +53,43 @@ def cap_memory(limit_gib: float) -> None:
     import torch
     total = torch.cuda.get_device_properties(torch.cuda.current_device()).total_memory
     torch.cuda.set_per_process_memory_fraction(min(1.0, max(0.0, limit_gib * 2**30 / total)))
+
+
+def fits_beside(others: float, reserve_gb: float) -> bool:
+    """The shapes beside other processes fit while they use ``others`` GB: at most the reserve plus the tune's
+    margin (the shapes were measured to leave both free)."""
+    return others * 1e9 / 2**30 <= reserve_gb * 1e9 / 2**30 + TUNE_MARGIN_GIB
+
+
+def hold_memory(reserve_gb: float, others: float, sizes_gib=(4.0, 1.0), slack_gib: float = 0.25,
+                headroom_gib: float = 1.0) -> float:
+    """Take the GPU's free memory into this process's allocator but what the other processes may still take: the
+    reserve less what they use (``others`` GB), plus ``slack_gib`` (this process's own memory outside the allocator,
+    e.g. a kernel module loaded late).  Taken in blocks of ``sizes_gib`` (largest first, each as large as fits; the
+    largest as large as the largest eager allocation, the readout chunk, so that a later one is served from a held
+    block), then the rest in 2 MiB units; the freed blocks stay reserved by this process and serve its own allocations.
+    The allocator's cap (:func:`cap_memory`) is then what it holds plus ``headroom_gib``: an allocation that no held
+    block can serve takes at most that much more of the GPU; past it the allocator first gives its free blocks back
+    (the next call takes the memory again).  Returns the GiB taken (negative when the allocator gave memory back)."""
+    import torch
+    unit, least = 2 << 20, 16 << 20                                  # requests under 10 MiB take 20 MiB segments
+    leave = max(0, int((reserve_gb - others) * 1e9)) + int(slack_gib * 2**30)
+    sizes, head = [int(s * 2**30) for s in sizes_gib], int(headroom_gib * 2**30)
+    before, held = torch.cuda.memory_reserved(), []
+    cap_memory((before + max(0, torch.cuda.mem_get_info()[0] - leave) + head + unit) / 2**30)
+    try:
+        while True:
+            room = torch.cuda.mem_get_info()[0] - leave
+            n = next((s for s in sizes if s <= room), room // unit * unit)
+            if n < least:
+                break
+            held.append(torch.empty(n, dtype=torch.uint8, device="cuda"))
+    except torch.cuda.OutOfMemoryError:                              # another process took the memory meanwhile
+        pass
+    del held
+    reserved = torch.cuda.memory_reserved()
+    cap_memory((reserved + max(0, torch.cuda.mem_get_info()[0] - leave) + head) / 2**30)
+    return (reserved - before) / 2**30
 
 
 def device() -> str:

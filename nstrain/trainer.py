@@ -27,14 +27,17 @@ waiting for data).  Each cycle end and each change of sequence length (a stage e
 of the old length, also when that update's checkpoint was a rolling one or the run resumed from it) is a kept
 checkpoint; the data preparer is told a cycle is consumed only after that checkpoint is on disk, and is told the cycle
 in training when the trainer starts.  Exit codes (nstrain.exits): 0 done / stopped / the line's data is exhausted, 3
-another process uses the GPU (beside other processes: they use more than ``guards.share_reserve_gb``), 4 another
+another process uses the GPU (beside other processes, at the start: the shapes do not fit beside them), 4 another
 trainer holds the line, 5 not enough disk space for the next checkpoints (checked after every update; a checkpoint is
 written while there is room), 6 beside other processes, and they left (relaunch with the GPU to itself), 1 failure
 (also when nvidia-smi fails: at start, or at three checks in a row, then after a checkpoint).  The GPU is checked every
-``guards.gpu_check_every`` updates; a change of the GPU's occupancy ends the run with a checkpoint.  Beside other
-processes (``$NSTRAIN_GPU_MODE=shared``, set by the supervisor, see nstrain.gpu) every length trains with its
-``shared`` shape.  Started by a supervisor (``NSTRAIN_SUPERVISOR_PID``), the trainer gets SIGTERM when the supervisor
-dies.
+``guards.gpu_check_every`` updates; another process (with the GPU to itself) or the other processes leaving (beside
+them) end the run with a checkpoint.  Beside other processes (``$NSTRAIN_GPU_MODE=shared``, set by the supervisor, see
+nstrain.gpu) every length trains with its ``shared`` shape; once its engine is captured (and one validation
+micro-batch has run, so that the eager kernels are loaded and the readout chunk is cached), and at every check, the
+trainer holds the GPU's memory but what the other processes may still take, ``guards.share_reserve_gb`` less what they
+use (nstrain.gpu.hold_memory): they cannot grow past the reserve, and the line does not stop for them.  Started by a
+supervisor (``NSTRAIN_SUPERVISOR_PID``), the trainer gets SIGTERM when the supervisor dies.
 """
 from __future__ import annotations
 
@@ -62,8 +65,8 @@ from nstrain.ckpt import Checkpoints, snapshot
 from nstrain.data.batches import Line, Prefetch, val_rows
 from nstrain.engine import StepEngine
 from nstrain.flat_adamw import FlatAdamW
-from nstrain.gpu import (GPU_MODE, GpuBusy, GpuCheckFailed, GpuFree, beside_limit_gib, cap_memory, lease,
-                         other_processes, others_gb)
+from nstrain.gpu import (GPU_MODE, GpuBusy, GpuCheckFailed, GpuFree, beside_limit_gib, cap_memory, fits_beside,
+                         hold_memory, lease, other_processes, others_gb)
 from nstrain.wb import RunRecord, Tracker
 
 
@@ -132,9 +135,9 @@ class Trainer:
             others = other_processes(exclude_pid=os.getpid())
             if self.shared and not others:
                 raise GpuFree("no other process on the GPU: the line trains with the GPU to itself")
-            if self.shared and others_gb(exclude_pid=os.getpid()) > c.guards.share_reserve_gb:
-                raise GpuBusy(f"other processes on the GPU use more than the {c.guards.share_reserve_gb:g} GB "
-                              f"reserved for them: {others}")
+            if self.shared and not fits_beside(others_gb(exclude_pid=os.getpid()), c.guards.share_reserve_gb):
+                raise GpuBusy(f"the shapes do not fit beside the other processes on the GPU (more than the "
+                              f"{c.guards.share_reserve_gb:g} GB reserved for them and the tune's margin): {others}")
             if others and not self.shared:
                 raise GpuBusy(f"other processes on the GPU: {others}; training needs the GPU to itself "
                               "(guards.allow_shared_gpu overrides)")
@@ -373,6 +376,12 @@ class Trainer:
         self.engine = StepEngine(self.model, self.opt, s.micro_rows, L, accum, c.optimizer.grad_clip)
         print(f"engine {accum} x {s.micro_rows} x {L}{' (beside other processes)' if self.shared else ''} captured "
               f"in {time.time() - t0:.0f} s, {torch.cuda.memory_allocated() / 2**30:.1f} GiB", flush=True)
+        if self.shared:                                              # a capture empties the cache: hold again
+            self._warm_validation(L)
+            try:
+                self._hold(others_gb(exclude_pid=os.getpid()))
+            except GpuCheckFailed as e:                              # the next check holds
+                print(f"{e}; the memory is held at the next check", flush=True)
         self._beat(f"{L} engine captured")
         return self.engine
 
@@ -399,6 +408,28 @@ class Trainer:
             self._save(u.cycle + 1, 0, "", keep, background, shape, self.run_id)
         else:
             self._save(u.cycle, u.next, u.manifest_sha256, keep, background, shape, self.run_id)
+
+    @torch.no_grad()
+    def _warm_validation(self, L: int) -> None:
+        """One validation micro-batch beside other processes before the memory is held: its kernels are loaded (a module
+        loaded later needs memory outside the allocator, which a held GPU may not have) and its blocks, the readout
+        chunk among them, are in this process's cache."""
+        if L not in self.val:
+            self.val[L] = val_rows(self.cfg.val_work, L, self.cfg.validation.rows)
+        mb = self.cfg.length(L, self.shared).micro_rows
+        for arr in self.val[L].values():
+            if arr.shape[0] >= mb:
+                w = torch.from_numpy(arr[:mb]).to(self.dev)
+                self.model.loss(w[:, :-1].contiguous(), w[:, 1:].contiguous())
+                return
+
+    def _hold(self, others: float) -> None:
+        """Beside other processes: hold the GPU's memory but what they may still take (nstrain.gpu.hold_memory)."""
+        taken = hold_memory(self.cfg.guards.share_reserve_gb, others)
+        if abs(taken) >= 0.5:
+            print(f"update {self.update}: {'holding' if taken > 0 else 'gave back'} {abs(taken):.1f} GiB "
+                  f"({torch.cuda.memory_reserved() / 2**30:.1f} GiB reserved); the other processes use {others:.1f} "
+                  f"of the {self.cfg.guards.share_reserve_gb:g} GB reserved for them", flush=True)
 
     @torch.no_grad()
     def _validate(self, L: int) -> dict:
@@ -513,7 +544,8 @@ class Trainer:
                     check_failed = True
             busy = seen[0] if seen else []
             left = self.shared and seen is not None and not busy
-            crowded = self.shared and seen is not None and seen[1] > c.guards.share_reserve_gb
+            if self.shared and busy:                                 # the other processes get the reserve, no more
+                self._hold(seen[1])
             row["sys/gpu_shared"] = int(self.shared)
             self.wb.log(self.update, row)
             self.rows.append((self.update, row))
@@ -531,10 +563,6 @@ class Trainer:
                 rc = exits.FAILURE
             elif busy and not self.shared and not stop:
                 print(f"update {self.update}: other processes on the GPU: {busy}; checkpoint and stop", flush=True)
-                rc = exits.GPU_BUSY
-            elif crowded and not stop:
-                print(f"update {self.update}: the other processes on the GPU use {seen[1]:.1f} GB, more than the "
-                      f"{c.guards.share_reserve_gb:g} GB reserved for them; checkpoint and stop", flush=True)
                 rc = exits.GPU_BUSY
             elif left and not stop:
                 print(f"update {self.update}: the other processes left the GPU; checkpoint and continue with the GPU "

@@ -219,7 +219,8 @@ def _measure(run_dir, seq_len: int, rows: int, accum: int, ac: str, updates: int
                        f"{why[-1][:300] if why else 'no output'}")
 
 
-def tune(run, margin_gib: float = 10.0, updates: int = 4, write: bool = True, shared: bool = False) -> Dict:
+def tune(run, margin_gib: float = gpu.TUNE_MARGIN_GIB, updates: int = 4, write: bool = True,
+         shared: bool = False) -> Dict:
     """The fastest fitting (micro_rows, recomputation) of every sequence length of the line (see the module
     documentation); written into run.json when ``write``.  ``shared``: the shapes beside other processes, which leave
     ``guards.share_reserve_gb`` of the GPU's memory to them (measured beside whatever runs there), written as the

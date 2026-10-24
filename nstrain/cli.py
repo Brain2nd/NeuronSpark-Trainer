@@ -27,6 +27,8 @@ import argparse
 import json
 import sys
 
+from nstrain.gpu import TUNE_MARGIN_GIB
+
 
 def _workers(p) -> None:
     p.add_argument("--dl-workers", type=int, default=8)
@@ -155,7 +157,9 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--top", type=int, default=60)
     p = sub.add_parser("tune", help="the fastest shape of every sequence length that fits the GPU, into run.json")
     p.add_argument("run")
-    p.add_argument("--margin-gib", type=float, default=10.0)
+    p.add_argument("--margin-gib", type=float, default=TUNE_MARGIN_GIB,
+                   help="memory left free beside each shape's peak (a line beside other processes starts on the "
+                        "default: nstrain.gpu.fits_beside)")
     p.add_argument("--updates", type=int, default=4, help="complete updates per measured shape (the first is warm-up)")
     p.add_argument("--dry-run", action="store_true", help="measure and report only")
     p.add_argument("--shared", action="store_true",

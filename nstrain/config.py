@@ -24,8 +24,8 @@ produces lives next to it (checkpoints/, run.log, heartbeat, wandb_run.json, sup
      "validation": {"every_tokens": 2e9, "rows": 16},
      "stop_at_tokens": null,                  # no update starts at or past it
      "guards": {"max_skipped_in_a_row": 10, "gpu_check_every": 50, "allow_shared_gpu": false,
-                "share_reserve_gb": null},    # null: the GPU to itself; a number: train beside other processes
-                                              # while they use at most this much memory (see nstrain.gpu)
+                "share_reserve_gb": null},    # null: the GPU to itself; a number: train beside other processes,
+                                              # which get this much memory and no more (see nstrain.gpu)
      "supervisor": {"max_fails": 5, "stall_s": 1800, "restart_pause_s": 30, "gpu_wait_s": 60, "prepare": true,
                     "preparer": {"lookahead": 1, "min_free_gb": 200, "dl_workers": 8, "tok_workers": 8, "rayon": 8}},
      "allow_changes": [],                     # FROZEN keys allowed to differ from the line's checkpoints (on purpose)
