@@ -527,12 +527,10 @@ class Trainer:
                    "perf/tok_per_s": u.inputs.numel() / max(now - last_t, 1e-9)}
             last_t = now
             if not diverged and not self.wb.check_replay(self.update, row, shared=int(self.shared)):
-                diverged = True                                      # resumed run is not the same computation
-                print(f"update {self.update}: replay differs from the server's copy; switching to a new run",
-                      flush=True)
-                old = self.run_id
-                self.wb.finish()
-                self.run_id = self._new_run("rollback", old, self.update - 1)
+                diverged = True                                      # the line stays in its run (nstrain.wb)
+                print(f"update {self.update}: replay differs from the server's copy (recomputed with another "
+                      "micro-batch shape, or not the same computation); the server keeps its rows and the run "
+                      "continues after its last step", flush=True)
             if self.tokens >= next_val:
                 row.update(self._validate(u.seq_len))
                 next_val += val_every

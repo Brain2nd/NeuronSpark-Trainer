@@ -5,10 +5,12 @@
 * Resume after a crash / stop (checkpoint at update S, the run may hold updates beyond S): the same run is resumed
   (``resume="must"``).  W&B ignores steps at or below the last step it holds, so the replayed updates S+1.. are not
   logged twice; before that, the replayed updates are compared with the server's copy (:meth:`check_replay`).  A
-  replay that differs (not the same computation) switches to a new run as for a rollback.
+  replay that differs (e.g. recomputed with another micro-batch shape after a change of GPU mode) is reported and the
+  line stays in its run: the server keeps its rows up to its last step and the run continues after them.  A line gets
+  a new run only for a rollback or a branch.
 * Rollback (continuing from an earlier checkpoint on purpose, with different results): a new run of the same name,
-  backfilled from the old run's server history up to S; the old run is renamed ``<name> (superseded @S)``, tagged
-  ``superseded`` and moved to the group ``superseded`` (nothing is deleted).
+  backfilled from the old run's server history up to S (every step, checked: :meth:`history`); the old run is renamed
+  ``<name> (superseded @S)``, tagged ``superseded`` and moved to the group ``superseded`` (nothing is deleted).
 * Branch: a new run, backfilled from the parent run's server history up to the fork update; ``parent_run`` /
   ``parent_step`` in its config.
 * The run of a line is recorded in ``<ckpt_root>/wandb_run.json`` (:class:`RunRecord`) as soon as it is created, with
@@ -104,17 +106,38 @@ class Tracker:
         if n % 1000 == 0 and self.on_wait is not None:              # long scans / backfills keep the heartbeat
             self.on_wait()
 
-    def history(self, path: str, upto: Optional[int] = None, above: Optional[int] = None) -> List[dict]:
+    def history(self, path: str, upto: Optional[int] = None, above: Optional[int] = None,
+                complete: bool = False) -> List[dict]:
+        """The run's server rows with ``above < _step <= upto``, sorted.  The full scan (``scan_history``) can come back
+        incomplete from a W&B server (2026-10-25: steps 1..3370 of a run holding 1..8370, an earlier scan without the
+        steps 3371..3999), so the sampled history with as many samples as the run has steps fills what the scan
+        missed.  ``complete``: every step from the first one in range to the last is required; a missing step raises
+        (and is retried like a service error, the server's history may still be catching up)."""
         def go():
-            rows = []
-            for n, row in enumerate(wandb.Api().run(path).scan_history(), 1):
-                self._tick(n)
-                s = row.get("_step")
-                if s is None or (upto is not None and s > upto) or (above is not None and s <= above):
-                    continue
-                rows.append({k: v for k, v in row.items() if not k.startswith("_") or k == "_step"})
-            rows.sort(key=lambda r: r["_step"])
-            return rows
+            r = wandb.Api().run(path)
+            got: Dict[int, dict] = {}
+
+            def take(rows):
+                for n, row in enumerate(rows, 1):
+                    self._tick(n)
+                    s = row.get("_step")
+                    if s is None or (upto is not None and s > upto) or (above is not None and s <= above):
+                        continue
+                    got.setdefault(int(s), {k: v for k, v in row.items() if not k.startswith("_") or k == "_step"})
+
+            take(r.scan_history())
+            last = int(r.lastHistoryStep if r.lastHistoryStep is not None else -1)
+            top = last if upto is None else min(upto, last)
+            first = (above + 1) if above is not None else min(got, default=0)
+            if top >= 0 and any(s not in got for s in range(max(first, 0), top + 1)):
+                take(r.history(samples=last + 1, pandas=False))
+            if complete and got:
+                lo = min(got)
+                missing = [s for s in range(lo, top + 1) if s not in got]
+                if missing:
+                    raise RuntimeError(f"{len(missing)} steps of {lo}..{top} missing from the server's history "
+                                       f"(first {missing[0]}, last {missing[-1]})")
+            return [got[s] for s in sorted(got)]
         return self._retry(f"history of {path}", go)
 
     # ------------------------------------------------------------------ runs
@@ -147,7 +170,7 @@ class Tracker:
         """Log the source run's server rows up to ``upto`` into the current run (rows at or below the current run's
         last step are dropped by W&B, so a backfill interrupted by a restart is completed by running it again)."""
         n = 0
-        for row in self.history(self._path(src_run_id), upto=upto):
+        for row in self.history(self._path(src_run_id), upto=upto, complete=True):
             step = row.pop("_step")
             self.run.log({k: v for k, v in row.items() if v is not None}, step=step)
             n += 1
