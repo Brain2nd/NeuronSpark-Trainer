@@ -349,13 +349,15 @@ class Trainer:
 
     def _open_run(self, meta, forking: bool) -> str:
         """The line's W&B run (see nstrain.wb), continued from wandb_run.json or created; the id is recorded before
-        the run is created and marked ready after its backfill, so a restart at any point completes the same run.  A
+        the run is created and marked ready once the server holds its backfill, so a restart at any point completes
+        the same run.  A
         rollback marker makes a new run (once: a restart finds the rollback's run in the record and continues it)."""
         rec = self.rec.load()
         if rec is not None and not rec["ready"]:                     # a creation / backfill cut short: finish it
             self.wb.create(rec["run_id"], self._run_config(rec["kind"], rec["source"], rec["source_step"]))
             if rec["source"] is not None:
                 self.wb.backfill(rec["source"], rec["source_step"])
+                self.wb.confirm(rec["run_id"], rec["source_step"])
             if rec["kind"] == "rollback":
                 self.wb.supersede(rec["source"], rec["source_step"])
             rec = self.rec.save(dict(rec, ready=True))
@@ -389,6 +391,7 @@ class Trainer:
         self.wb.create(rid, self._run_config(kind, source, step))
         if source is not None:
             self.wb.backfill(source, step)
+            self.wb.confirm(rid, step)                               # on the server before the line's own rows
         if kind == "rollback":
             self.wb.supersede(source, step)
         self.rec.save(dict(rec, ready=True))
@@ -419,7 +422,7 @@ class Trainer:
         c = self.cfg
         if self.shared:
             self._slack_out()
-            self._hold(self._others(others), slack_gib=CAPTURE_SLACK_GIB)
+            self._hold(self._others(others), slack_gib=CAPTURE_SLACK_GIB, reclaim=True)
         self._beat(f"capturing the {L} engine")
         s, accum = c.length(L, self.shared), c.accum(L, self.shared)
         M.recompute(self.model, s.activation_checkpointing)
@@ -438,7 +441,7 @@ class Trainer:
         CAPTURE_SLACK_GIB, the slack less 0.25 GiB in a block of its own pool outside the arena (``self.slack``),
         which the next capture gives back to the driver (``_slack_out``): memory only a capture needs, never free for
         the others to take in between (nstrain.gpu.room_beside: what they free meanwhile stays theirs)."""
-        self._hold(others, slack_gib=CAPTURE_SLACK_GIB)
+        self._hold(others, slack_gib=CAPTURE_SLACK_GIB, reclaim=True)
 
         # the slack's second reading: when nvidia-smi fails, the first one (no slack would be worse: the next capture
         # would take its memory from what the others may still use)
@@ -532,12 +535,13 @@ class Trainer:
                     del w
                 return
 
-    def _hold(self, others: float, slack_gib: float = 0.25) -> None:
+    def _hold(self, others: float, slack_gib: float = 0.25, reclaim: bool = False) -> None:
         """Beside other processes: the arena holds the GPU's memory but what they may still take, and ``slack_gib``
         for this process's own memory outside the allocator (nstrain.gpu.hold_memory: their memory read again after
-        the free memory, so that what they free meanwhile is not taken)."""
+        the free memory, so that what they free meanwhile is not taken; with ``reclaim``, at a start or a capture,
+        what the driver keeps from dead processes is taken too)."""
         taken = hold_memory(self.cfg.guards.share_reserve_gb, others, lambda: others_gb(exclude_pid=os.getpid()),
-                            slack_gib=slack_gib, arena=self.arena)
+                            slack_gib=slack_gib, arena=self.arena, reclaim=reclaim)
         if taken >= 0.5:
             print(f"update {self.update}: holding {taken:.1f} GiB more ({torch.cuda.memory_reserved() / 2**30:.1f} GiB "
                   f"reserved); the other processes use {others:.1f} of the {self.cfg.guards.share_reserve_gb:g} GB "

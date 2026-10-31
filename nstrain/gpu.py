@@ -129,8 +129,34 @@ def room_beside(reserve_gb: float, others: float, recheck: Callable[[], float], 
         return 0
 
 
+def reclaim_dead(least: int = 16 << 20) -> int:
+    """GPU memory the driver keeps although no process holds it (seen three times on 2026-10-31 on the B300 after
+    processes were killed: 17-49 GB used by no process, for an hour or more; a killed process holding 248 GiB, busy or
+    idle, left none in a direct trial, so what leaves it is not known) is reclaimed when an allocation runs the free
+    memory out -- by whoever allocates, so a neighbour could take it beyond its reserve.  An allocation past the
+    reported free memory, in a pool of its own that goes at once, reclaims it for this process's next hold: returns
+    the bytes freed (0: none, the allocation fails).  For the milliseconds of the probe the other processes' free
+    memory is taken too (an allocation of theirs then fails), so a line probes only when it starts or captures an
+    engine, not at every check."""
+    import torch
+    free = torch.cuda.mem_get_info()[0]
+    total = torch.cuda.get_device_properties(torch.cuda.current_device()).total_memory
+    torch.cuda.set_per_process_memory_fraction(1.0)                 # (the hold caps the allocator again)
+    pool = torch.cuda.MemPool()
+    try:
+        with torch.cuda.use_mem_pool(pool):
+            probe = torch.empty(min(total, free + least), dtype=torch.uint8, device="cuda")
+    except torch.cuda.OutOfMemoryError:
+        return 0
+    del probe
+    torch.cuda.synchronize()
+    del pool                                                         # (its block back to the driver)
+    return max(0, torch.cuda.mem_get_info()[0] - free)
+
+
 def hold_memory(reserve_gb: float, others: float, recheck: Callable[[], float], sizes_gib=(4.0, 1.0),
-                slack_gib: float = 0.25, headroom_gib: float = 1.0, arena: "Arena" = None) -> float:
+                slack_gib: float = 0.25, headroom_gib: float = 1.0, arena: "Arena" = None,
+                reclaim: bool = False) -> float:
     """Take the GPU's free memory into this process's allocator but what the other processes may still take: the
     reserve less what they use (``others`` GB), plus ``slack_gib`` (this process's own memory outside the allocator,
     e.g. a kernel module loaded late) -- the bytes :func:`room_beside` gives, from one reading of the free memory
@@ -138,7 +164,8 @@ def hold_memory(reserve_gb: float, others: float, recheck: Callable[[], float], 
     reserves that much more, so free blocks it already caches serve the first ones and are not counted.  Blocks of
     ``sizes_gib`` (largest first, each as large as fits; the largest as large as the largest eager allocation, the
     readout chunk, so that a later one is served from a held block), then the rest in one block; the freed blocks stay
-    reserved by this process and serve its own allocations.  The
+    reserved by this process and serve its own allocations.  With ``reclaim`` the memory the driver keeps from dead
+    processes is taken too (:func:`reclaim_dead`, then held again, until the probe finds none).  The
     allocator's cap (:func:`cap_memory`) is then what it holds plus ``headroom_gib``: an allocation that no held
     block can serve takes at most that much more of the GPU; past it the allocator gives back the free blocks outside
     the arena (the arena's stay).  With ``arena`` the blocks are cached in it, on its stream (they serve the arena's
@@ -147,20 +174,24 @@ def hold_memory(reserve_gb: float, others: float, recheck: Callable[[], float], 
     unit, least = 2 << 20, 16 << 20                                  # requests under 10 MiB take 20 MiB segments
     sizes, head = [int(s * 2**30) for s in sizes_gib], int(headroom_gib * 2**30)
     before = torch.cuda.memory_reserved()
-    budget = room_beside(reserve_gb, others, recheck, slack_gib, least) // unit * unit
-    held = []
-    if budget >= least:
-        cap_memory((before + budget + head + unit) / 2**30)
-        with arena.use() if arena is not None else contextlib.nullcontext():
-            try:
-                while (left := budget - (torch.cuda.memory_reserved() - before)) >= least:
-                    n = next((s for s in sizes if s <= left), left // unit * unit)
-                    held.append(torch.empty(n, dtype=torch.uint8, device="cuda"))
-            except torch.cuda.OutOfMemoryError:                      # another process took the memory meanwhile
-                pass
-            del held
-        if arena is not None:
-            arena.stream.synchronize()
+    while True:
+        start = torch.cuda.memory_reserved()
+        budget = room_beside(reserve_gb, others, recheck, slack_gib, least) // unit * unit
+        held = []
+        if budget >= least:
+            cap_memory((start + budget + head + unit) / 2**30)
+            with arena.use() if arena is not None else contextlib.nullcontext():
+                try:
+                    while (left := budget - (torch.cuda.memory_reserved() - start)) >= least:
+                        n = next((s for s in sizes if s <= left), left // unit * unit)
+                        held.append(torch.empty(n, dtype=torch.uint8, device="cuda"))
+                except torch.cuda.OutOfMemoryError:                  # another process took the memory meanwhile
+                    pass
+                del held
+            if arena is not None:
+                arena.stream.synchronize()
+        if not reclaim or reclaim_dead(least) < least:
+            break
     reserved = torch.cuda.memory_reserved()
     cap_memory((reserved + head) / 2**30)
     return (reserved - before) / 2**30

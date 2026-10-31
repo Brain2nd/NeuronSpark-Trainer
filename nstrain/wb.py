@@ -14,9 +14,11 @@
 * Branch: a new run, backfilled from the parent run's server history up to the fork update; ``parent_run`` /
   ``parent_step`` in its config.
 * The run of a line is recorded in ``<ckpt_root>/wandb_run.json`` (:class:`RunRecord`) as soon as it is created, with
-  the backfill still to do; a restart (before or after the line's first checkpoint, during a backfill) resumes that
-  run and completes the backfill (W&B drops steps at or below the last one it holds), so a line never gets a second
-  run by accident.
+  the backfill still to do; it is marked ready once the server holds every backfilled step (:meth:`confirm`: the
+  client delivers asynchronously, a process killed before that loses what it had not sent, and the run's later rows
+  would then make the hole permanent).  A restart (before or after the line's first checkpoint, during a backfill)
+  resumes that run and completes the backfill (W&B drops steps at or below the last one it holds), so a line never
+  gets a second run by accident.
 * Every call to the W&B service is retried with backoff for up to ``retry_s`` seconds (an outage stalls the start of
   a run instead of failing it); logging during the run is asynchronous in the W&B client.
 * Rows the server never received (the client delivers asynchronously; a crash loses what it had not sent) are sent
@@ -190,6 +192,18 @@ class Tracker:
             n += 1
             self._tick(n)
         return n
+
+    def confirm(self, run_id: str, upto: int) -> None:
+        """Wait until the server holds steps 1..``upto`` of ``run_id`` (a backfill's rows: the client delivers them
+        asynchronously, and a process killed before that loses what it had not sent), retried like every call."""
+        def go():
+            got = {r["_step"] for r in wandb.Api().run(self._path(run_id)).scan_history(min_step=1, max_step=upto + 1)
+                   if r.get("_step") is not None}
+            missing = [s for s in range(1, upto + 1) if s not in got]
+            if missing:
+                raise RuntimeError(f"{len(missing)} of the steps 1..{upto} are not on the server yet (first "
+                                   f"{missing[0]}, last {missing[-1]})")
+        self._retry(f"backfill of {run_id} on the server", go)
 
     def supersede(self, run_id: str, at: int) -> None:
         """Rename ``run_id`` to ``<name> (superseded @at)``, tag it and move it to the group ``superseded``."""
