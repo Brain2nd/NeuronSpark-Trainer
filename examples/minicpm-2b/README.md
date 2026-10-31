@@ -9,18 +9,27 @@ the data paths are placeholders.
 
 * **Tokenizer:** `tokenizer.json` of the Hugging Face repository `openbmb/MiniCPM5-1B`; `</s>` is id 1.
 * **Sources:** the 15 corpora in `nstrain/data/sources.py` (Ultra-FineWeb, Ultra-FineWeb-L3, UltraX, UltraData-Math,
-  UltraData-Code, UltraData-Stack, InfLLM-V2 long documents), each with one held-out file for validation.
+  UltraData-Code, UltraData-Stack, InfLLM-V2 long-context data); 1 % of every file's documents (5 % of the InfLLM-V2
+  data's) are held out for validation, never trained on.
 * **Recipes** (`nstrain/data/mixture.py`), domain shares web-en 50 / web-zh 25 / math 8 / code 17 as in the tiered-data
   experiment of arXiv 2602.09003 (Sec. 3.4):
 
   | Recipe | Length | Weights |
   |---|---|---|
-  | `stable` (trunk) | 4K | web-en L2 40 + recent crawl 10, web-zh L2 25, math L2 6 + L1 2, code L2 12 + Stack L2 5 |
-  | `decay` (branch) | 4K | the L3 corpora (rewritten / synthesised), with 30 % of the stable sources as replay |
-  | `long` (branch) | 32K | 70 % long documents, 30 % the decay mix |
+  | `stable` (trunk) | 4K | web-en L2 46.7 + 2025-H2 crawls 3.3 (their shares of bytes), web-zh L2 25, math L2 6 + L1 2, code L2 12 + Stack L2 5 |
+  | `decay` (branch) | 4K | the L3 corpora (rewritten / synthesised), with 30 % of the stable mix as replay |
+  | `long` (branch) | 32K | 70 % InfLLM-V2 long-context data (MiniCPM's long stage mix; ~16 % of its tokens are in rows of 32K or more), 30 % the decay mix |
 
 * **Cycles** of 20B tokens: each is downloaded, tokenized, trained on and deleted while the next one is prepared
-  (80 GB of tokens per cycle).
+  (80 GB of tokens per cycle).  A cycle holds every stratum of each source at its share of the source's bytes
+  (languages, crawl dumps -- more than 16 of them grouped into 16 neighbouring groups --, L3 sub-types; each file of
+  the InfLLM-V2 data, one kind of data each), taken from the stratum's open files: about 16 per source spread over
+  the strata by size, at least one per stratum, fewer while they would hold more than 4 cycles' worth of the source
+  -- but never fewer than one per stratum, so a source of many large strata (the code corpora) keeps more open.  A
+  cycle reads all of every further file it opens and the rest from those open files in proportion to their sizes, so
+  after a cycle no more than those are open (105 for the stable recipe; their whole streams, at most 130 GB, wait in
+  `pool/` for the next cycles) -- a few more after a cycle whose bytes-per-token estimate of a stratum was low: the
+  files it opened but did not need wait untouched, and the next cycle reads them first.
 
 ## Commands
 
@@ -61,8 +70,15 @@ nstrain run runs/b0
   lexical memory tables); 2B tokens of warmup, then constant.  The trunk never decays; its branches do (1-sqrt to 5 %).
 * **Checkpoints:** every 0.2B tokens, the last 3 kept (24.5 GB each: fp32 weights and AdamW state); every cycle end is
   kept permanently.
-* **Validation:** every 2B tokens, 16 rows of 4,096 tokens from each source's held-out file (`val/<source>` and
-  `val/mean` in W&B).  A held-out file is one file of its source, e.g. one programming language for a code source.
-* **Shared GPU:** `guards.gpu_check_every: 1` (one `nvidia-smi` query per update) and supervisor waits of 5 s: when
-  another process starts on the GPU, the trainer checkpoints at the end of the current update and exits; the
-  supervisor resumes the line within seconds of the GPU becoming free.
+* **Validation:** every 2B tokens.  `nstrain data val` keeps the held-out documents (by a hash of their text) of each
+  stratum's first files: 8 files per source spread over its strata, at least one per stratum, more until a stratum
+  holds its rows at 32K (about 130 GB in 190 files for the 15 sources, once; cycle 0 downloads these files again,
+  the first of each stratum, for their training documents).  Each stratum validates on 64 x its
+  share rows, at least one micro-batch (8 rows of 4,096 for this line), a multiple of it -- so a source of many strata
+  validates on more than 64 rows; a source's loss weights its strata by their shares (`val_4096/<source>`); over the
+  recipe's sources `val_4096/mix` (weighted by the recipe, the held-out estimate of the training loss) and
+  `val_4096/mean` (unweighted); at 32K the same under `val_32768/`.
+* **Shared GPU:** with `guards.share_reserve_gb: 50` and the `shared` shapes measured for it (`nstrain tune
+  --shared`), the line always trains with those shapes and holds all of the GPU but 50 GB: another process may start
+  at any time and take up to 50 GB, never more; `guards.gpu_check_every: 1` re-holds what it frees at every update.
+  The run.json here is the trunk's without a reserve (the GPU to itself).

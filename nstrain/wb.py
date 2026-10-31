@@ -63,8 +63,14 @@ class RunRecord:
 
 class Tracker:
     def __init__(self, project: str, name: str, config: dict, entity: Optional[str] = None, retry_s: float = 7200.0,
-                 on_wait: Optional[Callable[[], None]] = None, local_dir: Optional[Path] = None):
+                 on_wait: Optional[Callable[[], None]] = None, local_dir: Optional[Path] = None,
+                 key_file: Optional[str] = None):
         self.project, self.name, self.config, self.entity = project, name, config, entity
+        if key_file is not None:                                     # this process's account (the client reads it
+            key = Path(key_file).read_text().strip()                 # before ~/.netrc); never logged
+            if not key:
+                raise RuntimeError(f"wandb.key_file {key_file} is empty")
+            os.environ["WANDB_API_KEY"] = key
         self.local_dir = Path(local_dir) if local_dir is not None else None
         self.retry_s = float(retry_s)
         self.on_wait = on_wait                                       # called before every retry wait (heartbeat)
@@ -97,6 +103,14 @@ class Tracker:
             run.define_metric("*", step_metric=AXIS)
             return run
         return self._retry("init", go)
+
+    def alert(self, title: str, text: str) -> None:
+        """A W&B alert on the run (e-mail / Slack as the account is set up); failures are reported, never raised."""
+        try:
+            if self.run is not None:
+                self.run.alert(title=title, text=text)
+        except Exception as e:                                       # the alert is extra; the log has the message
+            print(f"wandb: alert failed ({type(e).__name__}: {str(e)[:200]})", flush=True)
 
     def _path(self, run_id: str) -> str:
         ent = self.entity or self._retry("api", lambda: wandb.Api().default_entity)

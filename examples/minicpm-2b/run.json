@@ -68,7 +68,7 @@
  },
  "validation": {
   "every_tokens": 2000000000.0,
-  "rows": 16
+  "rows": 64
  },
  "stop_at_tokens": null,
  "guards": {

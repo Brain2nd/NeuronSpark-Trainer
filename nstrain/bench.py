@@ -27,7 +27,7 @@ import subprocess
 import sys
 import time
 from collections import defaultdict
-from typing import Dict, List, Optional
+from typing import Dict, Optional
 
 import torch
 
@@ -36,7 +36,7 @@ from nstrain import gpu
 from nstrain import model as M
 from nstrain.engine import StepEngine
 from nstrain.flat_adamw import FlatAdamW
-from nstrain.proc import SUPERVISOR, TUNE
+from nstrain.proc import TUNE
 
 
 _LEASE = []                                                          # held for the life of the process
@@ -57,7 +57,9 @@ def setting(ac):
 
 def _setup(model_spec, rows: int, seq_len: int, ac: str, shared: bool = False, max_gib: float = None):
     """The model on the GPU, which it must have to itself (the lease, then no other compute process), or beside other
-    processes (``shared``: the lease only); ``max_gib``: PyTorch's memory in this process is capped there."""
+    processes (``shared``: the lease only); ``max_gib``: PyTorch's memory in this process is capped there.  As a new
+    line's trainer has it before its first capture: the optimizer's flat buffers, the build's freed blocks given back,
+    the launch calibration run in the arena the engine is then captured in (so the peak measured is that trainer's)."""
     if not _LEASE:
         _LEASE.append(gpu.lease("bench"))
         others = gpu.other_processes(exclude_pid=os.getpid())
@@ -74,10 +76,14 @@ def _setup(model_spec, rows: int, seq_len: int, ac: str, shared: bool = False, m
     g = torch.Generator(device="cpu").manual_seed(1)
     cal_rows, cal_len = min(rows, 8), min(seq_len, 4096)            # a run's launch calibration reads 4K rows
     cal = torch.randint(0, cfg["vocab_size"], (cal_rows * max(1, CALIBRATION_ROWS // cal_rows), cal_len), generator=g)
-    M.calibrate(model, cal, cal_rows, dev)
     M.recompute(model, setting(ac))
     opt = FlatAdamW(model, M.param_groups(model))
-    return cfg, model, opt, g
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()
+    arena = gpu.Arena()
+    with arena.use():
+        M.calibrate(model, cal, cal_rows, dev)
+    return cfg, model, opt, g, arena
 
 
 def bench(model_spec, rows: int, seq_len: int, accum: int, updates: int = 12, ac: str = "none",
@@ -85,9 +91,9 @@ def bench(model_spec, rows: int, seq_len: int, accum: int, updates: int = 12, ac
     """``model_spec``: a preset name, a model-config file or a model-config dict; the median over the updates after
     the first ``skip``; ``result``: also print the measurement as one ``BENCH_RESULT {json}`` line (for ``tune``);
     ``shared``: beside other processes on the GPU; ``max_gib``: out of memory past this much PyTorch memory."""
-    cfg, model, opt, g = _setup(model_spec, rows, seq_len, ac, shared, max_gib)
+    cfg, model, opt, g, arena = _setup(model_spec, rows, seq_len, ac, shared, max_gib)
     t0 = time.time()
-    eng = StepEngine(model, opt, rows, seq_len, accum)
+    eng = StepEngine(model, opt, rows, seq_len, accum, arena=arena)
     print(f"captured in {time.time() - t0:.1f} s; allocated {torch.cuda.memory_allocated() / 2**30:.1f} GiB, "
           f"peak {torch.cuda.max_memory_allocated() / 2**30:.1f} GiB", flush=True)
     n = rows * accum
@@ -119,8 +125,8 @@ def bench(model_spec, rows: int, seq_len: int, accum: int, updates: int = 12, ac
 
 
 def profile(model_spec: str, rows: int, seq_len: int, ac: str = "none", top: int = 60, n: int = 3) -> None:
-    cfg, model, opt, g = _setup(model_spec, rows, seq_len, ac)
-    eng = StepEngine(model, opt, rows, seq_len, 1)
+    cfg, model, opt, g, arena = _setup(model_spec, rows, seq_len, ac)
+    eng = StepEngine(model, opt, rows, seq_len, 1, arena=arena)
     w = torch.randint(0, cfg["vocab_size"], (rows, seq_len + 1), generator=g)
     x, y = w[:, :-1].contiguous().pin_memory(), w[:, 1:].contiguous().pin_memory()
     for _ in range(5):
@@ -204,7 +210,7 @@ def _measure(run_dir, seq_len: int, rows: int, accum: int, ac: str, updates: int
                         "--rows", str(rows), "--accum", str(accum), "--ac", ac, "--updates", str(updates), "--skip",
                         str(skip), "--result"] + (["--shared", "--max-gib", f"{max_gib:.3f}"] if max_gib else []),
                        capture_output=True, text=True, timeout=7200,
-                       env={k: v for k, v in dict(os.environ, **{TUNE: str(os.getpid())}).items() if k != SUPERVISOR})
+                       env=dict(os.environ, **{TUNE: str(os.getpid())}))
     for line in reversed(p.stdout.splitlines()):
         if line.startswith("BENCH_RESULT "):
             return json.loads(line[len("BENCH_RESULT "):])
@@ -212,6 +218,14 @@ def _measure(run_dir, seq_len: int, rows: int, accum: int, ac: str, updates: int
     if "GpuBusy" in out or "leased by" in out:
         raise RuntimeError("another process uses the GPU: tune measures on a GPU nothing else uses")
     if any(s.lower() in out.lower() for s in OUT_OF_MEMORY):
+        # out of memory because of the shape -- or because another process took memory meanwhile: then the tune
+        # would record a slower shape for the life of the line; it stops instead (nothing written)
+        others = gpu.other_processes()
+        if others and not max_gib:
+            raise RuntimeError(f"another process started on the GPU during the tune ({others}); nothing written")
+        if others and max_gib and gpu.others_gb() * 1e9 / 2**30 > _gpu_total_gib() - max_gib - CONTEXT_GIB:
+            raise RuntimeError("the other processes on the GPU grew past the reserve during the tune; nothing "
+                               "written")
         print(f"    out of memory (exit {p.returncode})", flush=True)
         return None
     why = [x for x in out.splitlines() if "Error" in x or "error:" in x] or out.strip().splitlines()[-1:]

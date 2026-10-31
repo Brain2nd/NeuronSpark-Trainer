@@ -10,6 +10,7 @@ sha256 it is the complete data state (the order inside a cycle is fixed by the m
 """
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import threading
@@ -24,6 +25,8 @@ import torch
 
 from nstrain.data.stream import CycleStream
 
+UNSERVED_S = 120.0       # a released cycle with no preparer serving the line this long: an error (shorter: a handover)
+
 
 @dataclass
 class Update:
@@ -36,6 +39,9 @@ class Update:
     targets: torch.Tensor          # (rows, L) int64, pinned
     sources: Dict[str, int]        # samples per source
     manifest_sha256: str
+    recipe: Dict[str, float]       # the weights of the segment the update ends in (its sources validated before it)
+    order_digest: str              # of the cycle's sample order (nstrain.data.stream.CycleStream.digest)
+    mix: Dict[Tuple[str, str], Tuple[int, float]]   # (source, stratum) -> (its samples here, the planned number)
 
 
 def plan(seq_len: np.ndarray, tokens_per_update: int) -> List[Tuple[int, int, int]]:
@@ -57,6 +63,23 @@ def plan(seq_len: np.ndarray, tokens_per_update: int) -> List[Tuple[int, int, in
     return out
 
 
+def update_mix(cs: CycleStream, a: int, b: int) -> Dict[Tuple[str, str], Tuple[int, float]]:
+    """(source, stratum) -> (its samples among samples a..b of the cycle, the number its planned share gives: in each
+    segment the samples of its source there times the stratum's share of the source in that segment)."""
+    lab, seg = np.asarray(cs.label[a:b]), np.asarray(cs.segment[a:b])
+    got = np.bincount(lab, minlength=len(cs.labels))
+    want: Dict[int, float] = {}
+    for j in np.unique(seg).tolist():
+        here = np.bincount(lab[seg == j], minlength=len(cs.labels))
+        per_source: Dict[str, int] = {}
+        for c, (s, _) in enumerate(cs.labels):
+            per_source[s] = per_source.get(s, 0) + int(here[c])
+        for c, (s, _) in enumerate(cs.labels):
+            if (j, c) in cs.share:
+                want[c] = want.get(c, 0.0) + per_source[s] * cs.share[(j, c)]
+    return {cs.labels[c]: (int(got[c]), w) for c, w in want.items()}
+
+
 class Line:
     """The cycles of one data line (an nstrain.data.work directory), consumed from a given progress."""
 
@@ -72,7 +95,7 @@ class Line:
         line (it rebuilds the released cycles of its window, nstrain.data.preparer); without one it is an error."""
         from nstrain.data.preparer import served
         p = self.root / "cycles" / f"cycle_{k:05d}" / "manifest.json"
-        said = False
+        said, unserved = False, None
         while not p.exists():
             if not wait:
                 return None
@@ -80,9 +103,14 @@ class Line:
             if st["total_tokens"] is not None and k * st["cycle_tokens"] >= st["total_tokens"]:
                 return None                                          # the line's data is exhausted
             if st["cycles"].get(str(k), {}).get("status") in ("released", "releasing"):
-                if not served(self.root):
-                    raise RuntimeError(f"cycle {k} of {self.root} was released and no preparer serves the line to "
-                                       "rebuild it: run the line with `nstrain run` (its preparer rebuilds it)")
+                if served(self.root):
+                    unserved = None
+                else:                                                # (a preparer handing over or restarting:
+                    unserved = unserved or time.time()               # a short gap)
+                    if time.time() - unserved > UNSERVED_S:
+                        raise RuntimeError(f"cycle {k} of {self.root} was released and no preparer has served the "
+                                           f"line for {UNSERVED_S:.0f} s to rebuild it: run the line with "
+                                           "`nstrain run` (its preparer rebuilds it)")
                 if not said:
                     print(f"cycle {k} of {self.root} was released: waiting for the preparer to rebuild it",
                           flush=True)
@@ -97,6 +125,17 @@ class Line:
             os.fsync(f.fileno())
         tmp.replace(self.root / "progress.json")
 
+    def consume(self, run_dir) -> None:
+        """This trainer reads the data line alone while it runs (``consumer.lock``, held until the process ends): a
+        second trainer at the same time -- another line on the same data -- would move progress.json and the
+        preparer's window under the first.  Lines may use a data line one after another."""
+        self._consumer = open(self.root / "consumer.lock", "a")
+        try:
+            fcntl.flock(self._consumer, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise RuntimeError(f"another trainer reads the data line {self.root} now: {run_dir} starts after it has "
+                               "ended, or needs its own data line (`nstrain data init` / `nstrain branch`)") from None
+
     def mark(self, k: int) -> None:
         """Tell the preparer (nstrain.data.preparer) that cycle k is in training (the earlier ones are consumed)."""
         self._progress(k, False)
@@ -105,15 +144,26 @@ class Line:
         """Tell the preparer that cycle k is consumed."""
         self._progress(k, True)
 
-    def updates(self, cycle: int, sample: int, expect_sha256: str = "") -> Iterator[Update]:
-        k, i, want = cycle, sample, expect_sha256
+    def updates(self, cycle: int, sample: int, expect_sha256: str = "", expect_order: str = "") -> Iterator[Update]:
+        k, i, want, order = cycle, sample, expect_sha256, expect_order
         while True:
             man = self.manifest(k)
             if man is None:
                 return
             cs = CycleStream(str(man), seed=self.seed, start=i, expect_sha256=want)
-            want = ""                                                # only the resumed cycle is checked
+            if order and order != cs.digest:
+                raise RuntimeError(f"cycle {k}: the sample order differs from the checkpoint's ({cs.digest} != "
+                                   f"{order}; another numpy or reader?): resuming would repeat and skip data")
+            want = order = ""                                        # only the resumed cycle is checked
             ups = plan(cs.seq_len, self.tpu)
+            if i == 0:
+                taken = np.zeros(len(cs), dtype=bool)
+                for a, b, _ in ups:
+                    taken[a:b] = True
+                print(f"cycle {k}: {len(cs)} samples in {len(ups)} updates; {int((~taken).sum())} samples "
+                      f"({int(cs.seq_len[~taken].sum())} tokens) at the ends of runs of one length are skipped (fewer "
+                      f"than one update), and {cs.tail} tokens at the ends of the sources' segment streams (less than "
+                      "a window each)", flush=True)
             bounds = {a for a, _, _ in ups} | {b for _, b, _ in ups}    # an update's start, or the end of the one
             if i != 0 and i not in bounds:                              # before a skipped remainder
                 raise RuntimeError(f"cycle {k}: progress {i} is not an update boundary")
@@ -137,7 +187,9 @@ class Line:
                     y[r].copy_(t[1:])
                     src[name] = src.get(name, 0) + 1
                 pos = b
-                yield Update(k, a, b, n_up == len(ups) - 1, L, x, y, src, cs.sha256)
+                j = int(cs.segment[b - 1])
+                yield Update(k, a, b, n_up == len(ups) - 1, L, x, y, src, cs.sha256,
+                             cs.m["segments"][j]["weights"], cs.digest, update_mix(cs, a, b))
             k, i = k + 1, 0
 
 
@@ -178,17 +230,56 @@ class Prefetch:
         return u
 
 
-def val_rows(work: str, seq_len: int, rows: int) -> Dict[str, np.ndarray]:
-    """The first ``rows`` samples of each source's held-out stream (``val/<source>/*.bin``), (rows, seq_len + 1)."""
-    out = {}
-    for d in sorted((Path(work) / "val").iterdir()):
-        bins = sorted(d.glob("*.bin"))
-        if not bins:
+def _rows_per_file(n: int, files: List[dict], seq_len: int, source: str, stratum: str) -> Dict[str, int]:
+    """``n`` rows split over the files in proportion to their held-out tokens (largest remainder), none given more
+    than it holds: a file's excess goes to the others, again in proportion."""
+    from nstrain.data.hf import largest_remainder
+    cap = {str(i): max(0, (int(f["tokens"]) - 1) // seq_len) for i, f in enumerate(files)}
+    alloc, todo, left = {}, set(cap), n
+    while True:
+        a = largest_remainder(left, {k: float(files[int(k)]["tokens"]) for k in sorted(todo)})
+        over = [k for k in sorted(todo) if a[k] > cap[k]]
+        if not over:
+            alloc.update(a)
+            return alloc
+        for k in over:
+            alloc[k] = cap[k]
+            left -= cap[k]
+            todo.discard(k)
+        if not todo:
+            raise RuntimeError(f"{source}/{stratum or '(flat)'}: the held-out tokens hold {sum(cap.values())} rows "
+                               f"of {seq_len}, fewer than {n}")
+
+
+def val_rows(work: str, seq_len: int, rows: int, unit: int = 1) -> Dict[str, List[Tuple[str, float, np.ndarray]]]:
+    """Each source's validation rows (``val/<source>/index.json``, nstrain.data.work.build_val): per stratum,
+    (stratum, its share of the source, (n, seq_len + 1) rows), n = ``rows`` x the share rounded to a multiple of
+    ``unit``, at least ``unit``; a stratum's rows split over its files by their held-out tokens (``_rows_per_file``),
+    each file's rows the windows from the head of its stream (held-out documents, shuffled).  A source's loss is the
+    share-weighted mean of its strata's, so every stratum counts at its share whatever its row count."""
+    out: Dict[str, List[Tuple[str, float, np.ndarray]]] = {}
+    root = Path(work) / "val"
+    for d in sorted(root.iterdir()) if root.exists() else []:
+        idx = d / "index.json"
+        if not idx.exists():
             continue
-        a = np.memmap(bins[0], dtype=np.uint32, mode="r")
-        n = min(rows, (a.size - 1) // seq_len)
-        if n == 0:
-            continue
-        out[d.name] = np.stack([np.asarray(a[r * seq_len:r * seq_len + seq_len + 1], dtype=np.int64)
-                                for r in range(n)])
+        strata = []
+        for t in json.loads(idx.read_text())["strata"]:
+            n = max(unit, int(round(rows * t["share"] / unit)) * unit)
+            files = t["files"]
+            if not files:
+                raise RuntimeError(f"{d.name}/{t['stratum'] or '(flat)'}: no held-out documents")
+            alloc = _rows_per_file(n, files, seq_len, d.name, t["stratum"])
+            got = []
+            for i, f in enumerate(files):
+                k = alloc[str(i)]
+                if not k:
+                    continue
+                a = np.memmap(d / f["bin"], dtype=np.uint32, mode="r")
+                if k * seq_len + 1 > a.size:
+                    raise RuntimeError(f"{d / f['bin']}: {a.size} held-out tokens hold fewer than {k} rows of "
+                                       f"{seq_len}")
+                got += [np.asarray(a[r * seq_len:r * seq_len + seq_len + 1], dtype=np.int64) for r in range(k)]
+            strata.append((t["stratum"], float(t["share"]), np.stack(got)))
+        out[d.name] = strata
     return out

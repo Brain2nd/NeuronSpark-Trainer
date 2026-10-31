@@ -16,7 +16,7 @@ import shutil
 import time
 from pathlib import Path
 
-from nstrain.data.work import Work
+from nstrain.data.work import NeedsSpace, Work
 
 HELD_BY_PARENT = "NSTRAIN_PREPARER_LOCK_HELD"
 
@@ -34,16 +34,8 @@ def serve(work) -> object:
 
 
 def served(work) -> bool:
-    p = Path(work) / "preparer.lock"
-    if not p.exists():
-        return False
-    with open(p, "a") as f:
-        try:
-            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            return True
-        fcntl.flock(f, fcntl.LOCK_UN)
-        return False
+    from nstrain.proc import flock_held
+    return flock_held(Path(work) / "preparer.lock")
 
 
 def loop_pass(w: Work, lookahead: int = 1, min_free_gb: float = 200.0, **kw) -> float:
@@ -76,7 +68,11 @@ def loop_pass(w: Work, lookahead: int = 1, min_free_gb: float = 200.0, **kw) -> 
             w.rebuild(k, **kw)
             print(f"rebuilt cycle {k} in {time.time() - t0:.0f} s", flush=True)
         else:
-            w.prepare(k, **kw)
+            try:
+                w.prepare(k, min_free_gb=min_free_gb, **kw)
+            except NeedsSpace as e:                                  # the next files would not fit: wait
+                print(f"waiting: {e}", flush=True)
+                return 300.0
             print(f"prepared cycle {k} in {time.time() - t0:.0f} s", flush=True)
         return 0.0
 

@@ -30,15 +30,28 @@ anything else:
 ```
 
 `notify` (optional) is run with an event in JSON on stdin when a line finishes, fails, gets stuck, is restarted by the
-watchdog, stops because the disk is full, waits for data longer than the watchdog interval, or when its data preparer
-keeps failing.
+watchdog or after a signal it did not send, stops because the disk is full, waits for data or for the GPU longer than
+the watchdog interval, when its data preparer keeps failing, or when the supervisor itself fails.
 
 ## Concepts
 
 * A **data line** is a directory of pre-tokenized data consumed in fixed-size **cycles**: each cycle is downloaded,
   tokenized, trained on and deleted.  Its mixture schedule is append-only; every input is pinned (dataset revisions,
-  file order, tokenizer), every cycle has a permanent manifest, so any cycle can be rebuilt exactly.  The **trunk**
-  has no length limit; a **branch** is forked from the state after a trunk cycle and has its own schedule and length.
+  file and document order, tokenizer), every cycle has a permanent manifest, so any cycle can be rebuilt exactly.
+  The **trunk** grows until a source's data are used up (an error, not a second pass: `max_epochs` 1, every token
+  is trained once); a **branch** is forked from the state after a trunk cycle and has its own schedule and length.
+* The **mix is representative at every level**: every update holds each source within two samples of its recipe
+  share; every cycle and every segment of it hold every stratum of a source (its subdirectories: languages, crawl
+  dumps, L3 sub-types; or its files, for a corpus whose files are kinds of data) at its share of the source's tokens,
+  taken from the stratum's open files (all of each but the few left open for the next cycles, which give the rest in
+  proportion to their sizes) and cut at document ends; a file's documents are
+  shuffled at tokenization and encoded as plain text (a token of the tokenizer's added vocabulary written in a
+  document, e.g. `</s>`, `<param` or `<think>` in code, is its characters, not that token); the trainer reads each
+  source's windows of a segment in a random order.  1 % of every file's documents (5 % of the InfLLM-V2 data's; by a hash of their text, the same
+  in every line) are held out and never trained on as documents of that source (a text that is also in another
+  source, e.g. quoted inside an L3 row, is held out or trained there by that source's own hash); each
+  source's validation rows come from those of every stratum, and its loss weights its strata by their shares;
+  `val_<L>/mix` weights the sources by the recipe.
 * A **training line** is a directory: `run.json` (its configuration) and everything the line produces.  Every command
   takes this directory.
 
@@ -103,23 +116,28 @@ start.  The schedule only grows at its end.
   gradient norm is not finite is skipped without touching weights or optimizer state.
 * **Learning rate.** Warmup, constant and decay pieces over tokens trained; a branch continues the trunk's schedule up
   to the fork and decays from there.  The optimizer state continues across sequence-length changes.
-* **Checkpoints.** Weights and optimizer state in fp32, the data position (cycle, sample, manifest sha256), the full
+* **Checkpoints.** Weights and optimizer state in fp32, the data position (cycle, sample, manifest sha256, the
+  sample order's digest), the full
   configuration, the code versions and the W&B run; written in the background, hashed (blake2b) and renamed
   atomically.  Each cycle end, each change of sequence length and the start of a line are kept checkpoints.
 * **W&B.** One run per line; a resumed line continues its run (the replayed updates are compared with the server's
   copy; updates the server never received before a crash are sent again from the checkpoint, so the curve has no
   hole), a rollback starts a new run backfilled from the old one, a branch starts a new run backfilled from its parent.
-* **Determinism.** The same data and state give the same update: a resumed line reproduces the updates of an
-  uninterrupted one.
+* **Determinism.** The same data, state and shape give the same update: a line resumed in the same GPU mode
+  reproduces the updates of an uninterrupted one (the checkpoint records the sample order's digest; a resume with
+  another order is refused).  With a reserve for other processes the line always trains with the lengths' `shared`
+  shapes (another micro-batch split of the same update: the same data, equal up to rounding).
+* **One line per GPU.** The GPU lease is the trainer's: between a trainer's crash and its relaunch (seconds) another
+  line's supervisor waiting for the GPU may take it.  Lines that share a GPU wait for each other; none has priority.
 
 ## Recovery
 
 | Event | What happens |
 |---|---|
 | The ssh login ends, the terminal closes | nothing: the supervisor (and `nstrain data run-preparer`) runs in its own session without a terminal; where systemd-logind would end the login's processes anyway (killing them at logout or when the session is idle, or a user manager without linger), the start is refused with the `systemd-run` command that runs it as a system service |
-| The trainer crashes or is killed | the supervisor resumes the line from its newest checkpoint (data position, optimizer state, W&B run); it stops after 5 failures in a row without progress |
+| The trainer crashes or is killed | the supervisor resumes the line from its newest checkpoint (data position, optimizer state, W&B run); it stops after 5 failures in a row without progress.  A trainer stopped by a SIGTERM that did not come from the supervisor checkpoints and is relaunched (`nstrain stop` stops the line) |
 | The GPU hangs (no heartbeat for 30 min) | the trainer is killed and restarted; if it does not exit, the supervisor stops and reports it |
-| Another process appears on the GPU | the trainer checkpoints and exits (checked every `guards.gpu_check_every` updates); a crash while the other process is there is not counted as a failure; the supervisor waits until the GPU is free and resumes the line.  With `guards.share_reserve_gb` set, the line instead continues beside the other processes with each length's `shared` shape (measured once by `nstrain tune --shared`, which leaves that much memory to them) as soon as it fits beside them, and holds all of the GPU's memory but what they may still take, the reserve less what they use: they cannot grow past the reserve (an allocation past it fails in them), and the line does not stop for them; it returns to its own shapes when they leave; after 3 crashes beside them without progress it waits for a free GPU |
+| Another process appears on the GPU | with `guards.share_reserve_gb` set the line already trains beside other processes: each length with its `shared` shape (measured for that reserve by `nstrain tune --shared`; a start without one is refused), all of the GPU's memory held but what they may still take, the reserve less what they use, adjusted at every check (`guards.gpu_check_every` updates): they cannot grow past the reserve (an allocation past it fails in them), and the line neither stops nor changes its shape for them -- what it holds stays held while it runs (`nstrain.gpu.Arena`), so nothing can take it, but for a 4 GiB slack it gives back while it captures an engine or runs a new line's first forward (at its start and at a change of sequence length, about a minute); what they free is held again only past their reserve (the free memory is read between two readings of theirs).  The reserve stays free while nobody uses it (the shared shape is a little slower than the line's own: about 1.7 % for the 2B line).  Without a reserve the trainer checkpoints and exits, and the supervisor waits until the GPU is free.  A crash while another process is (or was at the trainer's last check) on the GPU is not counted as a failure; after 3 crashes beside them without progress the line waits for a free GPU |
 | A checkpoint write is interrupted | the partial write is discarded at the next start |
 | The data source is unreachable, the preparer crashes | the preparer restarts with backoff and resumes the cycle with the same files; the trainer waits; a long wait or repeated preparer failures are notified |
 | The disk fills up | the preparer waits for space; the trainer checkpoints while there is room and stops for the operator |

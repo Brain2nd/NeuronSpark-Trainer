@@ -12,8 +12,8 @@ Recipe basis (the MiniCPM team's published practice):
   Sec. 3.4);
 * tiers rise over training (L1 -> L2 -> L3 beat a 1:1:1 mix of the same tokens by +1.49 pp there, without the late
   saturation of the mix): the trunk draws L2 (plus some math L1), the decay branch L3;
-* the decay keeps ~30 % of the stable distribution as replay (their decay verification: 30 % new data + 70 % default;
-  MiniCPM5-1B's decay is L3-centred);
+* the decay keeps 30 % of the stable distribution as replay -- every stable source at its stable share inside its
+  domain (their decay verification: 30 % new data + 70 % default; MiniCPM5-1B's decay is L3-centred);
 * MiniCPM4: 7T stable + 1T annealing at 4K, then 20B at 32K; MiniCPM5-1B: short decay 200B at 4K, long decay 75B at
   32K + 25B at 128K; MiniCPM5-2B's corpora: Ultra-FineWeb, Ultra-FineWeb-L3, UltraX, UltraData-Code, UltraData-Math.
 """
@@ -24,19 +24,20 @@ from typing import Dict, List, Optional, Tuple
 from nstrain.data.sources import SOURCES
 
 # domain shares: web_en 50, web_zh 25, math 8, code 17 in both 4K recipes
-STABLE = {
-    "web_en_l2": 40.0, "web_en_l2_recent": 10.0,                       # web_en 50 (recent crawl = a fifth)
+STABLE = {                         # web_en: the two L2 crawl ranges (to 2025-18; 2025-30..51) at their shares of
+    "web_en_l2": 46.7, "web_en_l2_recent": 3.3,                        # bytes (6,747 : 478 GB): web_en 50
     "web_zh_l2": 25.0,                                                 # web_zh 25
-    "math_l2": 6.0, "math_l1": 2.0,                                    # math 8
-    "code_l2": 12.0, "code_l2_stack": 5.0,                             # code 17
+    "math_l2": 6.0, "math_l1": 2.0,                                    # math 8 (the higher tier first)
+    "code_l2": 12.0, "code_l2_stack": 5.0,                             # code 17 (about their bytes, 611 : 273)
 }
-DECAY = {
-    "web_en_l3_qa": 14.0, "web_en_l3_style": 11.0, "web_en_ultrax": 10.0, "web_en_l2": 15.0,   # web_en 50 (replay 15)
-    "web_zh_l3_qa": 9.0, "web_zh_l3_style": 8.0, "web_zh_l2": 8.0,                               # web_zh 25 (replay 8)
-    "math_l3": 6.0, "math_l2": 2.0,                                                              # math 8 (replay 2)
-    "code_l3": 12.0, "code_l2": 5.0,                                                             # code 17 (replay 5)
+DECAY = {                          # the replay (30) holds every stable source at its stable share inside its domain
+    "web_en_l3_qa": 14.0, "web_en_l3_style": 11.0, "web_en_ultrax": 10.0,                   # web_en 50 (replay 15)
+    "web_en_l2": 14.0, "web_en_l2_recent": 1.0,
+    "web_zh_l3_qa": 9.0, "web_zh_l3_style": 8.0, "web_zh_l2": 8.0,                            # web_zh 25 (replay 8)
+    "math_l3": 6.0, "math_l2": 1.5, "math_l1": 0.5,                                           # math 8 (replay 2)
+    "code_l3": 12.0, "code_l2": 3.5, "code_l2_stack": 1.5,                                    # code 17 (replay 5)
 }
-LONG = dict({"long_mix": 70.0}, **{k: v * 30.0 / 100.0 for k, v in DECAY.items()})              # 70 % long documents
+LONG = dict({"long_mix": 70.0}, **{k: v * 30.0 / 100.0 for k, v in DECAY.items()})     # 70 % MiniCPM's long-stage data
 
 RECIPES: Dict[str, dict] = {
     "stable": {"seq_len": 4096, "weights": STABLE},

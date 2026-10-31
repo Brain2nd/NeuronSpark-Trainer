@@ -8,6 +8,7 @@
     nstrain data run-preparer --work W [--foreground]   the preparer under supervision (no trainer), in the background
 
     nstrain new RUN --model ns-2b --data W [--val W] [--peak-lr ..] [--warmup-tokens ..] [--wandb-project ..]
+                                                    [--wandb-key-file F]
     nstrain branch RUN --from PARENT_RUN --at-cycle K --plan decay:25e9,long:4e9 --data W_B [--cycle-tokens ..]
     nstrain check RUN          start checks without a GPU
     nstrain run RUN [--foreground]   the line under supervision (trainer + data preparer), in the background
@@ -55,6 +56,10 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--total-tokens", type=float)
     p.add_argument("--plan", help="recipe:tokens,... (default: the open-ended stable recipe of a trunk)")
     p.add_argument("--line", default="trunk")
+    p.add_argument("--open-files", type=int, default=16,
+                   help="files open per source at once, spread over its strata by size (at least one per stratum)")
+    p.add_argument("--max-strata", type=int, default=16,
+                   help="strata per source at most (neighbouring subdirectories merged; 1: a source is one stratum)")
     for name in ("calibrate", "val"):
         p = ds.add_parser(name)
         p.add_argument("--work", required=True)
@@ -108,6 +113,7 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--tokens-per-update", type=int)
     p.add_argument("--shape-from", help="the preset whose run defaults a model-config file uses")
     p.add_argument("--wandb-project", default="ns-pretrain")
+    p.add_argument("--wandb-key-file", help="a file with the line's W&B API key (default: the host's login)")
     p = sub.add_parser("branch", help="a branch line from a parent's cycle end (data fork + run.json)")
     p.add_argument("run")
     p.add_argument("--from", dest="parent", required=True)
@@ -169,6 +175,22 @@ def _parser() -> argparse.ArgumentParser:
     return ap
 
 
+def _adopt(w, path: str) -> dict:
+    """The sources' measured bytes per token of another line's state; and its strata's (with the sums they come from:
+    this line's files add to them, and they count before a source's own calibration) when that line has the same
+    files in the same strata (pinned revisions, max_strata)."""
+    st, src = w.load(), json.loads(open(path).read())
+    st["bytes_per_token"].update(src["bytes_per_token"])
+    if src.get("revisions") == st["revisions"] and src.get("max_strata") == st["max_strata"]:
+        for k in ("stratum_bpt", "stratum_sums"):
+            for n, v in src.get(k, {}).items():
+                st.setdefault(k, {}).setdefault(n, {}).update(v)
+    else:
+        print(f"{path}: other revisions or strata; its strata's bytes per token are not adopted")
+    w.save(st)
+    return st
+
+
 def _data(a) -> int:
     if a.dcmd == "loop":
         import signal
@@ -218,12 +240,10 @@ def _data(a) -> int:
             if not tok:
                 raise SystemExit("--tokenizer (or \"tokenizer\" in the host settings)")
             sched, total = mixture.parse_plan(a.plan) if a.plan else (None, a.total_tokens)
-            w.init(tok, a.eos_id, a.cycle_tokens, total, sched, a.line)
+            w.init(tok, a.eos_id, a.cycle_tokens, total, sched, a.line, a.open_files, max_strata=a.max_strata)
             src = host.get("calibration_from")
             if src:
-                st = w.load()
-                st["bytes_per_token"].update(json.loads(open(src).read())["bytes_per_token"])
-                w.save(st)
+                _adopt(w, src)
                 print(f"bytes per token adopted from {src}")
         elif a.dcmd == "calibrate":
             for n, m in sorted(w.calibrate(sorted(a.sources or SOURCES), **_kw(a)).items()):
@@ -231,17 +251,22 @@ def _data(a) -> int:
                       f"{m['file_bytes']/max(1, m['tokens']):6.3f} B/tok  {m['text_bytes']/max(1, m['tokens']):6.3f} "
                       f"text B/tok  {m['docs']:8d} docs  {m['tokens']/max(1e-9, m['seconds'])/1e6:7.2f} M tok/s")
         elif a.dcmd == "adopt-calibration":
-            st = w.load()
-            st["bytes_per_token"].update(json.loads(open(a.src).read())["bytes_per_token"])
-            w.save(st)
+            st = _adopt(w, a.src)
             print({k: round(v, 3) for k, v in st["bytes_per_token"].items()})
         elif a.dcmd == "val":
-            for n, m in sorted(w.build_val(sorted(a.sources or SOURCES), **_kw(a)).items()):
-                print(f"{n:18s} {m['tokens']/1e6:9.2f} M tokens  {m['bin']}")
+            w.build_val(sorted(a.sources or SOURCES), **_kw(a))
+            for n in sorted(a.sources or SOURCES):
+                idx = w.root / "val" / n / "index.json"
+                if idx.exists():
+                    strata = json.loads(idx.read_text())["strata"]
+                    fs = [f for t in strata for f in t["files"]]
+                    print(f"{n:18s} {len(strata)} strata, {len(fs)} files, {sum(f['tokens'] for f in fs)/1e6:7.2f} M "
+                          "held-out tokens kept")
         elif a.dcmd == "prepare":
             m = w.prepare(a.cycle, **_kw(a))
             for s, ps in sorted(m["sources"].items()):
-                print(f"{s:18s} {sum(p['count'] for p in ps)/1e9:7.3f} B tokens in {len(ps)} pieces")
+                print(f"{s:18s} {sum(p['count'] for p in ps)/1e9:7.3f} B tokens from {len({p['path'] for p in ps})} "
+                      f"files in {len({p['stratum'] for p in ps})} strata")
         elif a.dcmd == "release":
             w.release(a.cycle)
         elif a.dcmd == "rebuild":
@@ -297,7 +322,7 @@ def _dispatch(a) -> int:
     if a.cmd == "new":
         from nstrain import ops
         cfg = ops.new(a.run, a.model, a.data, a.val, a.name, a.peak_lr, a.warmup_tokens, a.wandb_project,
-                      a.tokens_per_update, a.shape_from)
+                      a.tokens_per_update, a.shape_from, a.wandb_key_file)
         print(f"{cfg.run_dir / 'run.json'}: line {cfg.name}, model {a.model}, data {cfg.data_work}")
         return 0
     if a.cmd == "branch":
@@ -340,9 +365,6 @@ def _dispatch(a) -> int:
             bench.bench(model, a.rows, a.seq_len, a.accum, a.updates, a.ac, a.result, a.skip, a.shared, a.max_gib)
         return 0
     if a.cmd == "tune":
-        import signal
-        from nstrain.proc import SUPERVISOR, die_with_parent
-        die_with_parent(SUPERVISOR, signal.SIGTERM)                 # a supervisor's tune ends with the supervisor
         from nstrain import bench
         bench.tune(a.run, a.margin_gib, a.updates, write=not a.dry_run, shared=a.shared)
         return 0

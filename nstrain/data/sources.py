@@ -1,7 +1,9 @@
 """The MiniCPM open corpora used for pre-training, one entry per (repository, directory).
 
 ``field`` is the text column; ``domain`` is the mixture domain (web_en / web_zh / math / code / long); ``tier`` follows
-the UltraData tiers (L1 filtered, L2 model-selected, L3 rewritten / synthesised).  Sizes are those of the Hugging Face
+the UltraData tiers (L1 filtered, L2 model-selected, L3 rewritten / synthesised); ``holdout`` is the share of each
+file's documents kept for validation (nstrain.data.tokenize.held); ``file_strata`` makes every file a stratum
+(nstrain.data.hf.stratum_of).  Sizes are those of the Hugging Face
 listing on 2026-10-21; token counts come from the calibration (``nstrain data calibrate``) in the active tokenizer.
 """
 from __future__ import annotations
@@ -19,6 +21,10 @@ class Source:
     tier: str
     note: str = ""
     fields: Tuple[str, ...] = ()        # several text columns joined with blank lines (e.g. the four-part code L3)
+    markers: Tuple[str, str] = ("", "")  # literal begin / end markers around each row's text: the corpus's framing,
+                                         # removed (the EOS is added by tokenization; a "</s>" inside is text)
+    holdout: float = 0.01               # share of the documents held out for validation (never trained on)
+    file_strata: bool = False           # every file is its own stratum (a corpus whose files are kinds of data)
 
 
 SOURCES: Dict[str, Source] = {
@@ -52,7 +58,10 @@ SOURCES: Dict[str, Source] = {
                             "273 GB"),
     "code_l3": Source("openbmb/UltraData-Code", "data/UltraData-Code-L3", "full_content", "code", "L3",
                       "task / analysis / solution / test aligned (full_content = all four parts), 605 GB"),
-    # long context (32K documents)
+    # long-context stage mixture (MiniCPM's InfLLM-V2 data; not only long documents)
     "long_mix": Source("openbmb/InfLLM-V2-data-5B", "train", "text", "long", "L2",
-                       "web / code / papers / wiki long documents, 16 GB"),
+                       "MiniCPM's long-context stage data, 16 GB, ~5.3B tokens: 20 files, each one kind of row (web, "
+                       "code, papers, chat, short synthetic arithmetic ...); ~0.85B tokens are in rows of 32K tokens "
+                       "or more, the median row of most files is under 400 tokens; each row is \"<s> ... </s>\"",
+                       markers=("<s>", "</s>"), holdout=0.05, file_strata=True),
 }

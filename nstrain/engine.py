@@ -11,7 +11,9 @@ Three graphs share one memory pool:
 
 The optimizer state is created at construction; the warm-up before capture runs at learning rate 0 (weights unchanged)
 and the optimizer state is restored afterwards; buffers the forward may write are snapshotted and restored as well.  A
-new shape (a sequence-length change) gets a new engine over the same model and optimizer.
+new shape (a sequence-length change) gets a new engine over the same model and optimizer, in the
+same ``arena`` (nstrain.gpu.Arena): it warms up and captures in the memory the arena holds (the old engine's, once it
+is released, or memory held beside other processes), never asking the driver for more when the arena has room.
 """
 from __future__ import annotations
 
@@ -25,7 +27,8 @@ from nstrain.flat_adamw import FlatAdamW
 
 class StepEngine:
     def __init__(self, model, optimizer: FlatAdamW, rows: int, seq_len: int, accum: int,
-                 grad_clip: float = 1.0, warmup_iters: int = 3, compile: bool = False):
+                 grad_clip: float = 1.0, warmup_iters: int = 3, compile: bool = False, arena=None,
+                 before_capture=None):
         self.model, self.opt = model, optimizer
         self.loss_fn = torch.compile(model.loss, dynamic=False) if compile else model.loss
         self.rows, self.L, self.accum, self.clip = int(rows), int(seq_len), int(accum), float(grad_clip)
@@ -36,7 +39,9 @@ class StepEngine:
         self.loss_sum, self.ce_sum, self.aux_sum = (torch.zeros((), **f32) for _ in range(3))
         self.gnorm = torch.zeros((), **f32)
         self.graphs: Dict[str, torch.cuda.CUDAGraph] = {}
-        self._capture(warmup_iters)
+        from nstrain.gpu import Arena
+        self.arena = arena if arena is not None else Arena()          # the trainer's: memory it already holds
+        self._capture(warmup_iters, before_capture)
 
     # ------------------------------------------------------------------ bodies (eager and captured)
     def _micro(self) -> None:
@@ -59,32 +64,39 @@ class StepEngine:
             t.zero_()
 
     # ------------------------------------------------------------------ capture
-    def _capture(self, warmup_iters: int) -> None:
+    def _capture(self, warmup_iters: int, before_capture=None) -> None:
         # the warm-up runs real steps at learning rate 0; a non-finite warm-up gradient would still reach the weights
         # (0 x NaN), so the parameters are restored too
-        params = [p.detach().clone() for p in self.model.parameters()]
-        bufs = {n: b.detach().clone() for n, b in self.model.named_buffers()}
-        saved = {n: {k: v.detach().clone() for k, v in st.items()} for n, st in self.opt.state().items()}
-        saved_lr = self.opt.lr.clone()
-        self.opt.lr.zero_()                                          # warm-up steps leave the weights unchanged
-        side = torch.cuda.Stream()
-        side.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(side):
+        # everything in the arena (the copies, the warm-up, the captures): memory it holds, no new driver memory;
+        # captured without torch.cuda.graph, whose entry empties the allocator's cache (it would give the memory
+        # back to the driver, for any process to take), thread-local (the prefetch thread may pin host memory)
+        a = self.arena
+        a.stream.wait_stream(torch.cuda.current_stream())
+        with a.use():
+            params = [p.detach().clone() for p in self.model.parameters()]
+            bufs = {n: b.detach().clone() for n, b in self.model.named_buffers()}
+            saved = {n: {k: v.detach().clone() for k, v in st.items()} for n, st in self.opt.state().items()}
+            saved_lr = self.opt.lr.clone()
+            self.opt.lr.zero_()                                      # warm-up steps leave the weights unchanged
             for _ in range(warmup_iters):
                 for _ in range(min(2, self.accum)):
                     self._micro()
                 self._norm()
                 self._step()
-        torch.cuda.current_stream().wait_stream(side)
         torch.cuda.synchronize()
-        pool = torch.cuda.graph_pool_handle()
-        for name, body in (("micro", self._micro), ("norm", self._norm), ("step", self._step)):
+        if before_capture is not None:                               # eager work whose first-call caches must be
+            before_capture()                                         # live before the arena's free blocks become
+        for name, body in (("micro", self._micro), ("norm", self._norm), ("step", self._step)):   # graph scratch
             g = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(g, pool=pool):
-                body()
+            with torch.cuda.stream(a.stream):
+                g.capture_begin(pool=a.pool.id, capture_error_mode="thread_local")
+                try:
+                    body()
+                finally:                                             # (as torch.cuda.graph's exit: a failed body
+                    g.capture_end()                                  # still ends the capture)
             self.graphs[name] = g
         torch.cuda.synchronize()
-        with torch.no_grad():                                        # undo the warm-up
+        with torch.no_grad(), a.use():                               # undo the warm-up
             for p, q in zip(self.model.parameters(), params):
                 p.copy_(q)
             for n, b in self.model.named_buffers():
@@ -93,6 +105,8 @@ class StepEngine:
             self.opt.lr.copy_(saved_lr)
             self.opt.zero_grad()
             self._zero_sums()
+            del params, bufs, saved, saved_lr
+        torch.cuda.synchronize()
 
     # ------------------------------------------------------------------ use
     def update(self, inputs: torch.Tensor, targets: torch.Tensor, base_lr: float) -> Tuple[dict, bool]:

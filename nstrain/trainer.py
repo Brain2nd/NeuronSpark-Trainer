@@ -12,6 +12,7 @@ The line's run directory (see nstrain.config for run.json)::
     trainer.lock        one trainer per line
     STOP                stop with a checkpoint: empty = at the next update boundary, {"at_cycle_end": k} = after the
                         last update of cycle k (``nstrain stop``); renamed STOP.honored-<update> when honored
+                        (nstrain.proc.honor_stop)
     wandb/              the W&B client's local files (those of runs that finished cleanly are removed at the next
                         start)
     rollback.json       written by `nstrain rollback`: this start continues as a new W&B run (removed once it exists)
@@ -28,16 +29,19 @@ of the old length, also when that update's checkpoint was a rolling one or the r
 checkpoint; the data preparer is told a cycle is consumed only after that checkpoint is on disk, and is told the cycle
 in training when the trainer starts.  Exit codes (nstrain.exits): 0 done / stopped / the line's data is exhausted, 3
 another process uses the GPU (beside other processes, at the start: the shapes do not fit beside them), 4 another
-trainer holds the line, 5 not enough disk space for the next checkpoints (checked after every update; a checkpoint is
-written while there is room), 6 beside other processes, and they left (relaunch with the GPU to itself), 1 failure
-(also when nvidia-smi fails: at start, or at three checks in a row, then after a checkpoint).  The GPU is checked every
-``guards.gpu_check_every`` updates; another process (with the GPU to itself) or the other processes leaving (beside
-them) end the run with a checkpoint.  Beside other processes (``$NSTRAIN_GPU_MODE=shared``, set by the supervisor, see
-nstrain.gpu) every length trains with its ``shared`` shape; once its engine is captured (and one validation
-micro-batch has run, so that the eager kernels are loaded and the readout chunk is cached), and at every check, the
-trainer holds the GPU's memory but what the other processes may still take, ``guards.share_reserve_gb`` less what they
-use (nstrain.gpu.hold_memory): they cannot grow past the reserve, and the line does not stop for them.  Started by a
-supervisor (``NSTRAIN_SUPERVISOR_PID``), the trainer gets SIGTERM when the supervisor dies.
+trainer holds the line, 5 a condition a relaunch cannot fix (not enough disk space for the next checkpoints, checked
+after every update -- a checkpoint is written while there is room --; a failed start check or preflight; a rollback
+marker that does not match ``latest``; another trainer reading the data line; the data read off their plan), 1 failure
+(also when nvidia-smi fails: at start, or at three checks in a row, then after a checkpoint).  A stop by a signal
+(exit 0) writes "stopped by a signal" as the last heartbeat stage (the supervisor relaunches a trainer it did not
+stop).  The GPU is checked every ``guards.gpu_check_every`` updates.  With ``guards.share_reserve_gb``
+set the line trains beside other processes, whether they are there or not: every length with its ``shared`` shape
+(measured for that reserve by ``nstrain tune --shared``; a start without one is refused), the engines captured and
+validation run in the trainer's arena (nstrain.gpu.Arena), which holds all of the GPU but what the other processes
+may still take -- the reserve less what they use, adjusted at every check (nstrain.gpu.hold_memory): they cannot grow
+past the reserve, and the line neither stops nor changes its shape for them (a change of shape would give memory back
+to the driver, for anything to take).  Without a reserve another process appearing ends the run with a checkpoint
+(exit 3).  Started by a supervisor (``NSTRAIN_SUPERVISOR_PID``), the trainer gets SIGTERM when the supervisor dies.
 """
 from __future__ import annotations
 
@@ -49,10 +53,9 @@ import os
 import shutil
 import signal
 import subprocess
-import sys
 import time
 from pathlib import Path
-from typing import List
+from typing import Dict, Optional
 
 import torch
 
@@ -63,10 +66,12 @@ from nstrain import schedule as sched
 from nstrain.checks import preflight, start_problems
 from nstrain.ckpt import Checkpoints, snapshot
 from nstrain.data.batches import Line, Prefetch, val_rows
+from nstrain.data.stream import ORDER_FORMAT
 from nstrain.engine import StepEngine
 from nstrain.flat_adamw import FlatAdamW
-from nstrain.gpu import (GPU_MODE, GpuBusy, GpuCheckFailed, GpuFree, beside_limit_gib, cap_memory, fits_beside,
-                         hold_memory, lease, other_processes, others_gb)
+from nstrain.gpu import (CAPTURE_SLACK_GIB, GpuBusy, GpuCheckFailed, beside_limit_gib, cap_memory, fits_beside,
+                         hold_memory, lease, other_processes, others_gb, room_beside)
+from nstrain.proc import honor_stop
 from nstrain.wb import RunRecord, Tracker
 
 
@@ -109,6 +114,9 @@ def code_versions(tokenizer_sha256: str) -> dict:
     return v
 
 
+MIX_ALARM_Z = 8.0                  # the read mix this many standard deviations off the plan: an alert
+
+
 class Trainer:
     def __init__(self, run):
         self.stop = False
@@ -126,24 +134,28 @@ class Trainer:
             fcntl.flock(self._lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             raise LineBusy(f"another trainer holds {self.root / 'trainer.lock'}") from None
-        self._beat("start")
-        self.shared = os.environ.get(GPU_MODE) == "shared"
-        if self.shared and c.guards.share_reserve_gb is None:
-            raise RuntimeError(f"${GPU_MODE}=shared needs guards.share_reserve_gb")
+        # a reserve set: the line always trains with its shapes beside other processes and holds all of the GPU but
+        # the reserve, whether they are there or not -- they may start at any time and take up to the reserve, never
+        # more; a change of shape on their arrival would have to give memory back to the driver, and anything could
+        # take it then (a greedy process took 86 GiB of a 6 GiB reserve in that moment, tests/test_gpu_share.py)
+        self.shared = c.guards.share_reserve_gb is not None
+        self.others_last = 0.0                                       # their GB when last measured (nstrain.gpu)
+        self.stopped_waiting = False                                 # a stop came while waiting for data
+        self._beat("start")                                          # (its mode: the supervisor's crash count)
         if not c.guards.allow_shared_gpu:                           # before any CUDA initialisation
             self._lease = lease(str(self.root))
             others = other_processes(exclude_pid=os.getpid())
-            if self.shared and not others:
-                raise GpuFree("no other process on the GPU: the line trains with the GPU to itself")
-            if self.shared and not fits_beside(others_gb(exclude_pid=os.getpid()), c.guards.share_reserve_gb):
+            if self.shared and others:
+                self.others_last = others_gb(exclude_pid=os.getpid())
+            if self.shared and others and not fits_beside(self.others_last, c.guards.share_reserve_gb):
                 raise GpuBusy(f"the shapes do not fit beside the other processes on the GPU (more than the "
                               f"{c.guards.share_reserve_gb:g} GB reserved for them and the tune's margin): {others}")
             if others and not self.shared:
                 raise GpuBusy(f"other processes on the GPU: {others}; training needs the GPU to itself "
                               "(guards.allow_shared_gpu overrides)")
         problems = preflight(c)
-        if problems:
-            raise RuntimeError("cannot start: " + "; ".join(problems))
+        if problems:                                                 # a configuration to fix: no relaunch helps
+            raise NeedsOperator("cannot start: " + "; ".join(problems))
         if self.shared:                                              # out of memory before the reserve is touched
             total = torch.cuda.get_device_properties(torch.cuda.current_device()).total_memory / 2**30
             cap_memory(beside_limit_gib(total, c.guards.share_reserve_gb))
@@ -163,8 +175,8 @@ class Trainer:
             self._beat("checkpoint loaded")
             problems = start_problems(c, meta, self.data_state, forking=latest is None)
             if problems:
-                raise RuntimeError("cannot start: " + "; ".join(problems) + "  (allow_changes in run.json lists "
-                                   "keys that may change on purpose)")
+                raise NeedsOperator("cannot start: " + "; ".join(problems) + "  (allow_changes in run.json lists "
+                                    "keys that may change on purpose)")
             self.model = M.build(self.model_cfg, self.dev, init="empty")
             self.model.load_state_dict({k: v.to(self.dev) for k, v in ms.items()}, strict=True)
             self.update, self.tokens = int(meta["update"]), int(meta["tokens"])
@@ -173,16 +185,17 @@ class Trainer:
             if latest is not None:                                   # continue this line
                 self.progress = (int(meta["data"]["cycle"]), int(meta["data"]["sample"]))
                 self.expect_sha = meta["data"]["manifest_sha256"]
+                self.expect_order = meta["data"].get("order_digest", "")
                 self.last_ckpt = self.update
                 self.prev_shape = meta.get("shape")
             else:                                                    # a branch starts at its own cycle 0
-                self.progress, self.expect_sha = (0, 0), ""
+                self.progress, self.expect_sha, self.expect_order = (0, 0), "", ""
         else:
             meta, opt_state = None, None
             torch.manual_seed(c.seed)
             self.model = M.build(self.model_cfg, self.dev, init="launch")
             self.update = self.tokens = self.skipped = 0
-            self.progress, self.expect_sha = (0, 0), ""
+            self.progress, self.expect_sha, self.expect_order = (0, 0), "", ""
         o = c.optimizer
         groups = M.param_groups(self.model, o.weight_decay, o.lexical_lr_mult)
         self.opt = FlatAdamW(self.model, groups, tuple(o.betas), o.eps)
@@ -193,11 +206,29 @@ class Trainer:
         if not self._room(1):
             raise NeedsOperator(self._space_message(1))
         self.engine = None
+        torch.cuda.empty_cache()                                     # the build's and the load's freed blocks (the
+        self.mix: Dict[tuple, tuple] = {}                            # arena cannot use them; before any hold)
+        self.mix_alarm = None
+        from nstrain.gpu import Arena
+        self.arena = Arena()                                         # the engines', calibration's, validation's memory
+        self.slack = self.slack_pool = None                          # (_slack_in)
+        if self.shared:                                              # from here on -- the wait for data, W&B -- they
+            self._slack_in(self._others(None))                       # get the reserve, no more
+        if c.stop_at_tokens is not None and self.tokens >= c.stop_at_tokens:
+            print(f"line {c.name}: stop_at_tokens {c.stop_at_tokens:.0f} reached (update {self.update}); nothing to "
+                  "train", flush=True)                               # (not waiting for the next cycle's data)
+            self.finished = True
+            return
+        try:
+            self.line.consume(self.root)
+        except RuntimeError as e:
+            raise NeedsOperator(str(e)) from None
         self.line.mark(self.progress[0])
-        self.updates = Prefetch(self.line.updates(*self.progress, expect_sha256=self.expect_sha))
-        self.first = self._next_update()
+        self.updates = Prefetch(self.line.updates(*self.progress, expect_sha256=self.expect_sha,
+                                                  expect_order=self.expect_order))
+        self.first = self._next_update(self.progress[0])
         if self.first is None:
-            if self._stop_requested():
+            if self.stopped_waiting:
                 print(f"line {c.name}: stopped before its first update here (update {self.update})", flush=True)
                 self.finished = True
                 return
@@ -206,16 +237,20 @@ class Trainer:
                 self.finished = True
                 return
             raise RuntimeError("no data on this line")
-        if src is None:
-            M.calibrate(self.model, self.first.inputs, c.length(self.first.seq_len).micro_rows, self.dev)
+        if src is None:                                              # the process's first forward: memory outside
+            self._slack_out()                                        # the allocator, as a capture's (_engine_for)
+            with self.arena.use():
+                M.calibrate(self.model, self.first.inputs, c.length(self.first.seq_len).micro_rows, self.dev)
+            if self.shared:
+                self._slack_in(self._others(None))
             self._beat("calibrated")
-            self._save(self.first.cycle, self.first.first, self.first.manifest_sha256, keep=True, background=False,
-                       shape=None, run_id=None)                      # the launch state of the line
+            self._save(self.first.cycle, self.first.first, self.first.manifest_sha256, self.first.order_digest,
+                       keep=True, background=False, shape=None, run_id=None)     # the launch state of the line
             self.last_ckpt = 0
 
         wcfg = dict(c.to_dict(), run_dir=str(self.root), model_config=self.model_cfg, code=self.code)
         self.wb = Tracker(c.wandb.project, c.name, wcfg, c.wandb.entity, retry_s=c.wandb.retry_s,
-                          on_wait=lambda: self._beat("wandb"), local_dir=self.root)
+                          on_wait=lambda: self._beat("wandb"), local_dir=self.root, key_file=c.wandb.key_file)
         self.wb.clean_local()
         self.rec = RunRecord(self.root / "wandb_run.json")
         self.run_id = self._open_run(meta, forking=src is not None and latest is None)
@@ -236,15 +271,15 @@ class Trainer:
         except json.JSONDecodeError:
             return {}                                                # unreadable: an unconditional stop
 
-    def _stop_requested(self, u=None, before: bool = False) -> bool:
+    def _stop_requested(self, u=None, before: bool = False, at: Optional[int] = None) -> bool:
         """A stop by signal, or by the STOP file: unconditional, or {"at_cycle_end": k}, due after the last update
-        of cycle k (``before``: before an update of a later cycle)."""
+        of cycle k (``before``: before an update of a later cycle; ``at``: waiting for the data of cycle ``at``)."""
         s = self._stop_file()
         due = False
         if s is not None:
             k = s.get("at_cycle_end")
-            due = k is None or (u is not None and (u.cycle > k if before else
-                                                    (u.cycle > k or (u.cycle == k and u.cycle_end))))
+            due = (k is None or (at is not None and at > k) or
+                   (u is not None and (u.cycle > k if before else (u.cycle > k or (u.cycle == k and u.cycle_end)))))
             self.stop_honored = self.stop_honored or due
         return self.stop or due
 
@@ -257,7 +292,9 @@ class Trainer:
 
     def _beat(self, stage: str) -> None:
         tmp = self.root / "heartbeat.tmp"
-        tmp.write_text(json.dumps({"time": time.time(), "update": self.update, "stage": stage, "pid": os.getpid()}))
+        tmp.write_text(json.dumps({"time": time.time(), "update": self.update, "stage": stage, "pid": os.getpid(),
+                                   "others": getattr(self, "others_seen", 0),
+                                   "mode": "shared" if getattr(self, "shared", False) else "exclusive"}))
         os.replace(tmp, self.root / "heartbeat")
 
     def _rollback_marker(self, latest):
@@ -267,8 +304,8 @@ class Trainer:
             return None
         m = json.loads(p.read_text())
         if latest is None or latest.name != f"u{int(m['to']):08d}":
-            raise RuntimeError(f"{p}: a rollback to update {m['to']}, but `latest` is {latest}; re-run "
-                               "`nstrain rollback`")
+            raise NeedsOperator(f"{p}: a rollback to update {m['to']}, but `latest` is {latest}; re-run "
+                                "`nstrain rollback`")
         return m
 
     def _resend(self) -> None:
@@ -293,15 +330,17 @@ class Trainer:
             print(f"warning: the W&B run lacks updates {holes[:20]} below its last one ({top}); they cannot be sent "
                   "again", flush=True)
 
-    def _next_update(self):
-        """The next update; None at the end of the line or when a stop is requested while the preparer is behind."""
+    def _next_update(self, at: int):
+        """The next update (of cycle ``at`` or later); None at the end of the line or when a stop is requested while
+        the preparer is behind (a STOP at the end of a cycle before ``at`` is due then)."""
         waited = 0
         while True:
             u = self.updates.get(timeout=60.0)
             if u is not Prefetch.WAITING:
                 return u
-            if self._stop_requested():
+            if self._stop_requested(at=at):
                 print(f"update {self.update}: stop requested while waiting for prepared data", flush=True)
+                self.stopped_waiting = True
                 return None
             waited += 1
             self._beat("waiting for data")
@@ -361,31 +400,89 @@ class Trainer:
         return {"rollback": {"rollback_of": source, "rollback_step": step},
                 "branch": {"parent_run": source, "parent_step": step}}.get(kind, {})
 
-    def _engine_for(self, L: int) -> StepEngine:
+    def _engine_for(self, L: int, others: Optional[float] = None) -> StepEngine:
+        """The engine of length L, warmed up and captured in the trainer's arena (nstrain.gpu.Arena): a new one
+        reuses the memory the arena holds.  Beside other processes the slack (``_slack_in``) goes back to the driver
+        for the capture -- the memory outside the allocator that a warm-up and a capture create (kernel modules,
+        local memory, graph data) -- while the arena holds all the rest but what they may still take (``others``:
+        their GB, else measured); the slack's unused rest is held again after the capture.  One validation
+        micro-batch runs before the capture (its first-call caches then live outside the graphs' scratch)."""
         if self.engine is not None and self.engine.L == L:
             return self.engine
         if self.engine is not None:
-            self.engine.release()
-            self.engine = None
-            torch.cuda.empty_cache()
+            self.engine.release()                                    # its memory stays in the arena (beside others:
+            self.engine = None                                       # held, the slack aside); alone on the GPU it
+            if not self.shared:                                      # goes back to the driver, so that the new
+                from nstrain.gpu import Arena                        # length's engine fits as in `nstrain tune` (a
+                self.arena.close()                                   # process of its own)
+                self.arena = Arena()
         c = self.cfg
+        if self.shared:
+            self._slack_out()
+            self._hold(self._others(others), slack_gib=CAPTURE_SLACK_GIB)
         self._beat(f"capturing the {L} engine")
         s, accum = c.length(L, self.shared), c.accum(L, self.shared)
         M.recompute(self.model, s.activation_checkpointing)
         t0 = time.time()
-        self.engine = StepEngine(self.model, self.opt, s.micro_rows, L, accum, c.optimizer.grad_clip)
+        self.engine = StepEngine(self.model, self.opt, s.micro_rows, L, accum, c.optimizer.grad_clip,
+                                 arena=self.arena, before_capture=lambda: self._warm_validation(L))
         print(f"engine {accum} x {s.micro_rows} x {L}{' (beside other processes)' if self.shared else ''} captured "
               f"in {time.time() - t0:.0f} s, {torch.cuda.memory_allocated() / 2**30:.1f} GiB", flush=True)
-        if self.shared:                                              # a capture empties the cache: hold again
-            self._warm_validation(L)
-            try:
-                self._hold(others_gb(exclude_pid=os.getpid()))
-            except GpuCheckFailed as e:                              # the next check holds
-                print(f"{e}; the memory is held at the next check", flush=True)
+        if self.shared:
+            self._slack_in(self._others(None))
         self._beat(f"{L} engine captured")
         return self.engine
 
-    def _save(self, cycle: int, sample: int, sha: str, keep: bool, background: bool, shape, run_id) -> None:
+    def _slack_in(self, others: float) -> None:
+        """Beside other processes: all of the GPU held but what they may still take -- in the arena all but
+        CAPTURE_SLACK_GIB, the slack less 0.25 GiB in a block of its own pool outside the arena (``self.slack``),
+        which the next capture gives back to the driver (``_slack_out``): memory only a capture needs, never free for
+        the others to take in between (nstrain.gpu.room_beside: what they free meanwhile stays theirs)."""
+        self._hold(others, slack_gib=CAPTURE_SLACK_GIB)
+
+        # the slack's second reading: when nvidia-smi fails, the first one (no slack would be worse: the next capture
+        # would take its memory from what the others may still use)
+        def again() -> float:
+            try:
+                return others_gb(exclude_pid=os.getpid())
+            except GpuCheckFailed:
+                return others
+        n = min(int((CAPTURE_SLACK_GIB - 0.25) * 2**30), room_beside(self.cfg.guards.share_reserve_gb, others, again))
+        n = n // (2 << 20) * (2 << 20)
+        if self.slack is None and n >= 64 << 20:
+            cap_memory((torch.cuda.memory_reserved() + n) / 2**30 + 1.0)            # (room for the block; the
+                                                                                    # hold below caps it again)
+            pool = torch.cuda.MemPool()
+            try:
+                with torch.cuda.use_mem_pool(pool):
+                    self.slack = torch.empty(n, dtype=torch.uint8, device=self.dev)
+                self.slack_pool = pool
+            except torch.cuda.OutOfMemoryError:                      # another process took it meanwhile
+                self.slack = None
+        self._hold(others)                                           # (the allocator's cap: what it holds, again)
+
+    def _slack_out(self) -> None:
+        """The slack block back to the driver (before a capture): its pool goes, and with it that block only -- the
+        arena's blocks and any other cached ones stay held."""
+        if self.slack is not None:
+            self.slack = None
+            torch.cuda.synchronize()
+            self.slack_pool = None
+
+    def _others(self, others: Optional[float]) -> float:
+        """The other processes' GB: ``others`` if given, else measured -- else (nvidia-smi failed) the last value
+        seen."""
+        if others is None:
+            try:
+                others = others_gb(exclude_pid=os.getpid())
+            except GpuCheckFailed as e:
+                print(f"{e}; the other processes' memory taken as last seen ({self.others_last:.1f} GB)", flush=True)
+                return self.others_last
+        self.others_last = others
+        return others
+
+    def _save(self, cycle: int, sample: int, sha: str, order: str, keep: bool, background: bool, shape,
+              run_id) -> None:
         """A checkpoint of the current state whose data progress is (cycle, sample)."""
         if not self._room(1):
             raise NeedsOperator(self._space_message(1))
@@ -395,7 +492,7 @@ class Trainer:
         meta = {"update": self.update, "tokens": self.tokens, "skipped": self.skipped,
                 "skipped_in_a_row": self.in_a_row, "line": c.name, "run_dir": str(self.root), "rows": rows,
                 "data": {"work": c.data_work, "cycle": cycle, "sample": sample, "manifest_sha256": sha,
-                         "seed": c.data_seed},
+                         "seed": c.data_seed, "order": ORDER_FORMAT, "order_digest": order},
                 "shape": shape, "run": c.to_dict(), "model_config": self.model_cfg, "code": self.code,
                 "wandb_run": run_id, "time": time.time()}
         self.ckpts.save(self.update, ms, os_, meta, keep=keep, background=background)
@@ -405,53 +502,74 @@ class Trainer:
         """A checkpoint after update ``u``."""
         shape = {"rows": self.engine.rows, "seq_len": self.engine.L, "accum": self.engine.accum}
         if u.cycle_end:
-            self._save(u.cycle + 1, 0, "", keep, background, shape, self.run_id)
+            self._save(u.cycle + 1, 0, "", "", keep, background, shape, self.run_id)
         else:
-            self._save(u.cycle, u.next, u.manifest_sha256, keep, background, shape, self.run_id)
+            self._save(u.cycle, u.next, u.manifest_sha256, u.order_digest, keep, background, shape, self.run_id)
+
+    def _val_rows(self, L: int):
+        """The validation rows of length L (nstrain.data.batches.val_rows), each stratum's a multiple of L's own
+        micro_rows: the same rows whatever the reserve (a shared shape is re-tuned with it)."""
+        if L not in self.val:
+            self.val[L] = val_rows(self.cfg.val_work, L, self.cfg.validation.rows, self.cfg.length(L, False).micro_rows)
+        return self.val[L]
+
+    def _val_batch(self, L: int) -> int:
+        """Validation micro-batch rows: the training shape's micro_rows when it divides L's own (the strata's row
+        counts are multiples of that; the kernels' per-shape caches are then the training ones), else their greatest
+        common divisor (its first call is warmed before the capture, ``_warm_validation``)."""
+        return math.gcd(self.cfg.length(L, False).micro_rows, self.cfg.length(L, self.shared).micro_rows)
 
     @torch.no_grad()
     def _warm_validation(self, L: int) -> None:
-        """One validation micro-batch beside other processes before the memory is held: its kernels are loaded (a module
-        loaded later needs memory outside the allocator, which a held GPU may not have) and its blocks, the readout
-        chunk among them, are in this process's cache."""
-        if L not in self.val:
-            self.val[L] = val_rows(self.cfg.val_work, L, self.cfg.validation.rows)
-        mb = self.cfg.length(L, self.shared).micro_rows
-        for arr in self.val[L].values():
-            if arr.shape[0] >= mb:
-                w = torch.from_numpy(arr[:mb]).to(self.dev)
-                self.model.loss(w[:, :-1].contiguous(), w[:, 1:].contiguous())
+        """One validation micro-batch, before an engine's capture (StepEngine's ``before_capture``): its kernels are
+        loaded and its first-call caches are created while the arena's free blocks are not yet graph scratch."""
+        mb = self._val_batch(L)
+        for strata in self._val_rows(L).values():
+            for _, _, arr in strata:
+                with self.arena.use():
+                    w = torch.from_numpy(arr[:mb]).to(self.dev)
+                    self.model.loss(w[:, :-1].contiguous(), w[:, 1:].contiguous())
+                    del w
                 return
 
-    def _hold(self, others: float) -> None:
-        """Beside other processes: hold the GPU's memory but what they may still take (nstrain.gpu.hold_memory)."""
-        taken = hold_memory(self.cfg.guards.share_reserve_gb, others)
-        if abs(taken) >= 0.5:
-            print(f"update {self.update}: {'holding' if taken > 0 else 'gave back'} {abs(taken):.1f} GiB "
-                  f"({torch.cuda.memory_reserved() / 2**30:.1f} GiB reserved); the other processes use {others:.1f} "
-                  f"of the {self.cfg.guards.share_reserve_gb:g} GB reserved for them", flush=True)
+    def _hold(self, others: float, slack_gib: float = 0.25) -> None:
+        """Beside other processes: the arena holds the GPU's memory but what they may still take, and ``slack_gib``
+        for this process's own memory outside the allocator (nstrain.gpu.hold_memory: their memory read again after
+        the free memory, so that what they free meanwhile is not taken)."""
+        taken = hold_memory(self.cfg.guards.share_reserve_gb, others, lambda: others_gb(exclude_pid=os.getpid()),
+                            slack_gib=slack_gib, arena=self.arena)
+        if taken >= 0.5:
+            print(f"update {self.update}: holding {taken:.1f} GiB more ({torch.cuda.memory_reserved() / 2**30:.1f} GiB "
+                  f"reserved); the other processes use {others:.1f} of the {self.cfg.guards.share_reserve_gb:g} GB "
+                  "reserved for them", flush=True)
 
     @torch.no_grad()
-    def _validate(self, L: int) -> dict:
-        rows = self.cfg.validation.rows
-        if L not in self.val:
-            self.val[L] = val_rows(self.cfg.val_work, L, rows)
-        out, tot, n = {}, 0.0, 0
-        mb = self.cfg.length(L, self.shared).micro_rows
-        for name, arr in self.val[L].items():
+    def _validate(self, L: int, recipe: dict) -> dict:
+        """The held-out loss of every source at length L (``val_<L>/<source>``: its strata's losses weighted by their
+        shares of the source), and over the sources of the update's recipe ``recipe`` ({source: weight}): weighted
+        by the recipe (``val_<L>/mix``, the held-out estimate of the training loss) and unweighted (``.../mean``)."""
+        key = f"val_{L}"
+        out, got = {}, {}
+        mb = self._val_batch(L)
+        for name, strata in self._val_rows(L).items():
             self._beat(f"validation {name}")
-            s, k = 0.0, 0
-            for i in range(0, arr.shape[0], mb):
-                w = torch.from_numpy(arr[i:i + mb]).to(self.dev)
-                if w.shape[0] < mb:
-                    break
-                s += float(self.model.loss(w[:, :-1].contiguous(), w[:, 1:].contiguous()).ce)
-                k += 1
-            if k:
-                out[f"val/{name}"] = s / k
-                tot, n = tot + s / k, n + 1
-        if n:
-            out["val/mean"] = tot / n
+            acc = tot = 0.0
+            for _, share, arr in strata:
+                s = 0.0
+                with self.arena.use():                               # (in the arena: memory the trainer holds)
+                    for i in range(0, arr.shape[0], mb):
+                        w = torch.from_numpy(arr[i:i + mb]).to(self.dev)
+                        s += float(self.model.loss(w[:, :-1].contiguous(), w[:, 1:].contiguous()).ce)
+                        del w
+                acc += share * s / (arr.shape[0] // mb)
+                tot += share
+            got[name] = out[f"{key}/{name}"] = acc / tot
+        mine = {n: float(w) for n, w in recipe.items() if w > 0}
+        missing = sorted(n for n in mine if n not in got)
+        if missing:
+            raise RuntimeError(f"validation: no held-out rows of the recipe's sources {missing} at length {L}")
+        out[f"{key}/mix"] = sum(got[n] * w for n, w in mine.items()) / sum(mine.values())
+        out[f"{key}/mean"] = sum(got[n] for n in mine) / len(mine)
         return out
 
     # ------------------------------------------------------------------ the loop
@@ -462,17 +580,43 @@ class Trainer:
             self.ckpts.wait()
             self.ckpts.keep(self.update)
         else:
-            self._save(u.cycle, u.first, u.manifest_sha256, keep=True, background=False, shape=self.prev_shape,
-                       run_id=self.run_id)
+            self._save(u.cycle, u.first, u.manifest_sha256, u.order_digest, keep=True, background=False,
+                       shape=self.prev_shape, run_id=self.run_id)
         print(f"update {self.update}: stage end ({self.prev_shape['seq_len']} -> {u.seq_len}), kept checkpoint",
               flush=True)
+
+    def _mix_check(self) -> dict:
+        """The strata of the samples read since the last check against the cycles' plans: the largest deviation in
+        standard deviations (``data/mix_z``; binomial, a random order keeps it under ~5).  Past MIX_ALARM_Z the data
+        are not mixed as planned: a W&B alert, and the line stops with a checkpoint for the operator (a defect in
+        the data's order costs every update trained on it)."""
+        worst, name = 0.0, None
+        tot: Dict[str, float] = {}
+        for (src, _), (_, e) in self.mix.items():
+            tot[src] = tot.get(src, 0.0) + e
+        for key, (o, e) in self.mix.items():
+            p = e / tot[key[0]] if tot.get(key[0]) else 0.0
+            sd = math.sqrt(max(e * (1 - p), 1e-9))
+            z = abs(o - e) / sd if e >= 25 else 0.0                  # (too few samples to judge)
+            if z > worst:
+                worst, name = z, key
+        self.mix = {}
+        if worst > MIX_ALARM_Z:
+            msg = (f"update {self.update}: the samples of {name[0]}/{name[1] or '(flat)'} deviate {worst:.1f} standard "
+                   "deviations from the cycle's plan since the last check: the data are not mixed as planned")
+            print(msg, flush=True)
+            self.wb.alert("data mix", msg)
+            self.mix_alarm = msg
+        return {"data/mix_z": worst}
 
     def _gpu_check(self, row: dict):
         """(other processes on the GPU, their memory in GB beside them, else 0), or None when the check failed; a
         failed check counts, three in a row raise."""
         try:
             busy = other_processes(exclude_pid=os.getpid())
-            gb = others_gb(exclude_pid=os.getpid()) if self.shared and busy else 0.0
+            gb = others_gb(exclude_pid=os.getpid()) if busy and self.shared else 0.0
+            if self.shared:
+                self.others_last = gb
         except GpuCheckFailed as e:
             self.gpu_check_fails += 1
             row["sys/gpu_check_failed"] = self.gpu_check_fails
@@ -481,8 +625,9 @@ class Trainer:
                 raise
             return None
         self.gpu_check_fails = 0
+        self.others_seen = len(busy)                                 # (in the heartbeat: the supervisor's crash call)
         row["sys/other_gpu_processes"] = len(busy)
-        if self.shared:
+        if busy and self.shared:
             row["sys/other_gpu_gb"] = gb
         return busy, gb
 
@@ -498,7 +643,7 @@ class Trainer:
         diverged = False
         self.gpu_check_fails = 0
         u = self.first
-        last_u = None
+        last_u = recipe = None
         last_t = time.time()
         rc = 0
         while u is not None:
@@ -510,6 +655,12 @@ class Trainer:
             if self._stop_requested(u, before=True):
                 print(f"update {self.update}: stop requested; no further update", flush=True)
                 break
+            if u.recipe is not recipe:                               # a new segment: its sources validate (else
+                missing = sorted(set(u.recipe) - set(self._val_rows(u.seq_len)))       # an error before training)
+                if missing:
+                    raise RuntimeError(f"update {self.update + 1}: the recipe's sources {missing} have no held-out "
+                                       f"rows of {u.seq_len} in {c.val_work} (`nstrain data val`)")
+                recipe = u.recipe
             eng = self._engine_for(u.seq_len)
             lr = sched.lr_at(c.schedule, c.optimizer.peak_lr, self.tokens)
             metrics, applied = eng.update(u.inputs, u.targets, lr)
@@ -531,8 +682,12 @@ class Trainer:
                 print(f"update {self.update}: replay differs from the server's copy (recomputed with another "
                       "micro-batch shape, or not the same computation); the server keeps its rows and the run "
                       "continues after its last step", flush=True)
+            for name, (o, e) in u.mix.items():                      # the samples read against the plan
+                a, b = self.mix.get(name, (0, 0.0))
+                self.mix[name] = (a + o, b + e)
             if self.tokens >= next_val:
-                row.update(self._validate(u.seq_len))
+                row.update(self._validate(u.seq_len, u.recipe))
+                row.update(self._mix_check())
                 next_val += val_every
             seen, check_failed = None, False                         # (other processes, their GB) when checked
             if self.update % c.guards.gpu_check_every == 0 and not c.guards.allow_shared_gpu:
@@ -541,9 +696,8 @@ class Trainer:
                 except GpuCheckFailed:
                     check_failed = True
             busy = seen[0] if seen else []
-            left = self.shared and seen is not None and not busy
-            if self.shared and busy:                                 # the other processes get the reserve, no more
-                self._hold(seen[1])
+            if self.shared and seen is not None:                     # the others get the reserve, no more (and
+                self._hold(seen[1])                                  # what they free is held again)
             row["sys/gpu_shared"] = int(self.shared)
             self.wb.log(self.update, row)
             self.rows.append((self.update, row))
@@ -560,12 +714,12 @@ class Trainer:
                 print(f"update {self.update}: the GPU cannot be checked; checkpoint and stop (failure)", flush=True)
                 rc = exits.FAILURE
             elif busy and not self.shared and not stop:
-                print(f"update {self.update}: other processes on the GPU: {busy}; checkpoint and stop", flush=True)
+                print(f"update {self.update}: other processes on the GPU: {busy} (no guards.share_reserve_gb: the "
+                      "line trains with the GPU to itself); checkpoint and stop", flush=True)
                 rc = exits.GPU_BUSY
-            elif left and not stop:
-                print(f"update {self.update}: the other processes left the GPU; checkpoint and continue with the GPU "
-                      "to itself", flush=True)
-                rc = exits.GPU_FREE
+            elif self.mix_alarm and not stop:
+                print(f"update {self.update}: {self.mix_alarm}; checkpoint and stop for the operator", flush=True)
+                rc = exits.NEEDS_OPERATOR
             elif not self._room(2) and not stop:
                 print(f"update {self.update}: {self._space_message(2)}; checkpoint and stop", flush=True)
                 rc = exits.NEEDS_OPERATOR
@@ -581,7 +735,7 @@ class Trainer:
                 next_ck += ck_every
             if done:
                 break
-            u = self._next_update()
+            u = self._next_update(u.cycle + 1 if u.cycle_end else u.cycle)
         if last_u is not None and self.last_ckpt != self.update:     # stopped while waiting for data
             self._checkpoint(last_u, keep=False, background=False)
         self.ckpts.wait()
@@ -590,9 +744,13 @@ class Trainer:
         return rc
 
     def _honor_stop(self) -> None:
+        """The STOP file renamed when it stopped the run; a stop by a signal said in the last heartbeat (the
+        supervisor tells it from the end of the line, nstrain.supervise)."""
         stop = self.root / "STOP"
         if self.stop_honored and stop.exists():
-            os.replace(stop, self.root / f"STOP.honored-{self.update}")
+            honor_stop(self.root, self.update)
+        if self.stop:
+            self._beat(exits.SIGNAL_STOP)
 
 
 def main(run) -> int:
@@ -601,9 +759,6 @@ def main(run) -> int:
     except GpuBusy as e:
         print(f"trainer: {e}", flush=True)
         return exits.GPU_BUSY
-    except GpuFree as e:
-        print(f"trainer: {e}", flush=True)
-        return exits.GPU_FREE
     except LineBusy as e:
         print(f"trainer: {e}", flush=True)
         return exits.LINE_BUSY

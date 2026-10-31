@@ -6,6 +6,7 @@ start instead of hours later (at the first validation, the first cycle of a new 
 """
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import List
 
@@ -16,7 +17,11 @@ from nstrain import schedule as sched
 def start_problems(cfg: C.RunConfig, meta: dict, data_state: dict, forking: bool) -> List[str]:
     """Why the checkpoint ``meta`` (the line's newest, or ``fork_from`` at a branch's first start) and this
     configuration do not belong together ([] if they do)."""
+    from nstrain.data.stream import ORDER_FORMAT
     old, allowed, problems = meta["run"], set(cfg.allow_changes), []
+    if meta["data"].get("order", 1) != ORDER_FORMAT:
+        problems.append(f"the checkpoint's data position is in sample order {meta['data'].get('order', 1)}, this "
+                        f"nstrain reads order {ORDER_FORMAT}: resuming would repeat and skip data")
     if meta["code"]["tokenizer_sha256"] != data_state["tokenizer_sha256"]:
         problems.append("the checkpoint was trained with another tokenizer")
     if meta["model_config"] != cfg.model and "model" not in allowed:
@@ -49,16 +54,30 @@ def start_problems(cfg: C.RunConfig, meta: dict, data_state: dict, forking: bool
 
 def preflight(cfg: C.RunConfig) -> List[str]:
     """The data line loads (tokenizer file and library as at init), every recipe source is calibrated and pinned,
-    every sequence length of the line has engine settings and held-out rows."""
+    every sequence length of the line has engine settings and held-out rows (of the line's revisions, holdout rule
+    and text encoding), the W&B key file (when set) holds a key."""
     from nstrain.data.batches import val_rows
     from nstrain.data.sources import SOURCES
+    from nstrain.data.tokenize import TEXT
     from nstrain.data.work import Work
     problems = []
+    if cfg.wandb.key_file is not None:
+        try:
+            if not Path(cfg.wandb.key_file).read_text().strip():
+                problems.append(f"wandb.key_file {cfg.wandb.key_file} is empty")
+        except OSError as e:
+            problems.append(f"wandb.key_file {cfg.wandb.key_file} cannot be read: {e}")
     try:
         st = Work(cfg.data_work).load()
     except (OSError, RuntimeError, KeyError, ValueError) as e:
-        return [f"data line {cfg.data_work}: {e}"]
+        return problems + [f"data line {cfg.data_work}: {e}"]
     problems += C.check_lengths(cfg, st)
+    r = cfg.guards.share_reserve_gb
+    if r is not None:                                                # the line trains beside other processes
+        for L, x in sorted(cfg.lengths.items()):
+            if x.shared is None or x.shared.reserve_gb != r:
+                problems.append(f"lengths.{L} has no shape beside other processes measured for the reserve of "
+                                f"{r:g} GB (`nstrain tune --shared`)")
     for e in st["schedule"]:
         for s in e["weights"]:
             if s not in st["bytes_per_token"]:
@@ -66,13 +85,31 @@ def preflight(cfg: C.RunConfig) -> List[str]:
             if s not in SOURCES or SOURCES[s].repo not in st["revisions"]:
                 problems.append(f"source {s} of recipe {e['recipe']} has no pinned revision in {cfg.data_work}")
     val = Path(cfg.val_work) / "val"
-    missing = sorted({s for e in st["schedule"] for s in e["weights"] if not any((val / s).glob("*.bin"))})
+    def held(s: str) -> bool:
+        try:
+            idx = json.loads((val / s / "index.json").read_text())
+            return all((val / s / f["bin"]).exists() for t in idx["strata"] for f in t["files"])
+        except (OSError, ValueError, KeyError):
+            return False
+    missing = sorted({s for e in st["schedule"] for s in e["weights"] if not held(s)})
     if missing:
         problems.append(f"no held-out streams of {missing} in {val} (`nstrain data val --work {cfg.val_work}`)")
-    for L in sorted({int(e["seq_len"]) for e in st["schedule"]}):
+    for s in sorted({s for e in st["schedule"] for s in e["weights"]} - set(missing)):
+        idx = json.loads((val / s / "index.json").read_text())
+        if s in SOURCES and idx.get("revision") != st["revisions"].get(SOURCES[s].repo):
+            problems.append(f"held-out rows of {s} are of revision {idx.get('revision')}, the data line trains on "
+                            f"{st['revisions'].get(SOURCES[s].repo)}")
+        if s in SOURCES and idx.get("holdout") != Work.holdout(s):
+            problems.append(f"held-out rows of {s} were chosen by {idx.get('holdout')}, the data line leaves out "
+                            f"{Work.holdout(s)}: they may be trained on")
+        if idx.get("text") != TEXT:
+            problems.append(f"held-out rows of {s} were encoded with text mode {idx.get('text')!r}, the data line "
+                            f"with {TEXT!r}: rebuild them (`nstrain data val --work {cfg.val_work}` remakes an index "
+                            "of another text mode)")
+    for L in sorted({int(e["seq_len"]) for e in st["schedule"]} & set(cfg.lengths) if not missing else ()):
         try:
-            if not val_rows(cfg.val_work, L, 1):
+            if not val_rows(cfg.val_work, L, cfg.validation.rows, cfg.length(L, False).micro_rows):
                 problems.append(f"no held-out streams of {L + 1} tokens in {val}")
-        except FileNotFoundError:
-            break
+        except (FileNotFoundError, RuntimeError) as e:
+            problems.append(f"held-out rows of {L}: {e}")
     return problems

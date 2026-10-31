@@ -38,15 +38,8 @@ from nstrain.data.work import Work, _write_atomic
 
 def _held(lock: Path) -> bool:
     """Another process holds this lock file."""
-    if not lock.exists():
-        return False
-    with open(lock, "a") as f:
-        try:
-            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            return True
-        fcntl.flock(f, fcntl.LOCK_UN)
-        return False
+    from nstrain.proc import flock_held
+    return flock_held(lock)
 
 
 def _runs_line(pid: int, cfg: C.RunConfig) -> bool:
@@ -69,9 +62,11 @@ def running(cfg: C.RunConfig) -> dict:
 # ---------------------------------------------------------------------- new / branch
 def new(run_dir, model: str, data_work: str, val_work: Optional[str] = None, name: Optional[str] = None,
         peak_lr: float = 3e-4, warmup_tokens: Optional[float] = None, wandb_project: str = "ns-pretrain",
-        tokens_per_update: Optional[int] = None, shape_from: Optional[str] = None) -> C.RunConfig:
+        tokens_per_update: Optional[int] = None, shape_from: Optional[str] = None,
+        wandb_key_file: Optional[str] = None) -> C.RunConfig:
     """A trunk-type line (warmup, then a constant rate).  ``model``: a preset name or a model-config JSON file;
-    ``shape_from``: the preset whose run defaults (lengths, tokens per update, warmup) a model file uses."""
+    ``shape_from``: the preset whose run defaults (lengths, tokens per update, warmup) a model file uses;
+    ``wandb_key_file``: a file with the line's W&B API key (default: the host's login)."""
     run_dir = Path(run_dir).resolve()
     if run_dir.exists() and any(run_dir.iterdir()):
         raise FileExistsError(f"{run_dir} is not empty")
@@ -86,7 +81,9 @@ def new(run_dir, model: str, data_work: str, val_work: Optional[str] = None, nam
         "tokens_per_update": int(tokens_per_update or d["tokens_per_update"]), "lengths": d["lengths"],
         "optimizer": dict(M.OPTIMIZER, peak_lr=peak_lr),
         "schedule": [{"from": 0, "to": w, "kind": "warmup"}, {"from": w, "to": None, "kind": "constant"}],
-        "wandb": {"project": wandb_project}}, where=str(run_dir / C.RUN_FILE))
+        "wandb": {"project": wandb_project,
+                  "key_file": str(Path(wandb_key_file).resolve()) if wandb_key_file else None}},
+        where=str(run_dir / C.RUN_FILE))
     cfg.run_dir = run_dir
     from nstrain.checks import preflight
     problems = preflight(cfg)
@@ -208,7 +205,13 @@ def stop(run, now: bool = False, at_cycle_end: Optional[int] = None) -> str:
     body = "" if at_cycle_end is None else json.dumps({"at_cycle_end": int(at_cycle_end)})
     _write_atomic(cfg.run_dir / "STOP", body)
     when = "at the next update boundary" if at_cycle_end is None else f"after the last update of cycle {at_cycle_end}"
-    note = "" if live["trainer"] else " (no trainer runs now: the next start honors it)"
+    if live["trainer"]:
+        note = ""
+    elif at_cycle_end is None:
+        note = " (no trainer runs now: a waiting supervisor stops within a second, else the next start honors it)"
+    else:
+        note = (f" (no trainer runs now: a waiting supervisor stops within a second if the latest checkpoint is past "
+                f"cycle {at_cycle_end}, else it starts the trainer, which stops at that cycle's end)")
     return f"{cfg.run_dir / 'STOP'}: the trainer stops {when} with a checkpoint{note}"
 
 
@@ -223,6 +226,13 @@ def rollback(run, to: int, force: bool = False) -> str:
             except BlockingIOError:
                 raise RuntimeError(f"{cfg.name}: {lock} is held (a supervisor / trainer runs this line); "
                                    "stop it first (`nstrain stop`)") from None
+        Path(cfg.data_work).mkdir(parents=True, exist_ok=True)       # (as Work.lock, for its progress.json below)
+        f = held.enter_context(open(Path(cfg.data_work) / "consumer.lock", "a"))
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise RuntimeError(f"{cfg.name}: another trainer reads the data line {cfg.data_work} (consumer.lock is "
+                               "held); the rollback would move its progress: stop that line first") from None
         ck = Checkpoints(cfg.ckpt_dir)
         target = cfg.ckpt_dir / f"u{to:08d}"
         marker = cfg.run_dir / "rollback.json"

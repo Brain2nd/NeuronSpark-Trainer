@@ -21,16 +21,19 @@ produces lives next to it (checkpoints/, run.log, heartbeat, wandb_run.json, sup
                    "lexical_lr_mult": 8.0, "grad_clip": 1.0},
      "schedule": [{"from": 0, "to": 2e9, "kind": "warmup"}, {"from": 2e9, "to": null, "kind": "constant"}],
      "checkpoints": {"every_tokens": 2e9, "keep_last": 3},
-     "validation": {"every_tokens": 2e9, "rows": 16},
+     "validation": {"every_tokens": 2e9, "rows": 64},   # rows per source, spread over its strata
      "stop_at_tokens": null,                  # no update starts at or past it
      "guards": {"max_skipped_in_a_row": 10, "gpu_check_every": 50, "allow_shared_gpu": false,
                 "share_reserve_gb": null},    # null: the GPU to itself; a number: train beside other processes,
-                                              # which get this much memory and no more (see nstrain.gpu)
+                                              # which get this much memory and no more (see nstrain.gpu); read at
+                                              # a start (the shared shapes are measured for it: change, re-tune,
+                                              # restart)
      "supervisor": {"max_fails": 5, "stall_s": 1800, "restart_pause_s": 30, "gpu_wait_s": 60, "prepare": true,
                     "preparer": {"lookahead": 1, "min_free_gb": 200, "dl_workers": 8, "tok_workers": 8, "rayon": 8}},
      "allow_changes": [],                     # FROZEN keys allowed to differ from the line's checkpoints (on purpose)
      "print_every": 10,
-     "wandb": {"project": "ns-pretrain", "entity": null, "retry_s": 7200}
+     "wandb": {"project": "ns-pretrain", "entity": null, "retry_s": 7200,
+               "key_file": null}                # a file with the line's W&B API key (null: the host's login)
     }
 
 Every key is checked (unknown keys are errors, also nested ones); the sections that only steer the process
@@ -90,7 +93,7 @@ class Checkpointing:
 @dataclass
 class Validation:
     every_tokens: float = 2e9
-    rows: int = 16
+    rows: int = 64                  # per source, spread over its held-out files (nstrain.data.batches.val_rows)
 
 
 @dataclass
@@ -125,6 +128,8 @@ class Wandb:
     project: str
     entity: Optional[str] = None
     retry_s: float = 7200.0
+    key_file: Optional[str] = None  # a file holding this line's W&B API key (the line's account; the host's login,
+                                    # ~/.netrc, stays as it is); null: the host's login
 
 
 @dataclass
@@ -176,7 +181,7 @@ class RunConfig:
 # FROZEN keys (see frozen_view); a branch does not inherit FORK_FREE
 FROZEN = ("tokens_per_update", "lengths.micro_rows", "seed", "data_seed", "data_work", "val_work", "validation.rows",
           "optimizer.peak_lr", "optimizer.betas", "optimizer.eps", "optimizer.weight_decay",
-          "optimizer.lexical_lr_mult", "optimizer.grad_clip", "wandb.project", "wandb.entity")
+          "optimizer.lexical_lr_mult", "optimizer.grad_clip", "wandb.project", "wandb.entity", "wandb.key_file")
 FORK_FREE = ("data_work", "data_seed", "lengths.micro_rows")
 CHANGEABLE = FROZEN + ("model", "schedule", "run_dir")                    # what allow_changes may name
 
@@ -190,7 +195,7 @@ def frozen_view(d: dict) -> dict:
             "val_work": d.get("val_work"), "validation.rows": d.get("validation", {}).get("rows"),
             **{f"optimizer.{k}": opt.get(k) for k in ("peak_lr", "betas", "eps", "weight_decay", "lexical_lr_mult",
                                                       "grad_clip")},
-            "wandb.project": wb.get("project"), "wandb.entity": wb.get("entity")}
+            "wandb.project": wb.get("project"), "wandb.entity": wb.get("entity"), "wandb.key_file": wb.get("key_file")}
 
 
 def frozen_differences(new: dict, old: dict, allowed, keys=FROZEN) -> List[str]:
@@ -309,6 +314,9 @@ def validate(c: RunConfig) -> List[str]:
         p.append("print_every >= 1")
     if not c.wandb.project:
         p.append("wandb.project must be set")
+    k = c.wandb.key_file
+    if k is not None and not Path(k).is_absolute():
+        p.append(f"wandb.key_file {k!r} must be an absolute path")    # (that it exists: the start checks)
     return p
 
 
