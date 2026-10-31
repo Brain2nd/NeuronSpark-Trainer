@@ -25,7 +25,22 @@ class Source:
                                          # removed (the EOS is added by tokenization; a "</s>" inside is text)
     holdout: float = 0.01               # share of the documents held out for validation (never trained on)
     file_strata: bool = False           # every file is its own stratum (a corpus whose files are kinds of data)
+    control: Tuple[str, ...] = ()       # added tokens that are control markers in this source's documents (a chat,
+                                         # fill-in-the-middle or tool format written with them): encoded as those
+                                         # tokens; any other added token written in a document is text
+                                         # (nstrain.data.tokenize)
 
+
+# The markers of the formats written in the InfLLM-V2 data that are tokens of the MiniCPM5 tokenizer: chat turns
+# ("<|im_start|> user ... <|im_end|>", 6.8 % of the held-out rows), fill-in-the-middle code (0.13 %) and code execution
+# (0.004 %).  Its thought / tool-call format ("<|thought_start|>", "<|thought_end|>", "<|tool_call_start|>",
+# "<|tool_call_end|>", 0.014 % of the rows) is of MiniCPM4's tokenizer: three of its four markers are no tokens of
+# MiniCPM5's, so it stays text as a whole ("<|thought_end|>" included).  A "<|...|>" string written in any other
+# source is text too: code quoting a prompt template (`"<|im_start|>user<|im_sep|>..."` in a Python string of
+# UltraData-Code), Llama's "<|eot_id|>" in a template ...; the tokenizer's other added tokens -- "</s>", "<param",
+# "<function", "<think>", "/think" ... -- occur in C# comments, C++ includes, HTML and paths and are text everywhere.
+INFLLM_V2_MARKERS = ("<|im_start|>", "<|im_end|>", "<|fim_prefix|>", "<|fim_middle|>", "<|fim_suffix|>",
+                     "<|execute_start|>", "<|execute_end|>")
 
 SOURCES: Dict[str, Source] = {
     # web, English
@@ -62,6 +77,8 @@ SOURCES: Dict[str, Source] = {
     "long_mix": Source("openbmb/InfLLM-V2-data-5B", "train", "text", "long", "L2",
                        "MiniCPM's long-context stage data, 16 GB, ~5.3B tokens: 20 files, each one kind of row (web, "
                        "code, papers, chat, short synthetic arithmetic ...); ~0.85B tokens are in rows of 32K tokens "
-                       "or more, the median row of most files is under 400 tokens; each row is \"<s> ... </s>\"",
-                       markers=("<s>", "</s>"), holdout=0.05, file_strata=True),
+                       "or more, the median row of most files is under 400 tokens; each row is \"<s> ... </s>\"; ~7 % "
+                       "of the rows are chats (\"<|im_start|> user ... <|im_end|>\", a few with code execution or "
+                       "MiniCPM4's thought / tool-call markers) and ~0.1 % fill-in-the-middle code (<|fim_...|>)",
+                       markers=("<s>", "</s>"), holdout=0.05, file_strata=True, control=INFLLM_V2_MARKERS),
 }

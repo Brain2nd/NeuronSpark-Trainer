@@ -58,7 +58,7 @@ def preflight(cfg: C.RunConfig) -> List[str]:
     and text encoding), the W&B key file (when set) holds a key."""
     from nstrain.data.batches import val_rows
     from nstrain.data.sources import SOURCES
-    from nstrain.data.tokenize import TEXT
+    from nstrain.data.tokenize import text_mode
     from nstrain.data.work import Work
     problems = []
     if cfg.wandb.key_file is not None:
@@ -102,9 +102,10 @@ def preflight(cfg: C.RunConfig) -> List[str]:
         if s in SOURCES and idx.get("holdout") != Work.holdout(s):
             problems.append(f"held-out rows of {s} were chosen by {idx.get('holdout')}, the data line leaves out "
                             f"{Work.holdout(s)}: they may be trained on")
-        if idx.get("text") != TEXT:
+        mode = text_mode(SOURCES[s].control if s in SOURCES else ())
+        if idx.get("text") != mode:
             problems.append(f"held-out rows of {s} were encoded with text mode {idx.get('text')!r}, the data line "
-                            f"with {TEXT!r}: rebuild them (`nstrain data val --work {cfg.val_work}` remakes an index "
+                            f"with {mode!r}: rebuild them (`nstrain data val --work {cfg.val_work}` remakes an index "
                             "of another text mode)")
     for L in sorted({int(e["seq_len"]) for e in st["schedule"]} & set(cfg.lengths) if not missing else ()):
         try:

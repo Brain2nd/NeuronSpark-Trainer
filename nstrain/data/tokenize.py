@@ -8,8 +8,11 @@ takes (nstrain.data.work), a validation row -- is a uniform sample of the file's
 The documents are plain text (TEXT): a token of the tokenizer's added vocabulary written in a document ("</s>",
 "<param", "/think", "<think>", "<unused_token_3>" ... in code, markup and paths) encodes as its characters, never as
 that token -- every added token is marked special and tokenizers' ``encode_special_tokens`` set, so none is matched in
-a text; the only added token of a stream is the EOS added after each document.  A source's literal row markers
-(``markers``, e.g. "<s>" / "</s>" around each row) are removed first: they are the corpus's framing, not text.
+a text; the only added token of a stream is the EOS added after each document.  The exception is a source's control
+markers (``control``, nstrain.data.sources: the "<|im_start|>", "<|fim_prefix|>" ... of a corpus written in a chat or
+fill-in-the-middle format): those added tokens are left unmarked, so they are matched and encode as themselves; the
+source's text mode (``text_mode``) names them.  A source's literal row markers (``markers``, e.g. "<s>" / "</s>"
+around each row) are removed first: they are the corpus's framing, not text.
 
 Held-out documents: a document whose text hashes below ``holdout["share"]`` (blake2b of ``holdout["salt"]`` and the
 text; the same in every file, revision, epoch and line) is validation data.  A training stream (``keep`` "train")
@@ -17,8 +20,8 @@ leaves it out; a validation stream (``keep`` "val") holds only such documents --
 the first ones up to ``max_tokens``.
 
 Output per input file: ``<out>.bin`` (uint32 tokens) and ``<out>.json`` (provenance: repo / path / revision / epoch /
-doc_seed, text; tokens, documents, text bytes, added-token ids in the encoded text (0 with plain text), blake2b of
-the .bin, seconds), both fsynced before the file's download is deleted: a crash of the host leaves a stream whole or
+doc_seed, text mode; tokens, documents, text bytes, added-token ids in the encoded text (0: plain text) and control
+tokens matched, blake2b of the .bin, seconds), both fsynced before the file's download is deleted: a crash of the host leaves a stream whole or
 absent.  The tokenizer is a ``tokenizer.json`` (Hugging Face ``tokenizers``, batch encoding on RAYON threads;
 deterministic for a given tokenizer file and library version).
 """
@@ -36,18 +39,29 @@ TEXT = "added-tokens-as-text"   # how documents are encoded (in every stream's m
 _TOK = {}
 
 
-def _tokenizer(path: str):
-    """The tokenizer as documents are encoded (TEXT): its added tokens all special, none matched in a text (their ids
-    are unchanged; the file itself is not touched)."""
-    if path not in _TOK:
+def text_mode(control: Sequence[str] = ()) -> str:
+    """How a source's documents are encoded: TEXT, with its control markers named when it has any."""
+    return TEXT + ("+control:" + ",".join(sorted(control)) if control else "")
+
+
+def _tokenizer(path: str, control: Sequence[str] = ()):
+    """The tokenizer as a source's documents are encoded: its added tokens all special, none matched in a text, but
+    the source's control markers, left unmarked so that they are (their ids are unchanged; the file itself is not
+    touched)."""
+    key = (path, tuple(sorted(control)))
+    if key not in _TOK:
         from tokenizers import Tokenizer
         spec = json.loads(Path(path).read_text())
+        added = {a["content"] for a in spec.get("added_tokens", [])}
+        unknown = sorted(set(control) - added)
+        if unknown:
+            raise ValueError(f"control markers {unknown} are not added tokens of {path}")
         for a in spec.get("added_tokens", []):
-            a["special"] = True
+            a["special"] = a["content"] not in control
         t = Tokenizer.from_str(json.dumps(spec))
         t.encode_special_tokens = True
-        _TOK[path] = t
-    return _TOK[path]
+        _TOK[key] = t
+    return _TOK[key]
 
 
 def _fsync(path, directory: bool = False) -> None:
@@ -107,15 +121,17 @@ def held(text: str, holdout: dict) -> bool:
 
 def tokenize_file(path: str, fields: Sequence[str], tokenizer_json: str, eos_id: int, out_prefix: str,
                   provenance: dict, doc_seed: str, holdout: dict, keep: str = "train",
-                  markers: Sequence[str] = ("", ""), max_tokens: int = 0, batch_rows: int = 4096,
-                  delete: bool = True) -> dict:
+                  markers: Sequence[str] = ("", ""), control: Sequence[str] = (), max_tokens: int = 0,
+                  batch_rows: int = 4096, delete: bool = True) -> dict:
     import numpy as np                                               # (not at import: work.py imports TEXT)
     if keep not in ("train", "val"):
         raise ValueError(f"keep must be 'train' or 'val', got {keep!r}")
     t0 = time.time()
-    tok = _tokenizer(tokenizer_json)
-    special = np.asarray(sorted(tok.get_added_tokens_decoder()), dtype=np.uint32)      # every added token's id
-    n_special = 0
+    tok = _tokenizer(tokenizer_json, control)
+    added = tok.get_added_tokens_decoder()                           # id -> AddedToken
+    ctl = np.asarray(sorted(i for i, a in added.items() if a.content in control), dtype=np.uint32)
+    special = np.asarray(sorted(i for i, a in added.items() if a.content not in control), dtype=np.uint32)
+    n_special = n_control = 0                                        # added tokens in the encoded text: others, control
     src = Path(path)
     out_bin = Path(out_prefix + ".bin")
     raw = out_bin.with_suffix(f".bin.raw{os.getpid()}")       # file order; a leftover writer never interleaves
@@ -137,6 +153,7 @@ def tokenize_file(path: str, fields: Sequence[str], tokenizer_json: str, eos_id:
                 for e in tok.encode_batch(texts, add_special_tokens=False):
                     ids = np.asarray(e.ids, dtype=np.uint32)
                     n_special += int(np.isin(ids, special).sum())
+                    n_control += int(np.isin(ids, ctl).sum())
                     parts.append(ids)
                     parts.append(np.asarray([eos_id], dtype=np.uint32))
                     lens.append(len(e.ids) + 1)
@@ -167,9 +184,9 @@ def tokenize_file(path: str, fields: Sequence[str], tokenizer_json: str, eos_id:
             if x.exists():
                 x.unlink()
         raise
-    meta = dict(provenance, doc_seed=doc_seed, keep=keep, holdout=holdout, text=TEXT, file_bytes=src.stat().st_size,
-                tokens=n_tok, tokens_before_cap=all_tokens, docs=n_doc, other_docs=n_other, text_bytes=n_bytes,
-                added_in_text=n_special,
+    meta = dict(provenance, doc_seed=doc_seed, keep=keep, holdout=holdout, text=text_mode(control),
+                file_bytes=src.stat().st_size, tokens=n_tok, tokens_before_cap=all_tokens, docs=n_doc,
+                other_docs=n_other, text_bytes=n_bytes, added_in_text=n_special, control_in_text=n_control,
                 blake2b=digest.hexdigest(), seconds=round(time.time() - t0, 2))
     j = Path(out_prefix + ".json")
     jt = j.with_name(f"{j.name}.tmp{os.getpid()}")

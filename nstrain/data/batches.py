@@ -23,7 +23,9 @@ from typing import Dict, Iterator, List, Optional, Tuple
 import numpy as np
 import torch
 
+from nstrain.data.sources import SOURCES
 from nstrain.data.stream import CycleStream
+from nstrain.data.tokenize import text_mode
 
 UNSERVED_S = 120.0       # a released cycle with no preparer serving the line this long: an error (shorter: a handover)
 
@@ -263,8 +265,14 @@ def val_rows(work: str, seq_len: int, rows: int, unit: int = 1) -> Dict[str, Lis
         idx = d / "index.json"
         if not idx.exists():
             continue
+        index = json.loads(idx.read_text())
+        mode = text_mode(SOURCES[d.name].control if d.name in SOURCES else ())
+        if index.get("text") != mode:                                # (encoded as the data line encodes now)
+            raise RuntimeError(f"{d.name}: the held-out rows were encoded with text mode {index.get('text')!r}, the "
+                               f"data line encodes with {mode!r}: rebuild them (`nstrain data val --work {work} "
+                               f"--sources {d.name}`)")
         strata = []
-        for t in json.loads(idx.read_text())["strata"]:
+        for t in index["strata"]:
             n = max(unit, int(round(rows * t["share"] / unit)) * unit)
             files = t["files"]
             if not files:

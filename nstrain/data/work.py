@@ -73,12 +73,12 @@ from typing import Dict, List, Optional, Tuple
 
 from nstrain.data import hf, mixture
 from nstrain.data.sources import SOURCES
-from nstrain.data.tokenize import TEXT
+from nstrain.data.tokenize import TEXT, text_mode
 
 PROV_KEYS = ("repo", "path", "revision", "epoch", "doc_seed", "tokens", "blake2b")
 ORDER = 2                        # the sample order a manifest is read in (nstrain.data.stream.ORDER_FORMAT)
 FORMAT = 4                       # state.json and manifest layout (strata, pool, document order, held-out documents,
-                                 # documents as plain text: nstrain.data.tokenize.TEXT)
+                                 # documents as plain text but a source's control markers: nstrain.data.tokenize)
 HOLDOUT_SALT = "nstrain-holdout-v1"   # with each source's share: the held-out documents of every line (tokenize.held)
 VAL_FILES = 16                   # files a stratum's held-out documents come from (at most)
 VAL_KEEP_TOKENS = 4 << 20        # held-out tokens kept per validation file (documents shuffled)
@@ -287,10 +287,15 @@ class Work:
         if from_token <= max(e["from"] for e in st["schedule"]):
             raise RuntimeError("entries must start after the last entry")
         e = mixture.entry(recipe, from_token)
-        held = [s for s in e["weights"] if not (self.root / "val" / s / "index.json").exists()]
+
+        def current(s: str) -> bool:                                 # held-out rows, of the source's text mode
+            idx = self.root / "val" / s / "index.json"
+            return idx.exists() and json.loads(idx.read_text()).get("text") == text_mode(SOURCES[s].control)
+        held = [s for s in e["weights"] if not current(s)]
         if (self.root / "val").exists() and held:
-            raise RuntimeError(f"recipe {recipe}: no held-out rows of {held} in {self.root / 'val'} (`nstrain data "
-                               "val` first: the trainer validates every source of its recipe)")
+            raise RuntimeError(f"recipe {recipe}: no held-out rows of {held} in {self.root / 'val'}, or of another "
+                               f"text mode (`nstrain data val --sources {' '.join(held)}` first: the trainer "
+                               "validates every source of its recipe)")
         st["schedule"].append(e)
         self.save(st)
         return st
@@ -419,7 +424,8 @@ class Work:
             except (FileNotFoundError, json.JSONDecodeError):
                 meta = None
             prov = {"path": f["path"], "revision": st["revisions"][SOURCES[s].repo], "epoch": f.get("epoch", 0),
-                    "doc_seed": self.doc_seed(st, s, f), "holdout": self.holdout(s), "text": TEXT}
+                    "doc_seed": self.doc_seed(st, s, f), "holdout": self.holdout(s),
+                    "text": text_mode(SOURCES[s].control)}
             b = Path(str(prefix) + ".bin")
             if (meta is not None and b.exists() and b.stat().st_size == 4 * meta.get("tokens", -1)
                     and all(meta.get(k) == v for k, v in prov.items())):
@@ -475,7 +481,7 @@ class Work:
                                "tokenizer_json": st["tokenizer"], "eos_id": st["eos_id"], "out_prefix": prefix,
                                "provenance": prov, "doc_seed": self.doc_seed(st, s, f), "holdout": self.holdout(s),
                                "keep": "val" if e < 0 else "train", "max_tokens": VAL_KEEP_TOKENS if e < 0 else 0,
-                               "markers": list(src.markers)}
+                               "markers": list(src.markers), "control": list(src.control)}
                         t = tp.submit(tokenize, job, self.staging(s, f))
                         tokenizing.add(t)
                         running[t] = (s, f, out)
@@ -497,7 +503,8 @@ class Work:
 
     @staticmethod
     def _piece(meta: dict, start: int, count: int, stratum: str) -> dict:
-        return dict({k: meta[k] for k in PROV_KEYS}, bin=meta["bin"], start=start, count=count, stratum=stratum)
+        return dict({k: meta[k] for k in PROV_KEYS}, bin=meta["bin"], start=start, count=count, stratum=stratum,
+                    text=meta["text"])
 
     # ---------------------------------------------------------------- calibration / validation
     def calibrate(self, names: List[str], dl_workers: int = 8, tok_workers: int = 8, rayon: int = 8) -> Dict:
@@ -539,7 +546,7 @@ class Work:
         plan, got, held = {}, {}, {}
         for n in names:
             idx = self.root / "val" / n / "index.json"
-            if idx.exists() and json.loads(idx.read_text()).get("text") == TEXT:
+            if idx.exists() and json.loads(idx.read_text()).get("text") == text_mode(SOURCES[n].control):
                 continue                                             # (an index of another text mode is remade)
             by = self.strata(st, n)
             size = {t: float(sum(f["size"] for f in fs)) / self.bpt(st, n, t) for t, fs in by.items()}
@@ -577,7 +584,7 @@ class Work:
                           "blake2b": m["blake2b"]} for f in held[(n, t)] for m in [got[(n, f["path"])]] if m["tokens"]]
                 items.append({"stratum": t, "share": size[t] / sum(size.values()), "files": files})
             index = {"source": n, "revision": st["revisions"][SOURCES[n].repo], "holdout": self.holdout(n),
-                     "text": TEXT, "strata": items}
+                     "text": text_mode(SOURCES[n].control), "strata": items}
             _write_atomic(self.root / "val" / n / "index.json", json.dumps(index, indent=1))
         self.save(st)
         return {n: m for (n, _), m in got.items()}
@@ -619,6 +626,13 @@ class Work:
                  for _, q in segs]
         want = {s: {t: sum(sp.get(s, {}).get(t, 0) for sp in split) for t in plan[s]} for s in need}
         pool: Dict[str, List[dict]] = {s: list(st["pool"].get(s, [])) for s in need}
+        for s in need:                                               # an open file encodes as the source does now
+            for p in pool[s]:                                        # (a piece without "text": plain text, FORMAT 4)
+                if p.get("text", TEXT) != text_mode(SOURCES[s].control):
+                    raise RuntimeError(f"the open file {p['path']} of {s} (epoch {p['epoch']}) was encoded with text "
+                                       f"mode {p.get('text', TEXT)!r}, the source now encodes with "
+                                       f"{text_mode(SOURCES[s].control)!r}: the line's open files are of another "
+                                       "encoding (a new data line, `nstrain data init`)")
         inflight = st.get("inflight") or {}
         if inflight and inflight.get("cycle") != k:
             raise RuntimeError(f"cycle {inflight.get('cycle')} was being prepared; finish it first")
