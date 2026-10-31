@@ -184,11 +184,13 @@ class Tracker:
 
     def backfill(self, src_run_id: str, upto: int) -> int:
         """Log the source run's server rows up to ``upto`` into the current run (rows at or below the current run's
-        last step are dropped by W&B, so a backfill interrupted by a restart is completed by running it again)."""
+        last step are dropped by W&B, so a backfill interrupted by a restart is completed by running it again).  Each
+        row is committed: a row logged with a step stays pending in the client until a later step is logged, and the
+        last one would never reach the server before :meth:`confirm` (which waits for it)."""
         n = 0
         for row in self.history(self._path(src_run_id), upto=upto, complete=True):
             step = row.pop("_step")
-            self.run.log({k: v for k, v in row.items() if v is not None}, step=step)
+            self.run.log({k: v for k, v in row.items() if v is not None}, step=step, commit=True)
             n += 1
             self._tick(n)
         return n
