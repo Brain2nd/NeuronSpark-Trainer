@@ -2,8 +2,8 @@
 
 The configuration and commands of a NeuronSpark pre-training line: the `ns-2b` preset with the MiniCPM5 tokenizer
 (130,560 tokens), trained on the open MiniCPM corpora on a single NVIDIA GB300.  `run.json` is the line's
-configuration as `nstrain new` and `nstrain tune` wrote it, with the shared-GPU settings (below) edited by hand; only
-the data paths are placeholders.
+configuration as `nstrain new`, `nstrain tune` and `nstrain tune --shared` wrote it; only the data paths are
+placeholders.
 
 ## Data
 
@@ -57,15 +57,17 @@ nstrain run runs/b0
 ## Settings in `run.json`
 
 * **Update:** 1,048,576 tokens (256 rows of 4,096).  `nstrain tune` measured whole updates on the GB300 and chose
-  8 rows per micro-batch with the first 3 dendritic neuron layers recomputed (peak 236.5 GiB):
+  8 rows per micro-batch with the first dendritic neuron layer recomputed (peak 236.8 GiB):
 
-  | Micro-batch | Recomputed layers | Tokens / s |
-  |---|---|---|
-  | 8 rows | first 3 | 48,591 |
-  | 4 rows | none | 47,788 |
-  | 16 rows | all | 43,219 |
+  | Micro-batch | Recomputed layers | Tokens / s | Peak reserved |
+  |---|---|---|---|
+  | 8 rows | first 1 | 49,576 | 236.8 GiB |
+  | 4 rows | none | 47,860 | 153.9 GiB |
+  | 16 rows | all 18 | 43,245 | 222.6 GiB |
 
-  In training: about 48.2k tokens/s, 21.8 s per update.
+  Beside other processes (`nstrain tune --shared`, 50 GB left to them, shapes below 192.1 GiB): 4 rows with no
+  recomputation, 47,843 tokens/s at 153.9 GiB (8 rows would recompute 9 layers: 46,094 tokens/s at 191.7 GiB).
+  In training with the shared shapes: about 47.6k tokens/s, 22.0 s per update.
 * **Optimizer:** AdamW, β (0.9, 0.95), weight decay 0.1, gradient clip 1.0, peak learning rate 3e-4 (8× for the
   lexical memory tables); 2B tokens of warmup, then constant.  The trunk never decays; its branches do (1-sqrt to 5 %).
 * **Checkpoints:** every 0.2B tokens, the last 3 kept (24.5 GB each: fp32 weights and AdamW state); every cycle end is
@@ -73,12 +75,12 @@ nstrain run runs/b0
 * **Validation:** every 2B tokens.  `nstrain data val` keeps the held-out documents (by a hash of their text) of each
   stratum's first files: 8 files per source spread over its strata, at least one per stratum, more until a stratum
   holds its rows at 32K (about 130 GB in 190 files for the 15 sources, once; cycle 0 downloads these files again,
-  the first of each stratum, for their training documents).  Each stratum validates on 64 x its
-  share rows, at least one micro-batch (8 rows of 4,096 for this line), a multiple of it -- so a source of many strata
-  validates on more than 64 rows; a source's loss weights its strata by their shares (`val_4096/<source>`); over the
+  the first of each stratum, for their training documents).  Each stratum validates on 16 x its
+  share rows, at least one micro-batch (4 rows of 4,096 for this line: the shared shape's), a multiple of it -- so a
+  source of many strata validates on more than 16 rows; a source's loss weights its strata by their shares (`val_4096/<source>`); over the
   recipe's sources `val_4096/mix` (weighted by the recipe, the held-out estimate of the training loss) and
   `val_4096/mean` (unweighted); at 32K the same under `val_32768/`.
 * **Shared GPU:** with `guards.share_reserve_gb: 50` and the `shared` shapes measured for it (`nstrain tune
   --shared`), the line always trains with those shapes and holds all of the GPU but 50 GB: another process may start
   at any time and take up to 50 GB, never more; `guards.gpu_check_every: 1` re-holds what it frees at every update.
-  The run.json here is the trunk's without a reserve (the GPU to itself).
+  The run.json here is the trunk's: the reserve and the shared shapes as `nstrain tune --shared` measured them.

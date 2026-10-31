@@ -28,7 +28,12 @@
  "lengths": {
   "4096": {
    "micro_rows": 8,
-   "activation_checkpointing": 3
+   "activation_checkpointing": 1,
+   "shared": {
+    "micro_rows": 4,
+    "activation_checkpointing": false,
+    "reserve_gb": 50.0
+   }
   }
  },
  "optimizer": {
@@ -68,13 +73,14 @@
  },
  "validation": {
   "every_tokens": 2000000000.0,
-  "rows": 64
+  "rows": 16
  },
  "stop_at_tokens": null,
  "guards": {
   "max_skipped_in_a_row": 10,
   "gpu_check_every": 1,
-  "allow_shared_gpu": false
+  "allow_shared_gpu": false,
+  "share_reserve_gb": 50.0
  },
  "supervisor": {
   "max_fails": 5,
