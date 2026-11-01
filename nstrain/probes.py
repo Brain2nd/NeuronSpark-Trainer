@@ -7,7 +7,9 @@ validation rows: ``val_<L>/dendritic/<name>`` over every dendritic head of the m
 * ``retention_frac_gt_0.9``: the fraction of the heads keeping more than 0.9 over the row (the slow-leak heads);
 * ``retention<horizon>k_frac_gt_0.5``: the fraction of the heads that would keep more than 0.5 over ``horizon`` tokens
   at the row's mean step (the probe's horizon, 32768 by default);
-* ``firing``: the mean head's firing rate (the fraction of the somatic outputs released through the threshold).
+* ``firing``: the mean head's firing rate (the fraction of the somatic outputs released through the threshold); with
+  a probe of several segments also ``firing_seg<k>`` per segment of the row (over every head) and
+  ``layer<NN>/firing_last_seg``, the layer's firing rate in the row's last segment.
 """
 from __future__ import annotations
 
@@ -46,6 +48,12 @@ def dendritic_metrics(key: str, probe) -> Dict[str, float]:
     for i, v in s.items():
         put(f"{key}/dendritic/layer{i:02d}", v["retention"], v["retention_horizon"], v["firing"])
     put(f"{key}/dendritic", *_readings(s))
+    if int(probe.segments) > 1:
+        seg = torch.cat([v["firing_by_segment"] for v in s.values()], dim=1)       # (segments, every head)
+        for k in range(seg.shape[0]):
+            out[f"{key}/dendritic/firing_seg{k}"] = float(seg[k].mean())
+        for i, v in s.items():
+            out[f"{key}/dendritic/layer{i:02d}/firing_last_seg"] = float(v["firing_by_segment"][-1].mean())
     return out
 
 

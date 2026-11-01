@@ -169,6 +169,7 @@ class Trainer:
         if self.shared:                                              # out of memory before the reserve is touched
             cap_memory(beside_limit_gib(self._total_gib(), self.reserve))
         self.model_cfg = c.model
+        self.probe_len = M.longest_context(c.model)                  # the long-row probe's length (_probe_long)
         self.ckpts = Checkpoints(c.ckpt_dir, keep_last=c.checkpoints.keep_last)
         self.line = Line(c.data_work, c.tokens_per_update, seed=c.data_seed)
         self.data_state = json.loads((Path(c.data_work) / "state.json").read_text())
@@ -563,11 +564,12 @@ class Trainer:
         else:
             self._save(u.cycle, u.next, u.manifest_sha256, u.order_digest, keep, background, shape, self.run_id)
 
-    def _val_rows(self, L: int):
+    def _val_rows(self, L: int, unit: Optional[int] = None):
         """The validation rows of length L (nstrain.data.batches.val_rows), each stratum's a multiple of L's own
         micro_rows: the same rows whatever the reserve (a shared shape is re-tuned with it)."""
         if L not in self.val:
-            self.val[L] = val_rows(self.cfg.val_work, L, self.cfg.validation.rows, self.cfg.length(L, False).micro_rows)
+            self.val[L] = val_rows(self.cfg.val_work, L, self.cfg.validation.rows,
+                                   self.cfg.length(L, False).micro_rows if unit is None else unit)
         return self.val[L]
 
     def _val_batch(self, L: int) -> int:
@@ -588,7 +590,25 @@ class Trainer:
                     self.model.loss(w[:, :-1].contiguous(), w[:, 1:].contiguous())
                     del w
                 print(f"{dendritic_line(probe)} (the warm-up micro-batch of length {L})", flush=True)
+                if self.probe_len > L:                                # the long-row probe's first call too
+                    self._warm_long(L)
                 return
+
+    @torch.no_grad()
+    def _warm_long(self, seg: int) -> None:
+        """One long row (``_probe_long``'s length, segments of ``seg``) before a capture: its kernels' first-call
+        caches and its memory while the arena's free blocks are not yet graph scratch, and a reading of the model at
+        this start."""
+        P = self.probe_len
+        if P % seg:
+            raise RuntimeError(f"long probe: the length {P} is not a multiple of the training length {seg}")
+        arr = next(iter(self._val_rows(P, unit=1).values()))[0][2]
+        with self.arena.use(), probing(self.model, DendriticProbe(horizon=P, segments=P // seg)) as probe:
+            w = torch.from_numpy(arr[:1]).to(self.dev)
+            per = self.model.per_token_ce(w[:, :-1].contiguous(), w[:, 1:].contiguous())
+            segs = [round(float(x), 3) for x in per.view(-1, seg).mean(dim=1)]
+            del w, per
+        print(f"long probe: one row of {P}, ce by segment of {seg} {segs}; {dendritic_line(probe)}", flush=True)
 
     def _hold(self, others: float, slack_gib: float = 0.25, reclaim: bool = False, quick: bool = False) -> None:
         """Beside other processes: the arena holds the GPU's memory but what they may still take, and ``slack_gib``
@@ -634,6 +654,49 @@ class Trainer:
             raise RuntimeError(f"validation: no held-out rows of the recipe's sources {missing} at length {L}")
         out[f"{key}/mix"] = sum(got[n] * w for n, w in mine.items()) / sum(mine.values())
         out[f"{key}/mean"] = sum(got[n] for n in mine) / len(mine)
+        out.update(dendritic_metrics(key, probe))
+        return out
+
+    @torch.no_grad()
+    def _probe_long(self, seg: int, recipe: dict) -> dict:
+        """The long-row probe: every source's held-out rows of the model's longest context ``self.probe_len``
+        (``val_<P>/<source>``, ``/mix``, ``/mean`` as ``_validate``, from the per-token cross entropy, one row at a
+        time), the loss by position in segments of ``seg`` tokens (the training length): ``val_<P>/pos/seg<k>``
+        weighted by the recipe and ``.../last_over_first``; the dendritic probe over the long rows, with the firing
+        rate by segment (``val_<P>/dendritic/...``, nstrain.probes)."""
+        P, key = self.probe_len, f"val_{self.probe_len}"
+        if P % seg:
+            raise RuntimeError(f"long probe: the length {P} is not a multiple of the training length {seg}")
+        n_seg = P // seg
+        probe = DendriticProbe(horizon=P, segments=n_seg)
+        out, got, pos = {}, {}, {}
+        with probing(self.model, probe):
+            for name, strata in self._val_rows(P, unit=1).items():
+                self._beat(f"long probe {name}")
+                acc, tot = torch.zeros(n_seg, dtype=torch.float64), 0.0
+                for _, share, arr in strata:
+                    s = torch.zeros(n_seg, dtype=torch.float64)
+                    with self.arena.use():                           # (in the arena: memory the trainer holds)
+                        for i in range(arr.shape[0]):
+                            w = torch.from_numpy(arr[i:i + 1]).to(self.dev)
+                            per = self.model.per_token_ce(w[:, :-1].contiguous(), w[:, 1:].contiguous())
+                            s += per.view(n_seg, seg).mean(dim=1).double().cpu()
+                            del w, per
+                    acc += share * s / arr.shape[0]
+                    tot += share
+                pos[name] = acc / tot                                # (n_seg,) the source's loss by segment
+                got[name] = out[f"{key}/{name}"] = float(pos[name].mean())
+        mine = {n: float(w) for n, w in recipe.items() if w > 0}
+        missing = sorted(n for n in mine if n not in got)
+        if missing:
+            raise RuntimeError(f"long probe: no held-out rows of the recipe's sources {missing} at length {P}")
+        wsum = sum(mine.values())
+        out[f"{key}/mix"] = sum(got[n] * w for n, w in mine.items()) / wsum
+        out[f"{key}/mean"] = sum(got[n] for n in mine) / len(mine)
+        mix = sum(pos[n] * w for n, w in mine.items()) / wsum
+        for k in range(n_seg):
+            out[f"{key}/pos/seg{k}"] = float(mix[k])
+        out[f"{key}/pos/last_over_first"] = float(mix[-1] / mix[0])
         out.update(dendritic_metrics(key, probe))
         return out
 
@@ -763,6 +826,8 @@ class Trainer:
                 self.mix[name] = (a + o, b + e)
             if self.tokens >= next_val:
                 row.update(self._validate(u.seq_len, u.recipe))
+                if self.probe_len > u.seq_len:
+                    row.update(self._probe_long(u.seq_len, u.recipe))
                 row.update(self._mix_check())
                 next_val += val_every
             seen, check_failed = None, False                         # (other processes, their GB) when checked

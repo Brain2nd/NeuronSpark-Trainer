@@ -62,6 +62,12 @@ the watchdog interval, when its data preparer keeps failing, or when the supervi
   retention over the row (`exp(A Σ dt)`, what is left of a compartment's potential at the row's first token after its
   last); `retention_frac_gt_0.9`, the fraction of slow-leak heads; `retention32k_frac_gt_0.5`, the fraction of the
   heads that would keep half of it over 32K tokens at the row's mean step; `firing`, the mean firing rate.
+  When the model's longest context (`rope_max_seq_len`) exceeds the training length, every validation also runs
+  the long-row probe on each source's held-out rows of that length, one row at a time: `val_<P>/<source>`, `/mix`,
+  `/mean` (the loss at the long length), `val_<P>/pos/seg<k>` (the recipe-weighted loss by position, in segments
+  of the training length) and `/pos/last_over_first`, and the dendritic probe over the long rows (`val_<P>/dendritic/...`,
+  with the firing rate by segment).  One row of each probe runs before every capture (its memory and kernels), and
+  its readings are printed.
 * A **training line** is a directory: `run.json` (its configuration) and everything the line produces.  Every command
   takes this directory.
 

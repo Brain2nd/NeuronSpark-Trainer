@@ -57,6 +57,12 @@ def build(cfg: dict, device, init: str):
     return NeuronSparkLMHeadModel(NeuronSparkConfig(**cfg), device=device, init=init)
 
 
+def longest_context(cfg: dict) -> int:
+    """The longest row the model is built for (``rope_max_seq_len``: the RoPE table, the inference ring)."""
+    from neuronspark.models.config_neuronspark import NeuronSparkConfig
+    return int(NeuronSparkConfig(**cfg).rope_max_seq_len)
+
+
 def dendritic_layers(cfg: dict) -> int:
     """The number of dendritic neuron layers of a model configuration."""
     from neuronspark import NeuronSparkConfig
