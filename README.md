@@ -60,8 +60,11 @@ the watchdog interval, when its data preparer keeps failing, or when the supervi
   `val_<L>/mix` weights the sources by the recipe.  Every validation also probes the dendritic neuron layers on
   its rows (`val_<L>/dendritic/...`, over every dendritic head and per layer): `retention_p50`, the median head's
   retention over the row (`exp(A Σ dt)`, what is left of a compartment's potential at the row's first token after its
-  last); `retention_frac_gt_0.9`, the fraction of slow-leak heads; `retention32k_frac_gt_0.5`, the fraction of the
-  heads that would keep half of it over 32K tokens at the row's mean step; `firing`, the mean firing rate.
+  last); `retention_frac_gt_0.9`, the fraction of slow-leak heads; `retention_max` and `retention_frac_gt_0.5`, the slowest
+  head's retention and the fraction of the heads above 0.5 (the tail below the slow-leak heads);
+  `retention32k_frac_gt_0.5`, the fraction of the heads that would keep half of it over 32K tokens at the row's mean
+  step; `tau_p50`, `tau_p90`, `tau_max`, the heads' e-fold lengths in tokens at the row's mean step (the row length
+  over the row's decay exponent `-A Σ dt`; readable where the retention underflows); `firing`, the mean firing rate.
   When the model's longest context (`rope_max_seq_len`) exceeds the training length, every validation also runs
   the long-row probe on each source's held-out rows of that length, one row at a time: `val_<P>/<source>`, `/mix`,
   `/mean` (the loss at the long length), `val_<P>/pos/seg<k>` (the recipe-weighted loss by position, in segments
