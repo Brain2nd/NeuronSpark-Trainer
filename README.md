@@ -67,7 +67,7 @@ the watchdog interval, when its data preparer keeps failing, or when the supervi
   `/mean` (the loss at the long length), `val_<P>/pos/seg<k>` (the recipe-weighted loss by position, in segments
   of the training length) and `/pos/last_over_first`, and the dendritic probe over the long rows (`val_<P>/dendritic/...`,
   with the firing rate by segment).  One row of each probe runs before every capture (its memory and kernels), and
-  its readings are printed.
+  its readings are printed.  The row of an update that validated is printed to `run.log` whatever `print_every`.
 * A **training line** is a directory: `run.json` (its configuration) and everything the line produces.  Every command
   takes this directory.
 

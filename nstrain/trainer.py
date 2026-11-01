@@ -824,7 +824,8 @@ class Trainer:
             for name, (o, e) in u.mix.items():                      # the samples read against the plan
                 a, b = self.mix.get(name, (0, 0.0))
                 self.mix[name] = (a + o, b + e)
-            if self.tokens >= next_val:
+            validated = self.tokens >= next_val
+            if validated:
                 row.update(self._validate(u.seq_len, u.recipe))
                 if self.probe_len > u.seq_len:
                     row.update(self._probe_long(u.seq_len, u.recipe))
@@ -857,7 +858,7 @@ class Trainer:
             self.rows.append((self.update, row))
             self._beat("update")
             self.ckpts.poll()                                        # a failed background checkpoint stops here
-            if self.update % c.print_every == 0:
+            if validated or self.update % c.print_every == 0:          # a validation's row always reaches run.log
                 print(json.dumps({k: (round(v, 5) if isinstance(v, float) else v) for k, v in row.items()}),
                       flush=True)
             if self.in_a_row > c.guards.max_skipped_in_a_row:
