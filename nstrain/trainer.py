@@ -741,6 +741,7 @@ class Trainer:
             now = time.time()
             row = {"tokens": self.tokens, "train/loss": metrics["loss"], "train/ce": metrics["ce"],
                    "train/aux": metrics["aux"], "train/grad_norm": metrics["grad_norm"], "train/lr": lr,
+                   **{f"train/grad_norm/{g}": v for g, v in metrics["grad_norms"].items()},
                    "train/seq_len": u.seq_len, "train/skipped": self.skipped, "data/cycle": u.cycle,
                    "data/sample": u.next, "perf/update_s": now - last_t,
                    "perf/tok_per_s": u.inputs.numel() / max(now - last_t, 1e-9)}

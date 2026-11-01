@@ -38,6 +38,8 @@ class StepEngine:
         f32 = dict(dtype=torch.float32, device=self.dev)
         self.loss_sum, self.ce_sum, self.aux_sum = (torch.zeros((), **f32) for _ in range(3))
         self.gnorm = torch.zeros((), **f32)
+        self.gnorms = torch.zeros(len(optimizer.groups), **f32)      # per parameter group (the diagnostic of a
+        self.group_names = [g["name"] for g in optimizer.groups]     # spike: nstrain.trainer logs them by name)
         self.graphs: Dict[str, torch.cuda.CUDAGraph] = {}
         from nstrain.gpu import Arena
         self.arena = arena if arena is not None else Arena()          # the trainer's: memory it already holds
@@ -52,7 +54,8 @@ class StepEngine:
         self.aux_sum.add_(out.aux.detach())
 
     def _norm(self) -> None:
-        self.gnorm.copy_(self.opt.grad_norm())
+        self.gnorms.copy_(self.opt.grad_norms())
+        self.gnorm.copy_(torch.linalg.vector_norm(self.gnorms))
 
     def _step(self) -> None:
         coef = torch.clamp(self.clip / (self.gnorm + 1e-6), max=1.0)
@@ -120,10 +123,10 @@ class StepEngine:
             self.y.copy_(targets[sl], non_blocking=True)
             self.graphs["micro"].replay()
         self.graphs["norm"].replay()
-        sums = torch.stack([self.gnorm, self.loss_sum, self.ce_sum, self.aux_sum]).tolist()
+        sums = torch.cat([torch.stack([self.gnorm, self.loss_sum, self.ce_sum, self.aux_sum]), self.gnorms]).tolist()
         gn = sums[0]
         metrics = {"loss": sums[1] / self.accum, "ce": sums[2] / self.accum, "aux": sums[3] / self.accum,
-                   "grad_norm": gn}
+                   "grad_norm": gn, "grad_norms": dict(zip(self.group_names, sums[4:]))}
         if not math.isfinite(gn) or not math.isfinite(metrics["loss"]):
             self.opt.zero_grad()
             self._zero_sums()

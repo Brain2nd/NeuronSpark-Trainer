@@ -48,7 +48,11 @@ the watchdog interval, when its data preparer keeps failing, or when the supervi
   shuffled at tokenization and encoded as plain text (a token of the tokenizer's added vocabulary written in a
   document, e.g. `</s>`, `<param` or `<think>` in code, is its characters, not that token; the exception is a source's
   own control markers, such as the `<|im_start|>` / `<|im_end|>` of the chats and the `<|fim_...|>` of the
-  fill-in-the-middle code in the InfLLM-V2 data, which encode as those tokens); the trainer reads each
+  fill-in-the-middle code in the InfLLM-V2 data, which encode as those tokens.  Matching added tokens in a text,
+  the default of the `tokenizers` library, encoded about 127 of every million tokens of UltraData-Code L2 and 126 of
+  Stack v3 as control tokens -- `/// <param name=...>` in C#, `#include <functional>` in C++, `"<s>"` in Python strings,
+  `/think` in paths -- and 770 per million in the InfLLM-V2 data, mostly its chat markers; measured over every
+  held-out document of the 15 sources); the trainer reads each
   source's windows of a segment in a random order.  1 % of every file's documents (5 % of the InfLLM-V2 data's; by a hash of their text, the same
   in every line) are held out and never trained on as documents of that source (a text that is also in another
   source, e.g. quoted inside an L3 row, is held out or trained there by that source's own hash); each

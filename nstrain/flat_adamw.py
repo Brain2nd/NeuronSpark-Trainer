@@ -84,8 +84,12 @@ class FlatAdamW:
         self.params = [p for g in self.groups for p in g["params"]]
 
     # ------------------------------------------------------------------ captured pieces
+    def grad_norms(self) -> torch.Tensor:
+        """The gradient norm of every group (fp32, one reduction each), in the groups' order."""
+        return torch.stack([torch.linalg.vector_norm(g["flat"]["g"]) for g in self.groups])
+
     def grad_norm(self) -> torch.Tensor:
-        return torch.linalg.vector_norm(torch.stack([torch.linalg.vector_norm(g["flat"]["g"]) for g in self.groups]))
+        return torch.linalg.vector_norm(self.grad_norms())
 
     def step(self, coef: torch.Tensor) -> None:
         """One update with gradients scaled by the device scalar ``coef``; zeroes the gradients."""
