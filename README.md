@@ -57,7 +57,11 @@ the watchdog interval, when its data preparer keeps failing, or when the supervi
   in every line) are held out and never trained on as documents of that source (a text that is also in another
   source, e.g. quoted inside an L3 row, is held out or trained there by that source's own hash); each
   source's validation rows come from those of every stratum, and its loss weights its strata by their shares;
-  `val_<L>/mix` weights the sources by the recipe.
+  `val_<L>/mix` weights the sources by the recipe.  Every validation also probes the dendritic neuron layers on
+  its rows (`val_<L>/dendritic/...`, over every dendritic head and per layer): `retention_p50`, the median head's
+  retention over the row (`exp(A Σ dt)`, what is left of a compartment's potential at the row's first token after its
+  last); `retention_frac_gt_0.9`, the fraction of slow-leak heads; `retention32k_frac_gt_0.5`, the fraction of the
+  heads that would keep half of it over 32K tokens at the row's mean step; `firing`, the mean firing rate.
 * A **training line** is a directory: `run.json` (its configuration) and everything the line produces.  Every command
   takes this directory.
 

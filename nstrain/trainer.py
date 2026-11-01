@@ -79,8 +79,10 @@ from nstrain.flat_adamw import FlatAdamW
 from nstrain.gpu import (CAPTURE_SLACK_GIB, GpuBusy, GpuCheckFailed, beside_limit_gib, cap_memory, fits_beside,
                         reclaim_dead,
                          hold_memory, lease, other_processes, others_gb, room_beside)
+from nstrain.probes import dendritic_line, dendritic_metrics
 from nstrain.proc import honor_stop
 from nstrain.wb import RunRecord, Tracker
+from neuronspark.utils.probe import DendriticProbe, probing
 
 
 class LineBusy(RuntimeError):
@@ -581,10 +583,11 @@ class Trainer:
         mb = self._val_batch(L)
         for strata in self._val_rows(L).values():
             for _, _, arr in strata:
-                with self.arena.use():
+                with self.arena.use(), probing(self.model, DendriticProbe()) as probe:
                     w = torch.from_numpy(arr[:mb]).to(self.dev)
                     self.model.loss(w[:, :-1].contiguous(), w[:, 1:].contiguous())
                     del w
+                print(f"{dendritic_line(probe)} (the warm-up micro-batch of length {L})", flush=True)
                 return
 
     def _hold(self, others: float, slack_gib: float = 0.25, reclaim: bool = False, quick: bool = False) -> None:
@@ -605,29 +608,33 @@ class Trainer:
     def _validate(self, L: int, recipe: dict) -> dict:
         """The held-out loss of every source at length L (``val_<L>/<source>``: its strata's losses weighted by their
         shares of the source), and over the sources of the update's recipe ``recipe`` ({source: weight}): weighted
-        by the recipe (``val_<L>/mix``, the held-out estimate of the training loss) and unweighted (``.../mean``)."""
+        by the recipe (``val_<L>/mix``, the held-out estimate of the training loss) and unweighted (``.../mean``).
+        The dendritic neuron layers are probed on the same rows (``val_<L>/dendritic/...``, nstrain.probes)."""
         key = f"val_{L}"
         out, got = {}, {}
         mb = self._val_batch(L)
-        for name, strata in self._val_rows(L).items():
-            self._beat(f"validation {name}")
-            acc = tot = 0.0
-            for _, share, arr in strata:
-                s = 0.0
-                with self.arena.use():                               # (in the arena: memory the trainer holds)
-                    for i in range(0, arr.shape[0], mb):
-                        w = torch.from_numpy(arr[i:i + mb]).to(self.dev)
-                        s += float(self.model.loss(w[:, :-1].contiguous(), w[:, 1:].contiguous()).ce)
-                        del w
-                acc += share * s / (arr.shape[0] // mb)
-                tot += share
-            got[name] = out[f"{key}/{name}"] = acc / tot
+        probe = DendriticProbe()
+        with probing(self.model, probe):
+            for name, strata in self._val_rows(L).items():
+                self._beat(f"validation {name}")
+                acc = tot = 0.0
+                for _, share, arr in strata:
+                    s = 0.0
+                    with self.arena.use():                           # (in the arena: memory the trainer holds)
+                        for i in range(0, arr.shape[0], mb):
+                            w = torch.from_numpy(arr[i:i + mb]).to(self.dev)
+                            s += float(self.model.loss(w[:, :-1].contiguous(), w[:, 1:].contiguous()).ce)
+                            del w
+                    acc += share * s / (arr.shape[0] // mb)
+                    tot += share
+                got[name] = out[f"{key}/{name}"] = acc / tot
         mine = {n: float(w) for n, w in recipe.items() if w > 0}
         missing = sorted(n for n in mine if n not in got)
         if missing:
             raise RuntimeError(f"validation: no held-out rows of the recipe's sources {missing} at length {L}")
         out[f"{key}/mix"] = sum(got[n] * w for n, w in mine.items()) / sum(mine.values())
         out[f"{key}/mean"] = sum(got[n] for n in mine) / len(mine)
+        out.update(dendritic_metrics(key, probe))
         return out
 
     # ------------------------------------------------------------------ the loop
