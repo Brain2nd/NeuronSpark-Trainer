@@ -98,13 +98,16 @@ class Arena:
         outer.wait_stream(self.stream)
 
     def close(self) -> None:
-        """The arena's memory back to the driver (after every graph captured in it is released)."""
+        """The arena's memory back to the driver (after every graph captured in it is released).  The cuBLAS
+        workspaces are dropped first: torch keeps one per stream in its allocator, so the arena's stream got one
+        inside the arena -- a few MiB that would pin a whole held segment (32 GiB) of the closed pool for good."""
         import gc
         import torch
         torch.cuda.synchronize()
         gc.collect()                                                 # graphs of a dead engine
         if self.pool.use_count() != 1:                               # (torch aborts the process otherwise)
             raise RuntimeError(f"the arena still has {self.pool.use_count() - 1} users (graphs captured in it)")
+        torch._C._cuda_clearCublasWorkspaces()
         self.pool = None
         torch.cuda.empty_cache()
 
@@ -150,11 +153,12 @@ def reclaim_dead(least: int = 16 << 20) -> int:
         return 0
     del probe
     torch.cuda.synchronize()
-    del pool                                                         # (its block back to the driver)
-    return max(0, torch.cuda.mem_get_info()[0] - free)
+    del pool
+    torch.cuda.empty_cache()                                         # (its block back to the driver now, not at the
+    return max(0, torch.cuda.mem_get_info()[0] - free)               # allocator's next release)
 
 
-def hold_memory(reserve_gb: float, others: float, recheck: Callable[[], float], sizes_gib=(4.0, 1.0),
+def hold_memory(reserve_gb: float, others: float, recheck: Callable[[], float], sizes_gib=(32.0, 4.0, 1.0),
                 slack_gib: float = 0.25, headroom_gib: float = 1.0, arena: "Arena" = None,
                 reclaim: bool = False) -> float:
     """Take the GPU's free memory into this process's allocator but what the other processes may still take: the
@@ -162,9 +166,9 @@ def hold_memory(reserve_gb: float, others: float, recheck: Callable[[], float], 
     e.g. a kernel module loaded late) -- the bytes :func:`room_beside` gives, from one reading of the free memory
     between two of theirs, taken from the driver: blocks are allocated (and kept until the end) until this process
     reserves that much more, so free blocks it already caches serve the first ones and are not counted.  Blocks of
-    ``sizes_gib`` (largest first, each as large as fits; the largest as large as the largest eager allocation, the
-    readout chunk, so that a later one is served from a held block), then the rest in one block; the freed blocks stay
-    reserved by this process and serve its own allocations.  With ``reclaim`` the memory the driver keeps from dead
+    ``sizes_gib`` (largest first, each as large as fits -- few, large blocks: fewer allocations, a shorter hold; the
+    allocator splits them for smaller requests, so a later eager allocation is served from a held block), then the
+    rest in one block; the freed blocks stay reserved by this process and serve its own allocations.  With ``reclaim`` the memory the driver keeps from dead
     processes is taken too (:func:`reclaim_dead`, then held again, until the probe finds none).  The
     allocator's cap (:func:`cap_memory`) is then what it holds plus ``headroom_gib``: an allocation that no held
     block can serve takes at most that much more of the GPU; past it the allocator gives back the free blocks outside

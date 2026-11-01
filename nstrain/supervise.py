@@ -22,10 +22,12 @@ Trainer (``python -m nstrain train RUN``, own session, output appended to ``<run
   relaunch; any other abnormal exit while another process is on the GPU (a kernel fault under time-slicing, see
   nstrain.gpu) is handled the same way; exit 4 (another trainer still holds the line, e.g. one writing its last
   checkpoint): wait for it; none of these is a failure;
-* with ``guards.share_reserve_gb`` the trainer always trains beside other processes (nstrain.trainer: its shapes
-  measured for that reserve, all of the GPU but the reserve held) and does not stop for them; it exits 3 only at a
-  start where they already use more than the reserve plus the tune's margin: the supervisor then waits until they fit
-  (the reserve re-read at every check, nstrain.gpu.fits_beside) or the GPU is free; after SHARED_CRASHES crashes
+* with ``guards.share_reserve_gb`` the trainer trains beside other processes without stopping (nstrain.trainer: it
+  changes mode inside the process when they appear or leave -- their shapes measured for that reserve, all of the GPU
+  but the reserve held while they are there, its own shapes and the GPU to itself otherwise); it exits 3 only when
+  they use more than the reserve plus the tune's margin (at a start, at a check, or taken while the trainer changed
+  mode): the supervisor then waits until they fit (the reserve re-read at every check, nstrain.gpu.fits_beside) or
+  the GPU is free, and the relaunched trainer picks its mode from what is on the GPU; after SHARED_CRASHES crashes
   beside them without progress the line waits for a free GPU (an event with the last exit code); the counts of
   failures and crashes start again whenever the line moves; a wait for the GPU longer than ``supervisor.stall_s`` is
   an event;

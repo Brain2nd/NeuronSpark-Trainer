@@ -34,14 +34,21 @@ after every update -- a checkpoint is written while there is room --; a failed s
 marker that does not match ``latest``; another trainer reading the data line; the data read off their plan), 1 failure
 (also when nvidia-smi fails: at start, or at three checks in a row, then after a checkpoint).  A stop by a signal
 (exit 0) writes "stopped by a signal" as the last heartbeat stage (the supervisor relaunches a trainer it did not
-stop).  The GPU is checked every ``guards.gpu_check_every`` updates.  With ``guards.share_reserve_gb``
-set the line trains beside other processes, whether they are there or not: every length with its ``shared`` shape
-(measured for that reserve by ``nstrain tune --shared``; a start without one is refused), the engines captured and
-validation run in the trainer's arena (nstrain.gpu.Arena), which holds all of the GPU but what the other processes
-may still take -- the reserve less what they use, adjusted at every check (nstrain.gpu.hold_memory): they cannot grow
-past the reserve, and the line neither stops nor changes its shape for them (a change of shape would give memory back
-to the driver, for anything to take).  Without a reserve another process appearing ends the run with a checkpoint
-(exit 3).  Started by a supervisor (``NSTRAIN_SUPERVISOR_PID``), the trainer gets SIGTERM when the supervisor dies.
+stop).  The GPU is checked every ``guards.gpu_check_every`` updates.
+
+The GPU to itself, the line trains with each length's own shape and leaves the rest of the memory free.  With
+``guards.share_reserve_gb`` set it also trains beside other processes, and changes mode inside the process, at a check
+(``_switch``; nothing else moves: weights, optimizer state, the data position and the W&B run stay as they are):
+when they appear it releases its engine and arena, holds at once all of the GPU but what they may still take -- the
+reserve less what they use (nstrain.gpu.hold_memory, adjusted at every check: they cannot grow past the reserve) --
+and captures the length's ``shared`` shape (measured for that reserve by ``nstrain tune --shared``; a start without
+one is refused) in the new arena; when they have left for ALONE_CHECKS checks it gives the arena back and captures
+the length's own shape again.  The memory is free for anything to take only between the close of the old arena and
+the hold of the new one (one round of cudaFree / cudaMalloc).  When they use more than the reserve and the shapes'
+margin -- at a start, at a check before the switch, or taken in that gap so that the capture beside them runs out of
+memory -- the line checkpoints and exits 3: the supervisor relaunches it once they fit or the GPU is free.  Without a
+reserve another process appearing ends the run with a checkpoint (exit 3).  Started by a supervisor
+(``NSTRAIN_SUPERVISOR_PID``), the trainer gets SIGTERM when the supervisor dies.
 """
 from __future__ import annotations
 
@@ -70,6 +77,7 @@ from nstrain.data.stream import ORDER_FORMAT
 from nstrain.engine import StepEngine
 from nstrain.flat_adamw import FlatAdamW
 from nstrain.gpu import (CAPTURE_SLACK_GIB, GpuBusy, GpuCheckFailed, beside_limit_gib, cap_memory, fits_beside,
+                        reclaim_dead,
                          hold_memory, lease, other_processes, others_gb, room_beside)
 from nstrain.proc import honor_stop
 from nstrain.wb import RunRecord, Tracker
@@ -115,6 +123,7 @@ def code_versions(tokenizer_sha256: str) -> dict:
 
 
 MIX_ALARM_Z = 8.0                  # the read mix this many standard deviations off the plan: an alert
+ALONE_CHECKS = 3                   # checks without other processes before a line beside them takes the GPU back
 
 
 class Trainer:
@@ -134,31 +143,29 @@ class Trainer:
             fcntl.flock(self._lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             raise LineBusy(f"another trainer holds {self.root / 'trainer.lock'}") from None
-        # a reserve set: the line always trains with its shapes beside other processes and holds all of the GPU but
-        # the reserve, whether they are there or not -- they may start at any time and take up to the reserve, never
-        # more; a change of shape on their arrival would have to give memory back to the driver, and anything could
-        # take it then (a greedy process took 86 GiB of a 6 GiB reserve in that moment, tests/test_gpu_share.py)
-        self.shared = c.guards.share_reserve_gb is not None
+        self.reserve = c.guards.share_reserve_gb                    # GB left to other processes, else none allowed
+        self.shared = False                                          # beside other processes now (see the module
+        self.alone_checks = 0                                        # documentation; _switch); checks without them
         self.others_last = 0.0                                       # their GB when last measured (nstrain.gpu)
         self.stopped_waiting = False                                 # a stop came while waiting for data
         self._beat("start")                                          # (its mode: the supervisor's crash count)
         if not c.guards.allow_shared_gpu:                           # before any CUDA initialisation
             self._lease = lease(str(self.root))
             others = other_processes(exclude_pid=os.getpid())
-            if self.shared and others:
-                self.others_last = others_gb(exclude_pid=os.getpid())
-            if self.shared and others and not fits_beside(self.others_last, c.guards.share_reserve_gb):
-                raise GpuBusy(f"the shapes do not fit beside the other processes on the GPU (more than the "
-                              f"{c.guards.share_reserve_gb:g} GB reserved for them and the tune's margin): {others}")
-            if others and not self.shared:
+            if others and self.reserve is None:
                 raise GpuBusy(f"other processes on the GPU: {others}; training needs the GPU to itself "
                               "(guards.allow_shared_gpu overrides)")
+            if others:
+                self.others_last = others_gb(exclude_pid=os.getpid())
+                if not fits_beside(self.others_last, self.reserve):
+                    raise GpuBusy(f"the shapes do not fit beside the other processes on the GPU (more than the "
+                                  f"{self.reserve:g} GB reserved for them and the tune's margin): {others}")
+                self.shared = True
         problems = preflight(c)
         if problems:                                                 # a configuration to fix: no relaunch helps
             raise NeedsOperator("cannot start: " + "; ".join(problems))
         if self.shared:                                              # out of memory before the reserve is touched
-            total = torch.cuda.get_device_properties(torch.cuda.current_device()).total_memory / 2**30
-            cap_memory(beside_limit_gib(total, c.guards.share_reserve_gb))
+            cap_memory(beside_limit_gib(self._total_gib(), self.reserve))
         self.model_cfg = c.model
         self.ckpts = Checkpoints(c.ckpt_dir, keep_last=c.checkpoints.keep_last)
         self.line = Line(c.data_work, c.tokens_per_update, seed=c.data_seed)
@@ -403,6 +410,46 @@ class Trainer:
         return {"rollback": {"rollback_of": source, "rollback_step": step},
                 "branch": {"parent_run": source, "parent_step": step}}.get(kind, {})
 
+    @staticmethod
+    def _total_gib() -> float:
+        return torch.cuda.get_device_properties(torch.cuda.current_device()).total_memory / 2**30
+
+    def _switch(self, shared: bool, others: float) -> None:
+        """The GPU mode changed at a check (``guards.share_reserve_gb`` set): beside other processes that appeared, or
+        with the GPU to itself again once they left.  The engine is released and the arena closed -- its memory goes
+        back to the driver -- and a new arena is made: beside them it holds at once all of the GPU but what they may
+        still take (the reserve less their ``others`` GB) and keeps the capture slack (``_slack_in``); alone it holds
+        nothing (the next capture takes what it needs, as `nstrain tune` measured it, and the rest stays free).  The
+        next update captures the length's shape of the new mode (``_engine_for``).  Weights, optimizer state, the
+        data position and the W&B run do not move.  Nothing is printed between the close and the hold: that gap is
+        the only time the memory is free for anything to take."""
+        import gc
+        from nstrain.gpu import Arena
+        if self.engine is not None:
+            self.engine.release()
+            self.engine = None
+        self._slack_out()
+        gc.collect()                                                 # (the dead engine's graphs, before the close:
+        self.arena.close()                                           # nothing left for its own collection)
+        self.arena = Arena()
+        self.shared = shared
+        print(f"update {self.update}: the arena closed: {torch.cuda.memory_reserved() / 2**30:.1f} GiB reserved by "
+              f"the allocator, {torch.cuda.mem_get_info()[0] / 2**30:.1f} GiB free on the GPU", flush=True)
+        if shared:
+            cap_memory(beside_limit_gib(self._total_gib(), self.reserve))
+            self._slack_in(others, quick=True)                       # their memory as the check read it: no
+                                                                     # nvidia-smi in the gap
+            print(f"update {self.update}: other processes on the GPU use {others:.1f} GB ({self.reserve:g} GB "
+                  "reserved for them): beside them from here, with the shapes measured for the reserve", flush=True)
+        else:
+            cap_memory(self._total_gib())
+            dead = 0
+            while (got := reclaim_dead()) >= 16 << 20:               # what the driver kept from the processes that
+                dead += got                                          # left: reclaimed, so the GPU is whole again
+            print(f"update {self.update}: the other processes left the GPU: with the GPU to itself from here, with "
+                  f"the lengths' own shapes ({dead / 2**30:.1f} GiB of theirs reclaimed from the driver)", flush=True)
+        self.alone_checks = 0
+
     def _engine_for(self, L: int, others: Optional[float] = None) -> StepEngine:
         """The engine of length L, warmed up and captured in the trainer's arena (nstrain.gpu.Arena): a new one
         reuses the memory the arena holds.  Beside other processes the slack (``_slack_in``) goes back to the driver
@@ -431,21 +478,26 @@ class Trainer:
                                  arena=self.arena, before_capture=lambda: self._warm_validation(L))
         print(f"engine {accum} x {s.micro_rows} x {L}{' (beside other processes)' if self.shared else ''} captured "
               f"in {time.time() - t0:.0f} s, {torch.cuda.memory_allocated() / 2**30:.1f} GiB", flush=True)
-        if self.shared:
-            self._slack_in(self._others(None))
+        torch.cuda.empty_cache()                                     # blocks freed outside the arena since the last
+        if self.shared:                                              # release (a closed arena's, a pool's) back to
+            self._slack_in(self._others(None))                       # the driver: free alone, held beside others
         self._beat(f"{L} engine captured")
         return self.engine
 
-    def _slack_in(self, others: float) -> None:
+    def _slack_in(self, others: float, quick: bool = False) -> None:
         """Beside other processes: all of the GPU held but what they may still take -- in the arena all but
         CAPTURE_SLACK_GIB, the slack less 0.25 GiB in a block of its own pool outside the arena (``self.slack``),
         which the next capture gives back to the driver (``_slack_out``): memory only a capture needs, never free for
-        the others to take in between (nstrain.gpu.room_beside: what they free meanwhile stays theirs)."""
-        self._hold(others, slack_gib=CAPTURE_SLACK_GIB, reclaim=True)
+        the others to take in between (nstrain.gpu.room_beside: what they free meanwhile stays theirs).  ``quick``
+        (the switch to this mode, ``_switch``): their memory is ``others`` as the check read it, not read again, and
+        the dead memory is not probed -- the shortest hold, the next check does both."""
+        self._hold(others, slack_gib=CAPTURE_SLACK_GIB, reclaim=not quick, quick=quick)
 
         # the slack's second reading: when nvidia-smi fails, the first one (no slack would be worse: the next capture
         # would take its memory from what the others may still use)
         def again() -> float:
+            if quick:
+                return others
             try:
                 return others_gb(exclude_pid=os.getpid())
             except GpuCheckFailed:
@@ -462,7 +514,7 @@ class Trainer:
                 self.slack_pool = pool
             except torch.cuda.OutOfMemoryError:                      # another process took it meanwhile
                 self.slack = None
-        self._hold(others)                                           # (the allocator's cap: what it holds, again)
+        self._hold(others, quick=quick)                              # (the allocator's cap: what it holds, again)
 
     def _slack_out(self) -> None:
         """The slack block back to the driver (before a capture): its pool goes, and with it that block only -- the
@@ -535,12 +587,14 @@ class Trainer:
                     del w
                 return
 
-    def _hold(self, others: float, slack_gib: float = 0.25, reclaim: bool = False) -> None:
+    def _hold(self, others: float, slack_gib: float = 0.25, reclaim: bool = False, quick: bool = False) -> None:
         """Beside other processes: the arena holds the GPU's memory but what they may still take, and ``slack_gib``
         for this process's own memory outside the allocator (nstrain.gpu.hold_memory: their memory read again after
-        the free memory, so that what they free meanwhile is not taken; with ``reclaim``, at a start or a capture,
-        what the driver keeps from dead processes is taken too)."""
-        taken = hold_memory(self.cfg.guards.share_reserve_gb, others, lambda: others_gb(exclude_pid=os.getpid()),
+        the free memory, so that what they free meanwhile is not taken -- not with ``quick``, the switch's hold, which
+        takes ``others`` as read; with ``reclaim``, at a start or a capture, what the driver keeps from dead
+        processes is taken too)."""
+        taken = hold_memory(self.cfg.guards.share_reserve_gb, others,
+                            (lambda: others) if quick else (lambda: others_gb(exclude_pid=os.getpid())),
                             slack_gib=slack_gib, arena=self.arena, reclaim=reclaim)
         if taken >= 0.5:
             print(f"update {self.update}: holding {taken:.1f} GiB more ({torch.cuda.memory_reserved() / 2**30:.1f} GiB "
@@ -618,7 +672,7 @@ class Trainer:
         failed check counts, three in a row raise."""
         try:
             busy = other_processes(exclude_pid=os.getpid())
-            gb = others_gb(exclude_pid=os.getpid()) if busy and self.shared else 0.0
+            gb = others_gb(exclude_pid=os.getpid()) if busy and self.reserve is not None else 0.0
             if self.shared:
                 self.others_last = gb
         except GpuCheckFailed as e:
@@ -665,7 +719,16 @@ class Trainer:
                     raise RuntimeError(f"update {self.update + 1}: the recipe's sources {missing} have no held-out "
                                        f"rows of {u.seq_len} in {c.val_work} (`nstrain data val`)")
                 recipe = u.recipe
-            eng = self._engine_for(u.seq_len)
+            try:
+                eng = self._engine_for(u.seq_len)
+            except torch.cuda.OutOfMemoryError:
+                if not self.shared:
+                    raise
+                print(f"update {self.update}: out of memory capturing the {u.seq_len} engine beside the other "
+                      "processes (they took more than the reserve meanwhile); checkpoint and stop until they fit",
+                      flush=True)
+                rc = exits.GPU_BUSY
+                break
             lr = sched.lr_at(c.schedule, c.optimizer.peak_lr, self.tokens)
             metrics, applied = eng.update(u.inputs, u.targets, lr)
             self.update += 1
@@ -673,7 +736,8 @@ class Trainer:
             self.skipped += 0 if applied else 1
             self.in_a_row = 0 if applied else self.in_a_row + 1
             self.prev_shape = {"rows": eng.rows, "seq_len": eng.L, "accum": eng.accum}
-            last_u = u
+            eng = None                                               # (no reference left on the engine: a switch of
+            last_u = u                                               # mode below frees it with the arena)
             now = time.time()
             row = {"tokens": self.tokens, "train/loss": metrics["loss"], "train/ce": metrics["ce"],
                    "train/aux": metrics["aux"], "train/grad_norm": metrics["grad_norm"], "train/lr": lr,
@@ -700,8 +764,21 @@ class Trainer:
                 except GpuCheckFailed:
                     check_failed = True
             busy = seen[0] if seen else []
-            if self.shared and seen is not None:                     # the others get the reserve, no more (and
-                self._hold(seen[1])                                  # what they free is held again)
+            evict = bool(busy) and not self.shared and self.reserve is None
+            if seen is not None and self.reserve is not None:
+                if busy and not self.shared:                         # they appeared: beside them from here, if
+                    if fits_beside(seen[1], self.reserve):           # their memory leaves room for the shapes
+                        self._switch(True, seen[1])
+                    else:
+                        evict = True
+                elif self.shared and not busy:                       # they left: alone again after ALONE_CHECKS
+                    self.alone_checks += 1                           # checks without them (not for a gap of one)
+                    if self.alone_checks >= ALONE_CHECKS:
+                        self._switch(False, 0.0)
+                else:
+                    self.alone_checks = 0
+                if self.shared and busy:                             # the others get the reserve, no more (and
+                    self._hold(seen[1])                              # what they free is held again)
             row["sys/gpu_shared"] = int(self.shared)
             self.wb.log(self.update, row)
             self.rows.append((self.update, row))
@@ -717,9 +794,12 @@ class Trainer:
             if check_failed and not stop:
                 print(f"update {self.update}: the GPU cannot be checked; checkpoint and stop (failure)", flush=True)
                 rc = exits.FAILURE
-            elif busy and not self.shared and not stop:
-                print(f"update {self.update}: other processes on the GPU: {busy} (no guards.share_reserve_gb: the "
-                      "line trains with the GPU to itself); checkpoint and stop", flush=True)
+            elif evict and not stop:
+                why = ("no guards.share_reserve_gb: the line trains with the GPU to itself" if self.reserve is None
+                       else f"they use {seen[1]:.1f} GB, more than the {self.reserve:g} GB reserved for them and the "
+                            "shapes' margin")
+                print(f"update {self.update}: other processes on the GPU: {busy} ({why}); checkpoint and stop",
+                      flush=True)
                 rc = exits.GPU_BUSY
             elif self.mix_alarm and not stop:
                 print(f"update {self.update}: {self.mix_alarm}; checkpoint and stop for the operator", flush=True)

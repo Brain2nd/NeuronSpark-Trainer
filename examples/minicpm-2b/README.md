@@ -81,6 +81,8 @@ nstrain run runs/b0
   recipe's sources `val_4096/mix` (weighted by the recipe, the held-out estimate of the training loss) and
   `val_4096/mean` (unweighted); at 32K the same under `val_32768/`.
 * **Shared GPU:** with `guards.share_reserve_gb: 50` and the `shared` shapes measured for it (`nstrain tune
-  --shared`), the line always trains with those shapes and holds all of the GPU but 50 GB: another process may start
-  at any time and take up to 50 GB, never more; `guards.gpu_check_every: 1` re-holds what it frees at every update.
-  The run.json here is the trunk's: the reserve and the shared shapes as `nstrain tune --shared` measured them.
+  --shared`), the line trains with its own shapes and the GPU to itself while nobody else is there, and when another
+  process appears it goes on beside it inside the same process: it holds all of the GPU but 50 GB and trains with the
+  shared shapes until the other process has been gone for 3 checks, then takes the GPU back.  The other process may
+  take up to 50 GB, never more.  The run.json here is the trunk's: the reserve and the shared shapes as
+  `nstrain tune --shared` measured them.
