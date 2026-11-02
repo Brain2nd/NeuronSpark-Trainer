@@ -79,10 +79,10 @@ from nstrain.flat_adamw import FlatAdamW
 from nstrain.gpu import (CAPTURE_SLACK_GIB, GpuBusy, GpuCheckFailed, beside_limit_gib, cap_memory, fits_beside,
                         reclaim_dead,
                          hold_memory, lease, other_processes, others_gb, room_beside)
-from nstrain.probes import dendritic_line, dendritic_metrics
+from nstrain.probes import dendritic_line, dendritic_metrics, hippocampal_line, hippocampal_metrics
 from nstrain.proc import honor_stop
 from nstrain.wb import RunRecord, Tracker
-from neuronspark.utils.probe import DendriticProbe, probing
+from neuronspark.utils.probe import DendriticProbe, HippocampalProbe, probing
 
 
 class LineBusy(RuntimeError):
@@ -586,12 +586,15 @@ class Trainer:
         mb = self._val_batch(L)
         for strata in self._val_rows(L).values():
             for _, _, arr in strata:
-                with self.arena.use(), probing(self.model, DendriticProbe(self.eos_id)) as probe:
+                probe, hprobe = DendriticProbe(self.eos_id), HippocampalProbe(self.eos_id)
+                with self.arena.use(), probing(self.model, probe, hprobe):
                     w = torch.from_numpy(arr[:mb]).to(self.dev)
                     probe.row(w[:, :-1])
+                    hprobe.row(w[:, :-1])
                     self.model.loss(w[:, :-1].contiguous(), w[:, 1:].contiguous())
                     del w
-                print(f"{dendritic_line(probe)} (the warm-up micro-batch of length {L})", flush=True)
+                print(f"{dendritic_line(probe)}; {hippocampal_line(hprobe)} (the warm-up micro-batch of length {L})",
+                      flush=True)
                 if self.probe_len > L:                                # the long-row probe's first call too
                     self._warm_long(L)
                 return
@@ -605,14 +608,16 @@ class Trainer:
         if P % seg:
             raise RuntimeError(f"long probe: the length {P} is not a multiple of the training length {seg}")
         arr = next(iter(self._val_rows(P, unit=1).values()))[0][2]
-        probe = DendriticProbe(self.eos_id, horizon=P, segments=P // seg)
-        with self.arena.use(), probing(self.model, probe):
+        probe, hprobe = DendriticProbe(self.eos_id, horizon=P, segments=P // seg), HippocampalProbe(self.eos_id)
+        with self.arena.use(), probing(self.model, probe, hprobe):
             w = torch.from_numpy(arr[:1]).to(self.dev)
             probe.row(w[:, :-1])
+            hprobe.row(w[:, :-1])
             per = self.model.per_token_ce(w[:, :-1].contiguous(), w[:, 1:].contiguous())
             segs = [round(float(x), 3) for x in per.view(-1, seg).mean(dim=1)]
             del w, per
-        print(f"long probe: one row of {P}, ce by segment of {seg} {segs}; {dendritic_line(probe)}", flush=True)
+        print(f"long probe: one row of {P}, ce by segment of {seg} {segs}; {dendritic_line(probe)}; "
+              f"{hippocampal_line(hprobe)}", flush=True)
 
     def _hold(self, others: float, slack_gib: float = 0.25, reclaim: bool = False, quick: bool = False) -> None:
         """Beside other processes: the arena holds the GPU's memory but what they may still take, and ``slack_gib``
@@ -637,8 +642,8 @@ class Trainer:
         key = f"val_{L}"
         out, got = {}, {}
         mb = self._val_batch(L)
-        probe = DendriticProbe(self.eos_id)
-        with probing(self.model, probe):
+        probe, hprobe = DendriticProbe(self.eos_id), HippocampalProbe(self.eos_id)
+        with probing(self.model, probe, hprobe):
             for name, strata in self._val_rows(L).items():
                 self._beat(f"validation {name}")
                 acc = tot = 0.0
@@ -648,6 +653,7 @@ class Trainer:
                         for i in range(0, arr.shape[0], mb):
                             w = torch.from_numpy(arr[i:i + mb]).to(self.dev)
                             probe.row(w[:, :-1])
+                            hprobe.row(w[:, :-1])
                             s += float(self.model.loss(w[:, :-1].contiguous(), w[:, 1:].contiguous()).ce)
                             del w
                     acc += share * s / (arr.shape[0] // mb)
@@ -660,6 +666,7 @@ class Trainer:
         out[f"{key}/mix"] = sum(got[n] * w for n, w in mine.items()) / sum(mine.values())
         out[f"{key}/mean"] = sum(got[n] for n in mine) / len(mine)
         out.update(dendritic_metrics(key, probe))
+        out.update(hippocampal_metrics(key, hprobe))
         return out
 
     @torch.no_grad()
@@ -673,9 +680,9 @@ class Trainer:
         if P % seg:
             raise RuntimeError(f"long probe: the length {P} is not a multiple of the training length {seg}")
         n_seg = P // seg
-        probe = DendriticProbe(self.eos_id, horizon=P, segments=n_seg)
+        probe, hprobe = DendriticProbe(self.eos_id, horizon=P, segments=n_seg), HippocampalProbe(self.eos_id)
         out, got, pos = {}, {}, {}
-        with probing(self.model, probe):
+        with probing(self.model, probe, hprobe):
             for name, strata in self._val_rows(P, unit=1).items():
                 self._beat(f"long probe {name}")
                 acc, tot = torch.zeros(n_seg, dtype=torch.float64), 0.0
@@ -685,6 +692,7 @@ class Trainer:
                         for i in range(arr.shape[0]):
                             w = torch.from_numpy(arr[i:i + 1]).to(self.dev)
                             probe.row(w[:, :-1])
+                            hprobe.row(w[:, :-1])
                             per = self.model.per_token_ce(w[:, :-1].contiguous(), w[:, 1:].contiguous())
                             s += per.view(n_seg, seg).mean(dim=1).double().cpu()
                             del w, per
@@ -704,6 +712,7 @@ class Trainer:
             out[f"{key}/pos/seg{k}"] = float(mix[k])
         out[f"{key}/pos/last_over_first"] = float(mix[-1] / mix[0])
         out.update(dendritic_metrics(key, probe))
+        out.update(hippocampal_metrics(key, hprobe))
         return out
 
     # ------------------------------------------------------------------ the loop

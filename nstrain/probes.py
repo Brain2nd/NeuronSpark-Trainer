@@ -21,6 +21,23 @@ validation rows: ``val_<L>/dendritic/<name>`` over every dendritic head of the m
   potential after the new one's first token); ``boundary_step_ratio_p50`` and ``boundary_step_ratio_max``, the heads'
   mean step over a boundary's two tokens over their mean step elsewhere (well above 1: a head that flushes its
   compartments at the boundaries).
+
+The hippocampal probe metrics, from a ``neuronspark.utils.probe.HippocampalProbe`` that saw the same rows:
+``val_<L>/hippocampal/layer<NN>/<name>`` per hippocampal layer and ``val_<L>/hippocampal/<name>`` over the model:
+
+* ``decay_tau_p50``, ``decay_tau_p90``, ``decay_tau_max``: the decay channels' e-fold lengths in tokens at the row's
+  mean step (the row length over the channel's decay exponent; the layer's 256 channels, or every layer's);
+* ``clock_tau_head<h>`` per layer and ``clock_tau_p50``, ``clock_tau_max`` over the model: the tokens over which a
+  head's pool clock (its eligibility bias) runs one e-fold at the row's mean step;
+* ``clock_boundary_step_ratio``: the clock's mean increment over a document boundary's two tokens over its increment
+  elsewhere (per layer; the mean over the layers for the model), with the probe's ``boundaries`` (over the model);
+* ``write_head<h>`` per layer and ``write_p50``, ``write_max`` over the model: the mean write tag of a head (the
+  fraction of a token's value entering the pool);
+* ``gate_firing``, ``ffn_in_firing``, ``ffn_gate_firing``, ``ffn_up_firing``: the firing rates of the write gate,
+  the FFN input neuron and the spiking FFN's gate and up neurons; ``copy_pi``, ``novelty``, ``read_gain``: the copy
+  arbitration's mean factors; ``pkm_entropy``, ``pkm_slots_used``, ``pkm_gate``: the PKM read's mean top-k weight
+  entropy, the fraction of its slots read over the rows and its mean read gate (per layer; means over the layers for
+  the model).
 """
 from __future__ import annotations
 
@@ -119,3 +136,80 @@ def dendritic_line(probe) -> str:
             f"{int((r > RETENTION_TAIL).sum())}/{r.numel()}, > {HORIZON_SLOW:g} over {int(probe.horizon) // 1024}k "
             f"{int((rh > HORIZON_SLOW).sum())}/{r.numel()}, tau tokens p50 {float(torch.quantile(tau, 0.5)):.3g} max "
             f"{float(tau.max()):.3g}, firing {float(f.mean()):.3f}, boundaries {nb}{at}")
+
+
+HIPPOCAMPAL_MEANS = ("gate_firing", "ffn_in_firing", "ffn_gate_firing", "ffn_up_firing", "copy_pi", "novelty",
+                     "read_gain", "pkm_entropy", "pkm_slots_used", "pkm_gate")
+
+
+def _hippocampal_readings(summary: dict):
+    """Over every layer: the channels' decay exponents, the heads' clock exponents and write tags, the per-layer
+    scalars stacked (layers,) per name, and the clock step ratios of the layers (NaN where a layer saw no boundary)."""
+    e = torch.cat([v["decay_exponent"] for v in summary.values()])
+    c = torch.cat([v["clock_exponent"] for v in summary.values()])
+    w = torch.cat([v["write"] for v in summary.values()])
+    means = {name: torch.stack([v[name].reshape(()) for v in summary.values()]) for name in HIPPOCAMPAL_MEANS}
+    ratio = torch.stack([(v["clock_boundary_step"] / v["clock_body_step"].clamp_min(1e-12)).reshape(())
+                         for v in summary.values()])
+    return e, c, w, means, ratio
+
+
+def hippocampal_metrics(key: str, probe) -> Dict[str, float]:
+    """The metrics of ``probe`` (a HippocampalProbe) under ``<key>/hippocampal`` (see the module docstring)."""
+    s = probe.summary()
+    if not s:
+        raise RuntimeError("hippocampal probe: the validation forward reached no hippocampal layer")
+    nb, out = _boundaries(s), {}
+    for i, v in s.items():
+        p = f"{key}/hippocampal/layer{i:02d}"
+        tau = _tau(probe, v["decay_exponent"])
+        out[f"{p}/decay_tau_p50"] = float(torch.quantile(tau, 0.5))
+        out[f"{p}/decay_tau_p90"] = float(torch.quantile(tau, 0.9))
+        out[f"{p}/decay_tau_max"] = float(tau.max())
+        ct = _tau(probe, v["clock_exponent"])
+        for h in range(ct.numel()):
+            out[f"{p}/clock_tau_head{h}"] = float(ct[h])
+        if nb:
+            ratio = v["clock_boundary_step"] / v["clock_body_step"].clamp_min(1e-12)
+            out[f"{p}/clock_boundary_step_ratio"] = float(ratio)
+        for h in range(v["write"].numel()):
+            out[f"{p}/write_head{h}"] = float(v["write"][h])
+        for name in HIPPOCAMPAL_MEANS:
+            out[f"{p}/{name}"] = float(v[name].reshape(()))
+    e, c, w, means, ratio = _hippocampal_readings(s)
+    p = f"{key}/hippocampal"
+    tau = _tau(probe, e)
+    out[f"{p}/decay_tau_p50"] = float(torch.quantile(tau, 0.5))
+    out[f"{p}/decay_tau_p90"] = float(torch.quantile(tau, 0.9))
+    out[f"{p}/decay_tau_max"] = float(tau.max())
+    ct = _tau(probe, c)
+    out[f"{p}/clock_tau_p50"] = float(torch.quantile(ct, 0.5))
+    out[f"{p}/clock_tau_max"] = float(ct.max())
+    if nb:
+        out[f"{p}/clock_boundary_step_ratio"] = float(ratio.mean())
+    out[f"{p}/write_p50"] = float(torch.quantile(w, 0.5))
+    out[f"{p}/write_max"] = float(w.max())
+    for name in HIPPOCAMPAL_MEANS:
+        out[f"{p}/{name}"] = float(means[name].mean())
+    out[f"{p}/boundaries"] = nb
+    return out
+
+
+def hippocampal_line(probe) -> str:
+    """One log line: the model-level readings of a HippocampalProbe."""
+    s = probe.summary()
+    if not s:
+        raise RuntimeError("hippocampal probe: the forward reached no hippocampal layer")
+    e, c, w, means, ratio = _hippocampal_readings(s)
+    nb = _boundaries(s)
+    tau, ct = _tau(probe, e), _tau(probe, c)
+    m = {k: float(v.mean()) for k, v in means.items()}
+    at = f": clock step ratio {float(ratio.mean()):.3g}" if nb else ""
+    return (f"hippocampal probe: decay tau tokens p50 {float(torch.quantile(tau, 0.5)):.3g} max "
+            f"{float(tau.max()):.3g}, "
+            f"clock tau p50 {float(torch.quantile(ct, 0.5)):.3g} max {float(ct.max()):.3g}, write p50 "
+            f"{float(torch.quantile(w, 0.5)):.3g} max {float(w.max()):.3g}, firing gate {m['gate_firing']:.3f} ffn in "
+            f"{m['ffn_in_firing']:.3f} gate {m['ffn_gate_firing']:.3f} up {m['ffn_up_firing']:.3f}, copy pi "
+            f"{m['copy_pi']:.3g} novelty {m['novelty']:.3f} read gain {m['read_gain']:.3g}, pkm entropy "
+            f"{m['pkm_entropy']:.3f} slots used {m['pkm_slots_used']:.3f} gate {m['pkm_gate']:.3f}, boundaries "
+            f"{nb}{at}")

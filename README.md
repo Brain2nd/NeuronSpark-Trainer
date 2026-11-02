@@ -70,6 +70,13 @@ the watchdog interval, when its data preparer keeps failing, or when the supervi
   retention across a boundary (`exp(A (dt_e + dt_e+1))`, what is left of the old document's potential after the new
   one's first token), `boundary_step_ratio_p50` and `boundary_step_ratio_max`, the heads' mean step over a boundary's
   two tokens over their mean step elsewhere (well above 1: a head that flushes its compartments at the boundaries).
+  The hippocampal layers are probed on the same rows (`val_<L>/hippocampal/...`, per layer and over the model):
+  `decay_tau_p50/p90/max`, the decay channels' e-fold lengths in tokens; `clock_tau_head<h>` (per layer) and
+  `clock_tau_p50/max`, the tokens over which a head's pool clock runs one e-fold; `clock_boundary_step_ratio`, the
+  clock's increment over a document boundary over its increment elsewhere; `write_head<h>` (per layer) and
+  `write_p50/max`, the mean write tag of a head; the firing rates `gate_firing`, `ffn_in_firing`, `ffn_gate_firing`,
+  `ffn_up_firing`; the copy arbitration's `copy_pi`, `novelty`, `read_gain`; the PKM read's `pkm_entropy`,
+  `pkm_slots_used`, `pkm_gate`.
   When the model's longest context (`rope_max_seq_len`) exceeds the training length, every validation also runs
   the long-row probe on each source's held-out rows of that length, one row at a time: `val_<P>/<source>`, `/mix`,
   `/mean` (the loss at the long length), `val_<P>/pos/seg<k>` (the recipe-weighted loss by position, in segments
