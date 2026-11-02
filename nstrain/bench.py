@@ -257,12 +257,14 @@ def tune(run, margin_gib: float = gpu.TUNE_MARGIN_GIB, updates: int = 4, write: 
             raise RuntimeError("another process uses the GPU: tune measures on a GPU nothing else uses")
         limit = _gpu_total_gib() - margin_gib - CONTEXT_GIB
         print(f"GPU {gpu.device()}: shapes fit below {limit:.1f} GiB reserved (margin {margin_gib:g} GiB)", flush=True)
-    tpu, chosen = cfg.tokens_per_update, {}
+    from nstrain import batch as batches
+    tpus, chosen = batches.values(cfg.batch_pieces()), {}            # the line's batches (one, or a ramp's)
+    tpu = min(tpus)                                                  # the throughput is measured on the smallest
     cap = limit if shared else None                                  # beside others: out of memory at the limit
     for L in sorted(cfg.lengths):
-        rows = [r for r in (2 ** i for i in range(16)) if r * L <= tpu and tpu % (r * L) == 0]
+        rows = [r for r in (2 ** i for i in range(16)) if r * L <= tpu and all(t % (r * L) == 0 for t in tpus)]
         if not rows:
-            raise ValueError(f"length {L}: no micro-batch divides the {tpu} tokens of an update")
+            raise ValueError(f"length {L}: no micro-batch divides the {tpus} tokens of an update")
         n = M.dendritic_layers(cfg.model)
         probes = {}
 

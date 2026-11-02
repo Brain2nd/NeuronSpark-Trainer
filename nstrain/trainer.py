@@ -17,6 +17,17 @@ The line's run directory (see nstrain.config for run.json)::
                         start)
     rollback.json       written by `nstrain rollback`: this start continues as a new W&B run (removed once it exists)
 
+Every update's row (W&B, run.log every ``print_every``) holds what the step computes anyway: the loss terms, the
+gradient norm, the groups' and the layers' (``param_bucket``), the rate, the weight decay and the tokens of the
+update (a batch-size ramp, nstrain.batch, changes them along the line), the data position, the throughput.  Every
+``validation.every_tokens`` the held-out rows of the training length and of the model's longest context are read
+with the probes (``_validate``, ``_probe_long``; the loss by position in the document too; the pool read's weight
+by distance on every ATTN_STRIDE_ROWS-th micro-batch and ATTN_STRIDE_LONG-th long row), the optimizer's state is
+summarised per parameter group and per layer (nstrain.probes.optimizer_metrics), and, with ``ema`` set, the
+parameters' moving average is validated too (``_validate_ema``: every source's rows at the training length, one
+long row per source); nothing else is computed in the training step.  The metric set is versioned (run.json
+``metrics``, nstrain.probes.METRICS_VERSION): a trainer computing another set does not start.
+
 Starts: a fresh line writes a kept checkpoint of its launch state (update 0) before its first update; a branch
 (``fork_from``) starts from the parent's kept cycle-end checkpoint, forked at that checkpoint's cycle (checked
 against the branch's data state), with the parent's model configuration and schedule up to the fork; a continued
@@ -59,6 +70,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -81,7 +93,8 @@ from nstrain.flat_adamw import FlatAdamW
 from nstrain.gpu import (CAPTURE_SLACK_GIB, GpuBusy, GpuCheckFailed, beside_limit_gib, cap_memory, fits_beside,
                         reclaim_dead,
                          hold_memory, lease, other_processes, others_gb, room_beside)
-from nstrain.probes import dendritic_line, dendritic_metrics, hippocampal_line, hippocampal_metrics
+from nstrain.probes import (METRICS_VERSION, DocPosition, dendritic_line, dendritic_metrics, hippocampal_line,
+                            hippocampal_metrics, optimizer_metrics)
 from nstrain.proc import honor_stop
 from nstrain.wb import RunRecord, Tracker
 from neuronspark.utils.probe import DendriticProbe, HippocampalProbe, probing
@@ -126,8 +139,21 @@ def code_versions(tokenizer_sha256: str) -> dict:
     return v
 
 
+def param_bucket(name: str) -> str:
+    """The bucket of a parameter for the gradient norms and the optimizer statistics: ``layer<NN>`` for a parameter
+    of the model's layer NN, else the part of the model its name starts with (embed_tokens, lexical_memory, norm,
+    ...)."""
+    m = re.match(r"(?:backbone\.)?layers\.(\d+)\.", name)
+    if m:
+        return f"layer{int(m.group(1)):02d}"
+    parts = name.split(".")
+    return parts[1] if parts[0] == "backbone" and len(parts) > 2 else parts[0]
+
+
 MIX_ALARM_Z = 8.0                  # the read mix this many standard deviations off the plan: an alert
 ALONE_CHECKS = 3                   # checks without other processes before a line beside them takes the GPU back
+ATTN_STRIDE_ROWS = 2               # the pool read's weight by distance: on every 2nd validation micro-batch
+ATTN_STRIDE_LONG = 4               # ... and every 4th long row (the costly reading of the probes, nstrain.probes)
 
 
 class Trainer:
@@ -168,6 +194,9 @@ class Trainer:
         problems = preflight(c)
         if problems:                                                 # a configuration to fix: no relaunch helps
             raise NeedsOperator("cannot start: " + "; ".join(problems))
+        if c.metrics is None:
+            print(f"warning: run.json names no metric set (metrics); this nstrain records {METRICS_VERSION!r}",
+                  flush=True)
         if self.shared:                                              # out of memory before the reserve is touched
             cap_memory(beside_limit_gib(self._total_gib(), self.reserve))
         self.model_cfg = c.model
@@ -211,9 +240,14 @@ class Trainer:
             self.progress, self.expect_sha, self.expect_order = (0, 0), "", ""
         o = c.optimizer
         groups = M.param_groups(self.model, o.weight_decay, o.lexical_lr_mult)
-        self.opt = FlatAdamW(self.model, groups, tuple(o.betas), o.eps)
+        self.opt = FlatAdamW(self.model, groups, tuple(o.betas), o.eps, ema=c.ema is not None, bucket=param_bucket)
+        self.ema_started = bool(meta.get("ema_started", False)) if meta is not None else False
         if opt_state is not None:
-            self.opt.load_state({n: {k: v.to(self.dev) for k, v in st.items()} for n, st in opt_state.items()})
+            had = self.opt.load_state({n: {k: v.to(self.dev) for k, v in st.items()} for n, st in opt_state.items()})
+            if c.ema is not None and self.ema_started and not had:
+                raise NeedsOperator("the checkpoint says the parameters' moving average had started but holds none")
+            if c.ema is None:
+                self.ema_started = False
         self.ckpt_bytes = (sum(t.numel() * t.element_size() for t in self.model.state_dict().values()) +
                            sum(t.numel() * t.element_size() for st in self.opt.state().values() for t in st.values()))
         if not self._room(1):
@@ -480,7 +514,7 @@ class Trainer:
         else:
             self._hold_all()
         self._beat(f"capturing the {L} engine")
-        s, accum = c.length(L, self.shared), c.accum(L, self.shared)
+        s, accum = c.length(L, self.shared), c.accum(L, self.shared, self.tokens)
         M.recompute(self.model, s.activation_checkpointing)
         t0 = time.time()
         self.engine = StepEngine(self.model, self.opt, s.micro_rows, L, accum, c.optimizer.grad_clip,
@@ -554,7 +588,8 @@ class Trainer:
         c = self.cfg
         rows, self.rows = [r for r in self.rows if r[0] <= self.update], []
         meta = {"update": self.update, "tokens": self.tokens, "skipped": self.skipped,
-                "skipped_in_a_row": self.in_a_row, "line": c.name, "run_dir": str(self.root), "rows": rows,
+                "skipped_in_a_row": self.in_a_row, "ema_started": self.ema_started, "line": c.name,
+                "run_dir": str(self.root), "rows": rows,
                 "data": {"work": c.data_work, "cycle": cycle, "sample": sample, "manifest_sha256": sha,
                          "seed": c.data_seed, "order": ORDER_FORMAT, "order_digest": order},
                 "shape": shape, "run": c.to_dict(), "model_config": self.model_cfg, "code": self.code,
@@ -662,7 +697,9 @@ class Trainer:
         key = f"val_{L}"
         out, got = {}, {}
         mb = self._val_batch(L)
-        probe, hprobe = DendriticProbe(self.eos_id), HippocampalProbe(self.eos_id, L)
+        probe = DendriticProbe(self.eos_id)
+        hprobe = HippocampalProbe(self.eos_id, L, attn_stride=ATTN_STRIDE_ROWS)
+        docpos = DocPosition(self.eos_id, L)
         with probing(self.model, probe, hprobe):
             for name, strata in self._val_rows(L).items():
                 self._beat(f"validation {name}")
@@ -672,10 +709,13 @@ class Trainer:
                     with self.arena.use():                           # (in the arena: memory the trainer holds)
                         for i in range(0, arr.shape[0], mb):
                             w = torch.from_numpy(arr[i:i + mb]).to(self.dev)
-                            probe.row(w[:, :-1])
-                            hprobe.row(w[:, :-1])
-                            s += float(self.model.loss(w[:, :-1].contiguous(), w[:, 1:].contiguous()).ce)
-                            del w
+                            x = w[:, :-1].contiguous()
+                            probe.row(x)
+                            hprobe.row(x)
+                            per = self.model.per_token_ce(x, w[:, 1:].contiguous())
+                            s += float(per.mean())
+                            docpos.add(name, x, per)
+                            del w, x, per
                     acc += share * s / (arr.shape[0] // mb)
                     tot += share
                 got[name] = out[f"{key}/{name}"] = acc / tot
@@ -685,8 +725,46 @@ class Trainer:
             raise RuntimeError(f"validation: no held-out rows of the recipe's sources {missing} at length {L}")
         out[f"{key}/mix"] = sum(got[n] * w for n, w in mine.items()) / sum(mine.values())
         out[f"{key}/mean"] = sum(got[n] for n in mine) / len(mine)
+        out.update(docpos.metrics(key, mine))
         out.update(dendritic_metrics(key, probe))
         out.update(hippocampal_metrics(key, hprobe))
+        return out
+
+    @torch.no_grad()
+    def _validate_ema(self, L: int, recipe: dict) -> dict:
+        """The held-out loss of the parameters' moving average (the average swapped into the parameters for the
+        forwards, then back): every source at length L on all its rows (``ema/val_<L>/<source>``, ``/mix``,
+        ``/mean`` as ``_validate``, no probes) and, when the model's longest context exceeds L, one long row per
+        source (the first row of its largest stratum; ``ema/val_<P>/...``)."""
+        out = {}
+        self._beat("validation of the moving average")
+        with self.arena.use():
+            self.opt.swap_ema()
+        try:
+            lengths = [(L, self._val_batch(L), False)]
+            if self.probe_len > L:
+                lengths.append((self.probe_len, 1, True))
+            for P, mb, one in lengths:
+                key, got = f"ema/val_{P}", {}
+                for name, strata in self._val_rows(P, unit=1 if one else None).items():
+                    acc = tot = 0.0
+                    for _, share, arr in (sorted(strata, key=lambda t: -t[1])[:1] if one else strata):
+                        n_rows = 1 if one else arr.shape[0]
+                        s = 0.0
+                        with self.arena.use():
+                            for i in range(0, n_rows, mb):
+                                w = torch.from_numpy(arr[i:i + mb]).to(self.dev)
+                                s += float(self.model.loss(w[:, :-1].contiguous(), w[:, 1:].contiguous()).ce)
+                                del w
+                        acc += share * s / max(1, n_rows // mb)
+                        tot += share
+                    got[name] = out[f"{key}/{name}"] = acc / tot
+                mine = {n: float(w) for n, w in recipe.items() if w > 0}
+                out[f"{key}/mix"] = sum(got[n] * w for n, w in mine.items()) / sum(mine.values())
+                out[f"{key}/mean"] = sum(got[n] for n in mine) / len(mine)
+        finally:
+            with self.arena.use():
+                self.opt.swap_ema()
         return out
 
     @torch.no_grad()
@@ -700,7 +778,9 @@ class Trainer:
         if P % seg:
             raise RuntimeError(f"long probe: the length {P} is not a multiple of the training length {seg}")
         n_seg = P // seg
-        probe, hprobe = DendriticProbe(self.eos_id, horizon=P, segments=n_seg), HippocampalProbe(self.eos_id, seg)
+        probe = DendriticProbe(self.eos_id, horizon=P, segments=n_seg)
+        hprobe = HippocampalProbe(self.eos_id, seg, attn_stride=ATTN_STRIDE_LONG)
+        docpos = DocPosition(self.eos_id, P)
         out, got, pos = {}, {}, {}
         with probing(self.model, probe, hprobe):
             for name, strata in self._val_rows(P, unit=1).items():
@@ -711,11 +791,13 @@ class Trainer:
                     with self.arena.use():                           # (in the arena: memory the trainer holds)
                         for i in range(arr.shape[0]):
                             w = torch.from_numpy(arr[i:i + 1]).to(self.dev)
-                            probe.row(w[:, :-1])
-                            hprobe.row(w[:, :-1])
-                            per = self.model.per_token_ce(w[:, :-1].contiguous(), w[:, 1:].contiguous())
+                            x = w[:, :-1].contiguous()
+                            probe.row(x)
+                            hprobe.row(x)
+                            per = self.model.per_token_ce(x, w[:, 1:].contiguous())
                             s += per.view(n_seg, seg).mean(dim=1).double().cpu()
-                            del w, per
+                            docpos.add(name, x, per)
+                            del w, x, per
                     acc += share * s / arr.shape[0]
                     tot += share
                 pos[name] = acc / tot                                # (n_seg,) the source's loss by segment
@@ -731,6 +813,7 @@ class Trainer:
         for k in range(n_seg):
             out[f"{key}/pos/seg{k}"] = float(mix[k])
         out[f"{key}/pos/last_over_first"] = float(mix[-1] / mix[0])
+        out.update(docpos.metrics(key, mine))
         out.update(dendritic_metrics(key, probe))
         out.update(hippocampal_metrics(key, hprobe))
         return out
@@ -835,7 +918,19 @@ class Trainer:
                 rc = exits.GPU_BUSY
                 break
             lr = sched.lr_at(c.schedule, c.optimizer.peak_lr, self.tokens)
-            metrics, applied = eng.update(u.inputs, u.targets, lr)
+            wd_batch = c.optimizer.weight_decay_batch                # the decay follows the batch (nstrain.batch)
+            wd_scale = 1.0 if wd_batch is None else u.inputs.numel() / float(wd_batch)
+            ema_c = 0.0
+            if c.ema is not None:                                    # the parameters' moving average
+                if not self.ema_started and self.tokens >= c.ema.from_tokens:
+                    with self.arena.use():
+                        self.opt.ema_init()                          # starts as a copy of the parameters
+                    self.ema_started = True
+                    print(f"update {self.update}: the parameters' moving average starts ({self.tokens} tokens; "
+                          f"horizon {c.ema.horizon_tokens:.0f} tokens)", flush=True)
+                if self.ema_started:
+                    ema_c = u.inputs.numel() / float(c.ema.horizon_tokens)
+            metrics, applied = eng.update(u.inputs, u.targets, lr, wd_scale, ema_c)
             self.update += 1
             self.tokens += u.inputs.numel()
             self.skipped += 0 if applied else 1
@@ -846,7 +941,9 @@ class Trainer:
             now = time.time()
             row = {"tokens": self.tokens, "train/loss": metrics["loss"], "train/ce": metrics["ce"],
                    "train/aux": metrics["aux"], "train/grad_norm": metrics["grad_norm"], "train/lr": lr,
+                   "train/weight_decay": c.optimizer.weight_decay * wd_scale, "train/batch_tokens": u.inputs.numel(),
                    **{f"train/grad_norm/{g}": v for g, v in metrics["grad_norms"].items()},
+                   **{f"train/grad_norm/{b}": v for b, v in metrics["grad_norm_buckets"].items()},
                    "train/seq_len": u.seq_len, "train/skipped": self.skipped, "data/cycle": u.cycle,
                    "data/sample": u.next, "perf/update_s": now - last_t,
                    "perf/tok_per_s": u.inputs.numel() / max(now - last_t, 1e-9)}
@@ -864,6 +961,10 @@ class Trainer:
                 row.update(self._validate(u.seq_len, u.recipe))
                 if self.probe_len > u.seq_len:
                     row.update(self._probe_long(u.seq_len, u.recipe))
+                with self.arena.use():                               # (its scratch: memory the trainer holds)
+                    row.update(optimizer_metrics(self.opt, lr))
+                if c.ema is not None and self.ema_started:
+                    row.update(self._validate_ema(u.seq_len, u.recipe))
                 row.update(self._mix_check())
                 next_val += val_every
             seen, check_failed = None, False                         # (other processes, their GB) when checked

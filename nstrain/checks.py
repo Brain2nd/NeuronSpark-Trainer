@@ -1,8 +1,9 @@
 """Checks before a line trains (the trainer at every start, ``nstrain check`` without a GPU).
 
 :func:`start_problems`: the checkpoint the line continues from (or a branch's fork point) and run.json belong together.
-:func:`preflight`: the data line and the held-out streams can serve this configuration, so a problem shows at the
-start instead of hours later (at the first validation, the first cycle of a new recipe, ...).
+:func:`preflight`: the data line and the held-out streams can serve this configuration, and the code computes the
+metric set the line records (``metrics``), so a problem shows at the start instead of hours later (at the first
+validation, the first cycle of a new recipe, ...).
 """
 from __future__ import annotations
 
@@ -44,9 +45,10 @@ def start_problems(cfg: C.RunConfig, meta: dict, data_state: dict, forking: bool
         if end is not None and total is not None and end < float(meta["tokens"]) + float(total):
             problems.append(f"the schedule ends at {end:.0f} tokens, before the branch's data "
                             f"({float(meta['tokens']) + float(total):.0f})")
-        problems += C.frozen_differences(new, old, allowed, [k for k in C.FROZEN if k not in C.FORK_FREE])
+        problems += C.frozen_differences(new, old, allowed, [k for k in C.FROZEN if k not in C.FORK_FREE],
+                                         tokens=float(meta["tokens"]))
     else:
-        problems += C.frozen_differences(new, old, allowed)
+        problems += C.frozen_differences(new, old, allowed, tokens=float(meta["tokens"]))
         if Path(meta["run_dir"]) != cfg.run_dir and "run_dir" not in allowed:
             problems.append(f"the checkpoint belongs to {meta['run_dir']} (allow_changes \"run_dir\" adopts it)")
     return problems
@@ -60,7 +62,11 @@ def preflight(cfg: C.RunConfig) -> List[str]:
     from nstrain.data.sources import SOURCES
     from nstrain.data.tokenize import text_mode
     from nstrain.data.work import Work
+    from nstrain.probes import METRICS_VERSION
     problems = []
+    if cfg.metrics is not None and cfg.metrics != METRICS_VERSION:
+        problems.append(f"the line records the metric set {cfg.metrics!r}, this nstrain computes {METRICS_VERSION!r}: "
+                        f"to adopt it, set metrics to {METRICS_VERSION!r} and list \"metrics\" in allow_changes")
     if cfg.wandb.key_file is not None:
         try:
             if not Path(cfg.wandb.key_file).read_text().strip():

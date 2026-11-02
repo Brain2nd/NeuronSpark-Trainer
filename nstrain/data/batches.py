@@ -3,7 +3,10 @@
 An update is ``tokens_per_update / L`` samples of one sequence length L (each sample L + 1 tokens: inputs and the
 targets shifted by one), cut into micro-batches of ``micro_rows`` rows.  Updates never span a cycle end or a change of
 sequence length: the samples left over there (fewer than one update) are skipped, so every cycle end is an update
-boundary (a checkpoint there is a clean fork point) and every update has one shape.
+boundary (a checkpoint there is a clean fork point) and every update has one shape.  With a batch-size ramp
+(nstrain.batch) the tokens of an update are those of the piece at the data line's token count before it: the cycle's
+``start_token`` plus the tokens of the cycle's updates so far (the skipped samples count for nothing), so a cycle's
+updates are fixed by its manifest and the pieces.
 
 Progress is ``(cycle, sample)``: the next update starts at sample ``sample`` of cycle ``cycle``; with the manifest's
 sha256 it is the complete data state (the order inside a cycle is fixed by the manifest and the seed).
@@ -23,6 +26,7 @@ from typing import Dict, Iterator, List, Optional, Tuple
 import numpy as np
 import torch
 
+from nstrain import batch as batches
 from nstrain.data.sources import SOURCES
 from nstrain.data.stream import CycleStream
 from nstrain.data.tokenize import text_mode
@@ -46,21 +50,27 @@ class Update:
     mix: Dict[Tuple[str, str], Tuple[int, float]]   # (source, stratum) -> (its samples here, the planned number)
 
 
-def plan(seq_len: np.ndarray, tokens_per_update: int) -> List[Tuple[int, int, int]]:
+def plan(seq_len: np.ndarray, tokens_per_update, start_token: float = 0.0) -> List[Tuple[int, int, int]]:
     """The updates of a cycle as (first, end, L): consecutive runs of ``tokens_per_update / L`` samples of one length;
-    the remainder of each run of equal lengths (fewer than one update) is skipped."""
-    out, i, n = [], 0, int(seq_len.size)
+    the remainder of each run of equal lengths (fewer than one update) is skipped.  ``tokens_per_update``: a number,
+    or the pieces of a ramp (nstrain.batch) read at ``start_token`` plus the tokens of the updates planned so far."""
+    pieces = batches.pieces(tokens_per_update)
+    out, i, n, tokens = [], 0, int(seq_len.size), float(start_token)
     while i < n:
         L = int(seq_len[i])
-        if tokens_per_update % L:
-            raise ValueError(f"tokens_per_update {tokens_per_update} is not a multiple of seq_len {L}")
-        rows = tokens_per_update // L
         j = i
         while j < n and int(seq_len[j]) == L:
             j += 1
-        while i + rows <= j:
+        while True:
+            tpu = batches.at(pieces, tokens)
+            if tpu % L:
+                raise ValueError(f"tokens_per_update {tpu} is not a multiple of seq_len {L}")
+            rows = tpu // L
+            if i + rows > j:
+                break
             out.append((i, i + rows, L))
             i += rows
+            tokens += tpu
         i = j
     return out
 
@@ -85,9 +95,9 @@ def update_mix(cs: CycleStream, a: int, b: int) -> Dict[Tuple[str, str], Tuple[i
 class Line:
     """The cycles of one data line (an nstrain.data.work directory), consumed from a given progress."""
 
-    def __init__(self, work: str, tokens_per_update: int, seed: int = 0, wait_s: float = 30.0):
+    def __init__(self, work: str, tokens_per_update, seed: int = 0, wait_s: float = 30.0):
         self.root = Path(work)
-        self.tpu = int(tokens_per_update)
+        self.tpu = batches.pieces(tokens_per_update)                 # a number, or the pieces of a ramp
         self.seed = seed
         self.wait_s = wait_s
 
@@ -157,7 +167,10 @@ class Line:
                 raise RuntimeError(f"cycle {k}: the sample order differs from the checkpoint's ({cs.digest} != "
                                    f"{order}; another numpy or reader?): resuming would repeat and skip data")
             want = order = ""                                        # only the resumed cycle is checked
-            ups = plan(cs.seq_len, self.tpu)
+            if len(self.tpu) > 1 and "start_token" not in cs.m:
+                raise RuntimeError(f"cycle {k}: the manifest has no start_token; a batch-size ramp needs the data "
+                                   "line's token count")
+            ups = plan(cs.seq_len, self.tpu, float(cs.m.get("start_token", 0.0)))
             if i == 0:
                 taken = np.zeros(len(cs), dtype=bool)
                 for a, b, _ in ups:

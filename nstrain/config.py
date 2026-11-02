@@ -10,7 +10,9 @@ produces lives next to it (checkpoints/, run.log, heartbeat, wandb_run.json, sup
      "val_work": "/data/trunk",               # the work directory holding the held-out streams (val/)
      "fork_from": null,                       # a branch: the parent's kept cycle-end checkpoint directory
      "seed": 0, "data_seed": 0,               # model launch seed; sample order seed
-     "tokens_per_update": 1048576,            # the same for every sequence length
+     "tokens_per_update": 1048576,            # the same for every sequence length; or a batch-size ramp, pieces
+                                              # [{"from": 0, "to": 11.7e9, "tokens": 393216}, ...] by the tokens
+                                              # trained (nstrain.batch; append-only like the schedule)
      "lengths": {"4096": {"micro_rows": 4, "activation_checkpointing": false},
                  "32768": {"micro_rows": 1, "activation_checkpointing": 3}},   # false | k (the first k dendritic
                                                     # layers) | true (every dendritic layer) | "all" (every layer);
@@ -18,8 +20,18 @@ produces lives next to it (checkpoints/, run.log, heartbeat, wandb_run.json, sup
                                                     # reserve_gb}, the shape beside other processes measured for
                                                     # that reserve (`nstrain tune --shared`)
      "optimizer": {"peak_lr": 3e-4, "betas": [0.9, 0.95], "eps": 1e-8, "weight_decay": 0.1,
-                   "lexical_lr_mult": 8.0, "grad_clip": 1.0},
+                   "lexical_lr_mult": 8.0, "grad_clip": 1.0,
+                   "weight_decay_batch": null},  # a number of tokens: an update's weight decay is weight_decay x its
+                                              # tokens / this (the decay follows the batch, nstrain.batch); null: the
+                                              # decay is weight_decay whatever the batch
      "schedule": [{"from": 0, "to": 2e9, "kind": "warmup"}, {"from": 2e9, "to": null, "kind": "constant"}],
+     "ema": {"horizon_tokens": 2e9,           # the parameters' exponential moving average (nstrain.flat_adamw): the
+             "from_tokens": 2e9},             # average moves by (update tokens / horizon) per update, starting as a
+                                              # copy of the parameters at from_tokens trained (the warmup's end);
+                                              # validated beside the parameters (ema/val_<L>/...); null: none
+     "metrics": "2026-11-03",                 # the version of the metric set the line records (nstrain.probes
+                                              # METRICS_VERSION): a trainer computing another set refuses to start
+                                              # (allow_changes "metrics" lets a line adopt the code's)
      "checkpoints": {"every_tokens": 2e9, "keep_last": 3},
      "validation": {"every_tokens": 2e9, "rows": 64},   # rows per source, spread over its strata
      "stop_at_tokens": null,                  # no update starts at or past it
@@ -53,6 +65,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Union
 
+from nstrain import batch as batches
 from nstrain import schedule as sched
 
 RUN_FILE = "run.json"
@@ -82,6 +95,13 @@ class Optimizer:
     weight_decay: float
     lexical_lr_mult: float
     grad_clip: float
+    weight_decay_batch: Optional[int] = None    # tokens: an update's decay is weight_decay x its tokens / this
+
+
+@dataclass
+class Ema:
+    horizon_tokens: float                       # the average's time scale in tokens
+    from_tokens: float = 0.0                    # tokens trained when the average starts (as a copy of the parameters)
 
 
 @dataclass
@@ -138,7 +158,7 @@ class RunConfig:
     model: dict
     data_work: str
     val_work: str
-    tokens_per_update: int
+    tokens_per_update: Union[int, List[dict]]   # one batch, or the pieces of a ramp (nstrain.batch)
     lengths: Dict[int, Length]
     optimizer: Optimizer
     schedule: List[dict]
@@ -153,6 +173,8 @@ class RunConfig:
     supervisor: Supervisor = field(default_factory=Supervisor)
     allow_changes: List[str] = field(default_factory=list)
     print_every: int = 10
+    ema: Optional[Ema] = None                   # the parameters' moving average (none without)
+    metrics: Optional[str] = None               # the metric set's version (nstrain.probes.METRICS_VERSION)
     run_dir: Path = field(default=None, metadata={"internal": True})        # where run.json lives (not stored)
 
     # ------------------------------------------------------------------ derived
@@ -170,8 +192,17 @@ class RunConfig:
             raise ValueError(f"{self.name}: lengths.{seq_len} has no shared shape (`nstrain tune --shared`)")
         return s.shared if shared else s
 
-    def accum(self, seq_len: int, shared: bool = False) -> int:
-        return self.tokens_per_update // (self.length(seq_len, shared).micro_rows * seq_len)
+    def batch_pieces(self) -> List[dict]:
+        """The batch pieces of the line (nstrain.batch; one open-ended piece for a single number)."""
+        return batches.pieces(self.tokens_per_update)
+
+    def batch_at(self, tokens: float) -> int:
+        """The tokens of the update that starts at ``tokens`` trained."""
+        return batches.at(self.batch_pieces(), tokens)
+
+    def accum(self, seq_len: int, shared: bool = False, tokens: float = 0.0) -> int:
+        """Micro-batches per update of length ``seq_len`` at ``tokens`` trained."""
+        return self.batch_at(tokens) // (self.length(seq_len, shared).micro_rows * seq_len)
 
     def to_dict(self) -> dict:
         """The JSON form (as in run.json; stored in every checkpoint)."""
@@ -181,8 +212,10 @@ class RunConfig:
 # FROZEN keys (see frozen_view); a branch does not inherit FORK_FREE
 FROZEN = ("tokens_per_update", "lengths.micro_rows", "seed", "data_seed", "data_work", "val_work", "validation.rows",
           "optimizer.peak_lr", "optimizer.betas", "optimizer.eps", "optimizer.weight_decay",
-          "optimizer.lexical_lr_mult", "optimizer.grad_clip", "wandb.project", "wandb.entity", "wandb.key_file")
+          "optimizer.weight_decay_batch", "optimizer.lexical_lr_mult", "optimizer.grad_clip", "wandb.project",
+          "wandb.entity", "wandb.key_file", "ema", "metrics")
 FORK_FREE = ("data_work", "data_seed", "lengths.micro_rows")
+APPEND_ONLY = ("tokens_per_update",)       # frozen up to the checkpoint's token, extendable past it (nstrain.batch)
 CHANGEABLE = FROZEN + ("model", "schedule", "run_dir")                    # what allow_changes may name
 
 
@@ -193,14 +226,27 @@ def frozen_view(d: dict) -> dict:
             "lengths.micro_rows": {str(k): v.get("micro_rows") for k, v in d.get("lengths", {}).items()},
             "seed": d.get("seed"), "data_seed": d.get("data_seed"), "data_work": d.get("data_work"),
             "val_work": d.get("val_work"), "validation.rows": d.get("validation", {}).get("rows"),
-            **{f"optimizer.{k}": opt.get(k) for k in ("peak_lr", "betas", "eps", "weight_decay", "lexical_lr_mult",
-                                                      "grad_clip")},
-            "wandb.project": wb.get("project"), "wandb.entity": wb.get("entity"), "wandb.key_file": wb.get("key_file")}
+            **{f"optimizer.{k}": opt.get(k) for k in ("peak_lr", "betas", "eps", "weight_decay", "weight_decay_batch",
+                                                      "lexical_lr_mult", "grad_clip")},
+            "wandb.project": wb.get("project"), "wandb.entity": wb.get("entity"), "wandb.key_file": wb.get("key_file"),
+            "ema": d.get("ema"), "metrics": d.get("metrics")}
 
 
-def frozen_differences(new: dict, old: dict, allowed, keys=FROZEN) -> List[str]:
+def frozen_differences(new: dict, old: dict, allowed, keys=FROZEN, tokens: Optional[float] = None) -> List[str]:
+    """The FROZEN settings that differ (``new`` and ``old`` run configs in their JSON form), but those ``allowed``;
+    an APPEND_ONLY setting differs when it gives a token before ``tokens`` another value (every token, with
+    ``tokens`` None)."""
     a, b = frozen_view(new), frozen_view(old)
-    return [f"{k}: {b[k]!r} -> {a[k]!r}" for k in keys if k not in allowed and a[k] != b[k]]
+    out = []
+    for k in keys:
+        if k in allowed:
+            continue
+        if k in APPEND_ONLY and tokens is not None:
+            if not batches.same_until(batches.pieces(a[k]), batches.pieces(b[k]), tokens):
+                out.append(f"{k}: {b[k]!r} -> {a[k]!r} differs before token {tokens:.0f}")
+        elif a[k] != b[k]:
+            out.append(f"{k}: {b[k]!r} -> {a[k]!r}")
+    return out
 
 
 # ---------------------------------------------------------------------- load / save
@@ -257,8 +303,12 @@ def validate(c: RunConfig) -> List[str]:
             p.append(f"{k} must be an absolute path")
     if c.fork_from is not None and not Path(c.fork_from).is_absolute():
         p.append("fork_from must be an absolute path")
-    if c.tokens_per_update <= 0:
-        p.append("tokens_per_update must be positive")
+    try:
+        pieces = c.batch_pieces()
+        batches.validate(pieces)
+    except (ValueError, KeyError, TypeError) as e:
+        pieces = None
+        p.append(f"tokens_per_update: {e}")
     if not c.lengths:
         p.append("lengths: at least one sequence length")
     for L, s in c.lengths.items():
@@ -267,9 +317,11 @@ def validate(c: RunConfig) -> List[str]:
                 continue
             if L <= 0 or x.micro_rows <= 0:
                 p.append(f"{where}: sequence length and micro_rows must be positive")
-            elif c.tokens_per_update % (x.micro_rows * L):
-                p.append(f"{where}: tokens_per_update {c.tokens_per_update} is not a multiple of micro_rows x "
-                         f"seq_len = {x.micro_rows * L}")
+            elif pieces is not None:
+                bad = [t for t in batches.values(pieces) if t % (x.micro_rows * L)]
+                if bad:
+                    p.append(f"{where}: tokens_per_update {bad} not a multiple of micro_rows x seq_len = "
+                             f"{x.micro_rows * L}")
             a = x.activation_checkpointing
             if not (isinstance(a, bool) or a == "all" or (isinstance(a, int) and a >= 1)):
                 p.append(f"{where}.activation_checkpointing must be false, true, \"all\" or a number of dendritic "
@@ -284,6 +336,10 @@ def validate(c: RunConfig) -> List[str]:
         p.append("optimizer.betas: two values in [0, 1)")
     if not o.eps > 0 or o.weight_decay < 0 or not o.lexical_lr_mult > 0 or not o.grad_clip > 0:
         p.append("optimizer: eps, lexical_lr_mult, grad_clip must be positive, weight_decay non-negative")
+    if o.weight_decay_batch is not None and o.weight_decay_batch <= 0:
+        p.append("optimizer.weight_decay_batch must be a positive number of tokens (or null)")
+    if c.ema is not None and (not c.ema.horizon_tokens > 0 or c.ema.from_tokens < 0):
+        p.append("ema: horizon_tokens positive, from_tokens >= 0")
     try:
         sched.validate(c.schedule)
     except (ValueError, KeyError, TypeError) as e:

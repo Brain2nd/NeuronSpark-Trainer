@@ -78,7 +78,33 @@ the watchdog interval, when its data preparer keeps failing, or when the supervi
   `ffn_up_firing`; the copy arbitration's `copy_pi`, `novelty`, `read_gain`; the PKM read's `pkm_entropy`,
   `pkm_slots_used`, `pkm_gate`; `rope_ext_q_head<h>` / `rope_ext_k_head<h>` (per layer) and `rope_ext_q_p50/max`,
   `rope_ext_k_p50/max`, the share of a head's query / key energy in the RoPE pairs whose wavelength exceeds the
-  training row length (against `rope_ext_pairs_frac`, the share of all pairs that are such).
+  training row length (against `rope_ext_pairs_frac`, the share of all pairs that are such); `attn_dist_bin<k>`
+  (per layer and over the model), the pool read's weight by distance for the queries of a row's last
+  training-length positions -- bin 0 the query's own event, bin k the events 2^(k-1) to 2^k - 1 back --,
+  `attn_beyond_train_head<h>` (per layer) and `attn_beyond_train_p50/max`, the weight on events the training length
+  or more back (0 on rows of the training length; on the long rows, what is read from beyond it), and
+  `attn_mean_log2_head<h>` / `attn_mean_log2_p50/max`, the weight-mean of log2(1 + distance); the weights are
+  recomputed from the heads' queries, keys, clocks and induction matches as the pool-read operator defines them, on
+  every second validation micro-batch and every fourth long row; `attn_entropy_head<h>` / `attn_entropy_p50/max`,
+  the entropy of those weights.  `val_<L>/docpos/bin<k>` is the loss by the target's position in its document (bin
+  0 the first token after an EOS, bin k the tokens 2^(k-1) to 2^k - 1 after it; the tokens of a document the row
+  cuts into are left out, `docpos/tokens_frac` the share counted): what each doubling of a document's context is
+  worth.  On the long rows `val_<P>/dendritic/retention_seg<k>_p50/max` is the retention from the row's first
+  token to the end of segment k, the decay curve of the row's start past the training length.  Every validation
+  also summarises the optimizer's state per parameter group (`opt/<group>/param_norm`, `m_norm`, `grad_rms`,
+  `update_norm`, `update_ratio`: the size of the step AdamW takes next over the weights' norm) and per layer
+  (`opt/layer<NN>/param_norm`, `update_norm`, `update_ratio`; the other parts of the model by name).  With `ema`
+  set, the parameters' moving average (`"ema": {"horizon_tokens": 2e9, "from_tokens": 2e9}`: the average moves by
+  update tokens / horizon per update, starting as a copy of the parameters at `from_tokens`; one more flat buffer
+  and one more read-write of it per update) is validated beside them: `ema/val_<L>/<source>`, `/mix`, `/mean` on
+  every row of the training length and `ema/val_<P>/...` on one long row per source -- the reading a learning-rate
+  decay would give, at every validation, without decaying (Zhang et al., 2410.21676 train with a constant rate and
+  evaluate the average).  Every row also carries the gradient norm of every layer (`train/grad_norm/layer<NN>`, the
+  other parts of the model by name): one fused pass over the gradient buffers, the same pass that gives the groups'.
+  Nothing is computed in the training step beyond the loss terms and the gradient norms (and the average's move);
+  the metric set is versioned (`metrics` in `run.json`, the code's
+  `METRICS_VERSION`): a trainer computing another set does not start a line, so a line's readings are decided before
+  it starts, not patched along the way.
   When the model's longest context (`rope_max_seq_len`) exceeds the training length, every validation also runs
   the long-row probe on each source's held-out rows of that length, one row at a time: `val_<P>/<source>`, `/mix`,
   `/mean` (the loss at the long length), `val_<P>/pos/seg<k>` (the recipe-weighted loss by position, in segments
@@ -109,6 +135,10 @@ nstrain data val --work /data/lines/trunk
 
 # a training line from a model preset (ns-2b, ns-1p3b, tiny-32k)
 nstrain new runs/trunk --model ns-2b --data /data/lines/trunk --peak-lr 3e-4
+# ... with a batch-size ramp whose weight decay follows the batch (0.1 at 1M tokens per update)
+nstrain new runs/trunk --model ns-2b --data /data/lines/trunk \
+    --tokens-per-update '[{"from":0,"to":4.7e9,"tokens":262144},{"from":4.7e9,"to":null,"tokens":393216}]' \
+    --weight-decay-batch 1048576 --ema-horizon-tokens 2e9
 nstrain tune runs/trunk                     # the fastest micro-batch shape of every length that fits the GPU
 nstrain check runs/trunk                    # every start check, without a GPU
 
@@ -139,8 +169,15 @@ start.  The schedule only grows at its end.
 
 ## Training
 
-* **Updates.** Every optimizer update has the same number of tokens and one sequence length; the loss is the mean over
-  the update's tokens.  Each length has its own micro-batch rows and activation recomputation (`lengths` in
+* **Updates.** Every optimizer update has one sequence length and the tokens of `tokens_per_update`: one number, or
+  a **batch-size ramp** -- pieces by the tokens trained (`[{"from": 0, "to": 4.7e9, "tokens": 262144}, ...]`,
+  append-only like the schedule), after the finding that the loss-optimal batch grows with the data as a power law
+  (Bergsma et al., 2505.13738; Zhang et al., 2410.21676); the loss is the mean over the update's tokens.  With
+  `optimizer.weight_decay_batch` set, an update's weight decay is `weight_decay` times its tokens over that batch,
+  so the AdamW time scale in tokens does not move with the batch (the rate does not change).  The batch of an update
+  is read at the data line's token count (the cycle's start token plus its updates so far), so a cycle's updates
+  are fixed by its manifest and the pieces; a larger batch needs no new capture (the micro-batches' loss scale is a
+  device scalar).  Each length has its own micro-batch rows and activation recomputation (`lengths` in
   `run.json`), chosen by `nstrain tune` before the first update: the fastest setting whose peak memory fits the GPU
   with a small margin, so the GPU's memory is used, not left idle.  Updates never span a cycle end or a change of sequence length, so every cycle end is an update
   boundary and an exact fork point.
@@ -149,8 +186,8 @@ start.  The schedule only grows at its end.
   gradient norm is not finite is skipped without touching weights or optimizer state.
 * **Learning rate.** Warmup, constant and decay pieces over tokens trained; a branch continues the trunk's schedule up
   to the fork and decays from there.  The optimizer state continues across sequence-length changes.
-* **Checkpoints.** Weights and optimizer state in fp32, the data position (cycle, sample, manifest sha256, the
-  sample order's digest), the full
+* **Checkpoints.** Weights and optimizer state in fp32 (the parameters' moving average with it, when kept), the
+  data position (cycle, sample, manifest sha256, the sample order's digest), the full
   configuration, the code versions and the W&B run; written in the background, hashed (blake2b) and renamed
   atomically.  Each cycle end, each change of sequence length and the start of a line are kept checkpoints.
 * **W&B.** One run per line; a resumed line continues its run (the replayed updates are compared with the server's

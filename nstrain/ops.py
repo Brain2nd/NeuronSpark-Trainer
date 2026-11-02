@@ -62,11 +62,16 @@ def running(cfg: C.RunConfig) -> dict:
 # ---------------------------------------------------------------------- new / branch
 def new(run_dir, model: str, data_work: str, val_work: Optional[str] = None, name: Optional[str] = None,
         peak_lr: float = 3e-4, warmup_tokens: Optional[float] = None, wandb_project: str = "ns-pretrain",
-        tokens_per_update: Optional[int] = None, shape_from: Optional[str] = None,
-        wandb_key_file: Optional[str] = None) -> C.RunConfig:
+        tokens_per_update=None, shape_from: Optional[str] = None, wandb_key_file: Optional[str] = None,
+        weight_decay_batch: Optional[int] = None, ema_horizon_tokens: Optional[float] = None) -> C.RunConfig:
     """A trunk-type line (warmup, then a constant rate).  ``model``: a preset name or a model-config JSON file;
     ``shape_from``: the preset whose run defaults (lengths, tokens per update, warmup) a model file uses;
-    ``wandb_key_file``: a file with the line's W&B API key (default: the host's login)."""
+    ``tokens_per_update``: a number, or the pieces of a batch-size ramp (nstrain.batch); ``weight_decay_batch``:
+    the batch whose decay is the optimizer's weight_decay (the decay follows the batch; None: a constant decay);
+    ``ema_horizon_tokens``: keep the parameters' moving average with this horizon, from the warmup's end (None:
+    none); ``wandb_key_file``: a file with the line's W&B API key (default: the host's login).  The line records
+    the metric set of this nstrain (``metrics``)."""
+    from nstrain.probes import METRICS_VERSION
     run_dir = Path(run_dir).resolve()
     if run_dir.exists() and any(run_dir.iterdir()):
         raise FileExistsError(f"{run_dir} is not empty")
@@ -78,9 +83,14 @@ def new(run_dir, model: str, data_work: str, val_work: Optional[str] = None, nam
     cfg = C.from_dict({
         "name": name or run_dir.name, "model": M.model_config(model), "data_work": str(Path(data_work).resolve()),
         "val_work": str(Path(val_work or data_work).resolve()), "seed": 0, "data_seed": 0,
-        "tokens_per_update": int(tokens_per_update or d["tokens_per_update"]), "lengths": d["lengths"],
-        "optimizer": dict(M.OPTIMIZER, peak_lr=peak_lr),
+        "tokens_per_update": (d["tokens_per_update"] if tokens_per_update is None
+                              else tokens_per_update if isinstance(tokens_per_update, list)
+                              else int(tokens_per_update)),
+        "lengths": d["lengths"],
+        "optimizer": dict(M.OPTIMIZER, peak_lr=peak_lr, weight_decay_batch=weight_decay_batch),
         "schedule": [{"from": 0, "to": w, "kind": "warmup"}, {"from": w, "to": None, "kind": "constant"}],
+        "ema": None if ema_horizon_tokens is None else {"horizon_tokens": float(ema_horizon_tokens), "from_tokens": w},
+        "metrics": METRICS_VERSION,
         "wandb": {"project": wandb_project,
                   "key_file": str(Path(wandb_key_file).resolve()) if wandb_key_file else None}},
         where=str(run_dir / C.RUN_FILE))

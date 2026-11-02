@@ -8,7 +8,8 @@
     nstrain data run-preparer --work W [--foreground]   the preparer under supervision (no trainer), in the background
 
     nstrain new RUN --model ns-2b --data W [--val W] [--peak-lr ..] [--warmup-tokens ..] [--wandb-project ..]
-                                                    [--wandb-key-file F]
+                    [--wandb-key-file F] [--tokens-per-update N | '[{"from":0,"to":1e10,"tokens":393216},..]']
+                    [--weight-decay-batch N] [--ema-horizon-tokens N]
     nstrain branch RUN --from PARENT_RUN --at-cycle K --plan decay:25e9,long:4e9 --data W_B [--cycle-tokens ..]
     nstrain check RUN          start checks without a GPU
     nstrain run RUN [--foreground]   the line under supervision (trainer + data preparer), in the background
@@ -29,6 +30,17 @@ import json
 import sys
 
 from nstrain.gpu import TUNE_MARGIN_GIB
+
+
+def _tokens_per_update(s: str):
+    """``--tokens-per-update``: a number of tokens, or the JSON pieces of a batch-size ramp (nstrain.batch)."""
+    s = s.strip()
+    if s.startswith("["):
+        v = json.loads(s)
+        if not isinstance(v, list):
+            raise argparse.ArgumentTypeError("a JSON list of pieces")
+        return v
+    return int(s)
 
 
 def _workers(p) -> None:
@@ -110,7 +122,13 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--name")
     p.add_argument("--peak-lr", type=float, default=3e-4)
     p.add_argument("--warmup-tokens", type=float)
-    p.add_argument("--tokens-per-update", type=int)
+    p.add_argument("--tokens-per-update", type=_tokens_per_update,
+                   help="tokens per update, or the JSON pieces of a batch-size ramp (nstrain.batch)")
+    p.add_argument("--weight-decay-batch", type=int,
+                   help="tokens: an update's weight decay is weight_decay x its tokens / this (the decay follows "
+                        "the batch of a ramp)")
+    p.add_argument("--ema-horizon-tokens", type=float,
+                   help="keep the parameters' moving average with this horizon in tokens, from the warmup's end")
     p.add_argument("--shape-from", help="the preset whose run defaults a model-config file uses")
     p.add_argument("--wandb-project", default="ns-pretrain")
     p.add_argument("--wandb-key-file", help="a file with the line's W&B API key (default: the host's login)")
@@ -322,7 +340,8 @@ def _dispatch(a) -> int:
     if a.cmd == "new":
         from nstrain import ops
         cfg = ops.new(a.run, a.model, a.data, a.val, a.name, a.peak_lr, a.warmup_tokens, a.wandb_project,
-                      a.tokens_per_update, a.shape_from, a.wandb_key_file)
+                      a.tokens_per_update, a.shape_from, a.wandb_key_file, a.weight_decay_batch,
+                      a.ema_horizon_tokens)
         print(f"{cfg.run_dir / 'run.json'}: line {cfg.name}, model {a.model}, data {cfg.data_work}")
         return 0
     if a.cmd == "branch":
