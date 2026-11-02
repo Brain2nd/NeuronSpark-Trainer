@@ -36,18 +36,20 @@ marker that does not match ``latest``; another trainer reading the data line; th
 (exit 0) writes "stopped by a signal" as the last heartbeat stage (the supervisor relaunches a trainer it did not
 stop).  The GPU is checked every ``guards.gpu_check_every`` updates.
 
-The GPU to itself, the line trains with each length's own shape and leaves the rest of the memory free.  With
-``guards.share_reserve_gb`` set it also trains beside other processes, and changes mode inside the process, at a check
-(``_switch``; nothing else moves: weights, optimizer state, the data position and the W&B run stay as they are):
-when they appear it releases its engine and arena, holds at once all of the GPU but what they may still take -- the
-reserve less what they use (nstrain.gpu.hold_memory, adjusted at every check: they cannot grow past the reserve) --
-and captures the length's ``shared`` shape (measured for that reserve by ``nstrain tune --shared``; a start without
-one is refused) in the new arena; when they have left for ALONE_CHECKS checks it gives the arena back and captures
-the length's own shape again.  The memory is free for anything to take only between the close of the old arena and
-the hold of the new one (one round of cudaFree / cudaMalloc).  When they use more than the reserve and the shapes'
-margin -- at a start, at a check before the switch, or taken in that gap so that the capture beside them runs out of
-memory -- the line checkpoints and exits 3: the supervisor relaunches it once they fit or the GPU is free.  Without a
-reserve another process appearing ends the run with a checkpoint (exit 3).  Started by a supervisor
+The GPU to itself, the line trains with each length's own shape; its arena (nstrain.gpu.Arena) holds all of the
+GPU's memory but a capture's slack, in large blocks (``_hold_all``), and every allocation of the engine's warm-up and
+capture and of the validation rows of any length is served from them.  With ``guards.share_reserve_gb`` set it also
+trains beside other processes, and changes mode inside the process, at a check (``_switch``; nothing else moves:
+weights, optimizer state, the data position and the W&B run stay as they are): when they appear (in the slack, at
+first) it releases its engine and arena, holds at once all of the GPU but what they may still take -- the reserve
+less what they use (nstrain.gpu.hold_memory, adjusted at every check: they cannot grow past the reserve) -- and
+captures the length's ``shared`` shape (measured for that reserve by ``nstrain tune --shared``; a start without one
+is refused) in the new arena; when they have left for ALONE_CHECKS checks it gives the arena back, holds all of the
+GPU again and captures the length's own shape.  The memory is free for anything to take only between the close of
+the old arena and the hold of the new one (one round of cudaFree / cudaMalloc).  When they use more than the reserve
+and the shapes' margin -- at a start, at a check before the switch, or taken in that gap so that the capture beside
+them runs out of memory -- the line checkpoints and exits 3: the supervisor relaunches it once they fit or the GPU is
+free.  Without a reserve another process appearing ends the run with a checkpoint (exit 3).  Started by a supervisor
 (``NSTRAIN_SUPERVISOR_PID``), the trainer gets SIGTERM when the supervisor dies.
 """
 from __future__ import annotations
@@ -422,11 +424,11 @@ class Trainer:
         """The GPU mode changed at a check (``guards.share_reserve_gb`` set): beside other processes that appeared, or
         with the GPU to itself again once they left.  The engine is released and the arena closed -- its memory goes
         back to the driver -- and a new arena is made: beside them it holds at once all of the GPU but what they may
-        still take (the reserve less their ``others`` GB) and keeps the capture slack (``_slack_in``); alone it holds
-        nothing (the next capture takes what it needs, as `nstrain tune` measured it, and the rest stays free).  The
-        next update captures the length's shape of the new mode (``_engine_for``).  Weights, optimizer state, the
-        data position and the W&B run do not move.  Nothing is printed between the close and the hold: that gap is
-        the only time the memory is free for anything to take."""
+        still take (the reserve less their ``others`` GB) and keeps the capture slack (``_slack_in``); alone, the
+        next update's capture holds all of the GPU but the slack (``_hold_all``).  The next update captures the
+        length's shape of the new mode (``_engine_for``).  Weights, optimizer state, the data position and the W&B
+        run do not move.  Nothing is printed between the close and the hold: that gap is the only time the memory is
+        free for anything to take."""
         import gc
         from nstrain.gpu import Arena
         if self.engine is not None:
@@ -459,8 +461,9 @@ class Trainer:
         reuses the memory the arena holds.  Beside other processes the slack (``_slack_in``) goes back to the driver
         for the capture -- the memory outside the allocator that a warm-up and a capture create (kernel modules,
         local memory, graph data) -- while the arena holds all the rest but what they may still take (``others``:
-        their GB, else measured); the slack's unused rest is held again after the capture.  One validation
-        micro-batch runs before the capture (its first-call caches then live outside the graphs' scratch)."""
+        their GB, else measured); the slack's unused rest is held again after the capture.  Alone, the arena holds
+        all of the GPU but that slack first (``_hold_all``), and the slack stays free.  One validation micro-batch
+        and one long row run before the capture (their first-call caches then live outside the graphs' scratch)."""
         if self.engine is not None and self.engine.L == L:
             return self.engine
         if self.engine is not None:
@@ -474,6 +477,8 @@ class Trainer:
         if self.shared:
             self._slack_out()
             self._hold(self._others(others), slack_gib=CAPTURE_SLACK_GIB, reclaim=True)
+        else:
+            self._hold_all()
         self._beat(f"capturing the {L} engine")
         s, accum = c.length(L, self.shared), c.accum(L, self.shared)
         M.recompute(self.model, s.activation_checkpointing)
@@ -618,6 +623,21 @@ class Trainer:
             del w, per
         print(f"long probe: one row of {P}, ce by segment of {seg} {segs}; {dendritic_line(probe)}; "
               f"{hippocampal_line(hprobe)}", flush=True)
+
+    def _hold_all(self) -> None:
+        """The GPU to itself: the arena holds all of the GPU's free memory but a capture's slack (CAPTURE_SLACK_GIB,
+        for the memory outside the allocator that the capture creates), in large blocks (nstrain.gpu.hold_memory
+        with nothing left to others; what the driver keeps from dead processes is reclaimed too), so that every
+        allocation of the engine's warm-up and capture and of the validation rows of any length is served from them.
+        An arena that took its blocks from the driver as they were asked for holds none larger than the largest
+        allocation so far: once it held the GPU, a larger one -- the long rows' (a 32K row's copy scores are 4 GiB,
+        a 4K micro-batch's a few hundred MiB) -- failed."""
+        torch.cuda.empty_cache()                                     # blocks cached outside the arena (a build's, a
+        taken = hold_memory(0.0, 0.0, lambda: 0.0, slack_gib=CAPTURE_SLACK_GIB, arena=self.arena, reclaim=True)
+                                                                     # load's): the arena cannot use them, it takes
+                                                                     # them from the driver as its own blocks
+        print(f"update {self.update}: holding {taken:.1f} GiB ({torch.cuda.memory_reserved() / 2**30:.1f} GiB "
+              f"reserved, {torch.cuda.mem_get_info()[0] / 2**30:.1f} GiB free): the GPU to itself", flush=True)
 
     def _hold(self, others: float, slack_gib: float = 0.25, reclaim: bool = False, quick: bool = False) -> None:
         """Beside other processes: the arena holds the GPU's memory but what they may still take, and ``slack_gib``

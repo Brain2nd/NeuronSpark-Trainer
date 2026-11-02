@@ -1,22 +1,26 @@
-"""The training GPU: a host-wide lease and the other compute processes on it.
+"""The training GPU: a host-wide lease, the other compute processes on it, and the trainer's memory.
 
 When the GPU is time-sliced with another process, the driver's preemption of the training kernels can fault, so by
 default the trainer refuses to start beside another process and checkpoints and exits (nstrain.exits.GPU_BUSY) when
-one appears; the supervisor waits for the GPU to be free.  With ``guards.share_reserve_gb`` the trainer instead always
-trains with the lengths' ``shared`` shapes, measured to fit while other processes use up to the reserve plus the
-tune's margin less a capture's slack (:func:`fits_beside`), whether other processes are there or not. It holds all of
-the GPU's memory but what the other processes may still take, the reserve less what they use (:func:`hold_memory`, in
-the trainer's :class:`Arena`, which never gives memory back while the trainer runs, and a slack block of a few GiB
-that goes back to the driver only while an engine is captured or a new line's first forward runs, for their memory
-outside the allocator): they cannot grow past the reserve -- but for that slack while it is out and the 0.25 GiB
-left for the trainer's own memory outside the allocator -- (an allocation past it fails in them, not in the line),
-the line does not stop for them, and what they free past the reserve is held again, never what is theirs: the free
-memory taken is read between two readings of theirs (:func:`room_beside`).  Memory they already used past the
-reserve when the line started stays theirs until they free it.  It never switches shapes for them: a switch would
-give memory back to the driver, and any process could take it then.  The lease (an exclusive lock on
-``$NSTRAIN_GPU_LOCK_DIR`` (default /tmp) ``/nstrain-gpu<index>.lock``, taken before any CUDA initialisation and held
-for the life of the process) closes the window in which two trainers (or a trainer and ``nstrain bench``) both see a
-free GPU at start.
+one appears; the supervisor waits for the GPU to be free.  With ``guards.share_reserve_gb`` the trainer instead trains
+on beside other processes, with the lengths' ``shared`` shapes, measured to fit while they use up to the reserve plus
+the tune's margin less a capture's slack (:func:`fits_beside`), and with the lengths' own shapes when it has the GPU
+to itself, switching inside the process (nstrain.trainer: ``_switch``).
+
+The trainer's memory is its :class:`Arena`: one memory pool, in which its engines warm up and capture and its
+validation runs, held in large blocks that serve every allocation (:func:`hold_memory`; the arena never gives memory
+back while the trainer runs, and a pool that took blocks from the driver as they were asked for would hold none
+larger than the largest allocation so far).  Alone, it holds all of the GPU but a capture's slack (CAPTURE_SLACK_GIB:
+memory outside the allocator that a capture creates).  Beside other processes it holds all but what they may still
+take, the reserve less what they use, and a slack block of a few GiB that goes back to the driver only while an
+engine is captured or a new line's first forward runs: they cannot grow past the reserve -- but for that slack while
+it is out and the 0.25 GiB left for the trainer's own memory outside the allocator -- (an allocation past it fails
+in them, not in the line), the line does not stop for them, and what they free past the reserve is held again, never
+what is theirs: the free memory taken is read between two readings of theirs (:func:`room_beside`).  Memory they
+already used past the reserve when the line started stays theirs until they free it.  The lease (an exclusive lock
+on ``$NSTRAIN_GPU_LOCK_DIR`` (default /tmp) ``/nstrain-gpu<index>.lock``, taken before any CUDA initialisation and
+held for the life of the process) closes the window in which two trainers (or a trainer and ``nstrain bench``) both
+see a free GPU at start.
 """
 from __future__ import annotations
 

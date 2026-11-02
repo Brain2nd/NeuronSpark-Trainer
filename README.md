@@ -161,6 +161,11 @@ start.  The schedule only grows at its end.
   another order is refused).  Beside other processes (a reserve set, and they are there) the line trains with the lengths' `shared`
   shapes (another micro-batch split of the same update: the same data, equal up to rounding) and goes back to its
   own shapes once they have left.
+* **GPU memory.** The trainer's arena (one memory pool) holds all of the GPU's memory in large blocks -- but a 4 GiB
+  slack for what a capture creates outside the allocator, and, beside other processes, what they may still take --
+  and every allocation of an engine's warm-up and capture and of the validation rows of any length is served from
+  them (a pool that takes blocks from the driver as they are asked for holds none larger than the largest allocation
+  so far: the long rows' allocations are larger than any of a training step's).
 * **One line per GPU.** The GPU lease is the trainer's: between a trainer's crash and its relaunch (seconds) another
   line's supervisor waiting for the GPU may take it.  Lines that share a GPU wait for each other; none has priority.
 

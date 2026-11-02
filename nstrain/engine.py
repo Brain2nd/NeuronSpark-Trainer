@@ -10,10 +10,12 @@ Three graphs share one memory pool:
 * ``step``: clip by that norm and the AdamW kernels (which also zero the gradients); the sums are zeroed.
 
 The optimizer state is created at construction; the warm-up before capture runs at learning rate 0 (weights unchanged)
-and the optimizer state is restored afterwards; buffers the forward may write are snapshotted and restored as well.  A
-new shape (a sequence-length change) gets a new engine over the same model and optimizer, in the
-same ``arena`` (nstrain.gpu.Arena): it warms up and captures in the memory the arena holds (the old engine's, once it
-is released, or memory held beside other processes), never asking the driver for more when the arena has room.
+and the optimizer state is restored afterwards; buffers the forward may write are snapshotted and restored as well
+(the snapshot lives on the host: the weights, the optimizer's moments and the buffers of a large model are tens of
+GiB that the warm-up and the capture would otherwise have to fit beside).  A new shape (a sequence-length change) gets
+a new engine over the same model and optimizer, in the same ``arena`` (nstrain.gpu.Arena): it warms up and captures
+in the memory the arena holds (the old engine's, once it is released, or memory held beside other processes), never
+asking the driver for more when the arena has room.
 """
 from __future__ import annotations
 
@@ -75,11 +77,8 @@ class StepEngine:
         # back to the driver, for any process to take), thread-local (the prefetch thread may pin host memory)
         a = self.arena
         a.stream.wait_stream(torch.cuda.current_stream())
+        saved = self._snapshot()
         with a.use():
-            params = [p.detach().clone() for p in self.model.parameters()]
-            bufs = {n: b.detach().clone() for n, b in self.model.named_buffers()}
-            saved = {n: {k: v.detach().clone() for k, v in st.items()} for n, st in self.opt.state().items()}
-            saved_lr = self.opt.lr.clone()
             self.opt.lr.zero_()                                      # warm-up steps leave the weights unchanged
             for _ in range(warmup_iters):
                 for _ in range(min(2, self.accum)):
@@ -99,16 +98,39 @@ class StepEngine:
                     g.capture_end()                                  # still ends the capture)
             self.graphs[name] = g
         torch.cuda.synchronize()
-        with torch.no_grad(), a.use():                               # undo the warm-up
-            for p, q in zip(self.model.parameters(), params):
-                p.copy_(q)
-            for n, b in self.model.named_buffers():
-                b.copy_(bufs[n])
-            self.opt.load_state(saved)
-            self.opt.lr.copy_(saved_lr)
+        self._restore(saved)                                         # undo the warm-up
+        with a.use():
             self.opt.zero_grad()
             self._zero_sums()
-            del params, bufs, saved, saved_lr
+        torch.cuda.synchronize()
+
+    def _snapshot(self) -> dict:
+        """The state the warm-up (and the validation before the capture) may change, copied to the host: the
+        optimizer's flat buffers (the trainable weights ``p`` and the moments ``m``, ``v``, one contiguous copy per
+        group), the parameters outside them (none trainable), the model's buffers, the step count and the learning
+        rate."""
+        torch.cuda.synchronize()                                     # (the last engine's work on them: done)
+        flat = [{k: g["flat"][k].to("cpu") for k in ("p", "m", "v")} for g in self.opt.groups]
+        others = {n: p.detach().to("cpu") for n, p in self.model.named_parameters() if n not in self.opt.slots}
+        bufs = {n: b.detach().to("cpu") for n, b in self.model.named_buffers()}
+        torch.cuda.synchronize()
+        return {"flat": flat, "others": others, "bufs": bufs, "t": self.opt.t.to("cpu"), "bc": self.opt.bc.to("cpu"),
+                "lr": self.opt.lr.to("cpu")}
+
+    @torch.no_grad()
+    def _restore(self, saved: dict) -> None:
+        for g, h in zip(self.opt.groups, saved["flat"]):
+            for k in ("p", "m", "v"):
+                g["flat"][k].copy_(h[k])
+        params = dict(self.model.named_parameters())
+        for n, q in saved["others"].items():
+            params[n].copy_(q)
+        bufs = dict(self.model.named_buffers())
+        for n, q in saved["bufs"].items():
+            bufs[n].copy_(q)
+        self.opt.t.copy_(saved["t"])
+        self.opt.bc.copy_(saved["bc"])
+        self.opt.lr.copy_(saved["lr"])
         torch.cuda.synchronize()
 
     # ------------------------------------------------------------------ use
