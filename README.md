@@ -76,7 +76,9 @@ the watchdog interval, when its data preparer keeps failing, or when the supervi
   clock's increment over a document boundary over its increment elsewhere; `write_head<h>` (per layer) and
   `write_p50/max`, the mean write tag of a head; the firing rates `gate_firing`, `ffn_in_firing`, `ffn_gate_firing`,
   `ffn_up_firing`; the copy arbitration's `copy_pi`, `novelty`, `read_gain`; the PKM read's `pkm_entropy`,
-  `pkm_slots_used`, `pkm_gate`.
+  `pkm_slots_used`, `pkm_gate`; `rope_ext_q_head<h>` / `rope_ext_k_head<h>` (per layer) and `rope_ext_q_p50/max`,
+  `rope_ext_k_p50/max`, the share of a head's query / key energy in the RoPE pairs whose wavelength exceeds the
+  training row length (against `rope_ext_pairs_frac`, the share of all pairs that are such).
   When the model's longest context (`rope_max_seq_len`) exceeds the training length, every validation also runs
   the long-row probe on each source's held-out rows of that length, one row at a time: `val_<P>/<source>`, `/mix`,
   `/mean` (the loss at the long length), `val_<P>/pos/seg<k>` (the recipe-weighted loss by position, in segments

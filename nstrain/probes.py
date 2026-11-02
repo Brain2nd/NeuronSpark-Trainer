@@ -37,7 +37,11 @@ The hippocampal probe metrics, from a ``neuronspark.utils.probe.HippocampalProbe
   the FFN input neuron and the spiking FFN's gate and up neurons; ``copy_pi``, ``novelty``, ``read_gain``: the copy
   arbitration's mean factors; ``pkm_entropy``, ``pkm_slots_used``, ``pkm_gate``: the PKM read's mean top-k weight
   entropy, the fraction of its slots read over the rows and its mean read gate (per layer; means over the layers for
-  the model).
+  the model);
+* ``rope_ext_q_head<h>``, ``rope_ext_k_head<h>`` per layer and ``rope_ext_q_p50``, ``rope_ext_q_max``,
+  ``rope_ext_k_p50``, ``rope_ext_k_max`` over the model: the share of a head's query / key energy in the RoPE pairs
+  whose wavelength exceeds the training row length (the pairs whose relative phases beyond that length training
+  never showed), against ``rope_ext_pairs_frac``, the share such pairs are of all (a direction-free vector's share).
 """
 from __future__ import annotations
 
@@ -148,10 +152,12 @@ def _hippocampal_readings(summary: dict):
     e = torch.cat([v["decay_exponent"] for v in summary.values()])
     c = torch.cat([v["clock_exponent"] for v in summary.values()])
     w = torch.cat([v["write"] for v in summary.values()])
+    rq = torch.cat([v["rope_ext_q"] for v in summary.values()])
+    rk = torch.cat([v["rope_ext_k"] for v in summary.values()])
     means = {name: torch.stack([v[name].reshape(()) for v in summary.values()]) for name in HIPPOCAMPAL_MEANS}
     ratio = torch.stack([(v["clock_boundary_step"] / v["clock_body_step"].clamp_min(1e-12)).reshape(())
                          for v in summary.values()])
-    return e, c, w, means, ratio
+    return e, c, w, means, ratio, rq, rk
 
 
 def hippocampal_metrics(key: str, probe) -> Dict[str, float]:
@@ -174,9 +180,12 @@ def hippocampal_metrics(key: str, probe) -> Dict[str, float]:
             out[f"{p}/clock_boundary_step_ratio"] = float(ratio)
         for h in range(v["write"].numel()):
             out[f"{p}/write_head{h}"] = float(v["write"][h])
+        for h in range(v["rope_ext_q"].numel()):
+            out[f"{p}/rope_ext_q_head{h}"] = float(v["rope_ext_q"][h])
+            out[f"{p}/rope_ext_k_head{h}"] = float(v["rope_ext_k"][h])
         for name in HIPPOCAMPAL_MEANS:
             out[f"{p}/{name}"] = float(v[name].reshape(()))
-    e, c, w, means, ratio = _hippocampal_readings(s)
+    e, c, w, means, ratio, rq, rk = _hippocampal_readings(s)
     p = f"{key}/hippocampal"
     tau = _tau(probe, e)
     out[f"{p}/decay_tau_p50"] = float(torch.quantile(tau, 0.5))
@@ -189,6 +198,11 @@ def hippocampal_metrics(key: str, probe) -> Dict[str, float]:
         out[f"{p}/clock_boundary_step_ratio"] = float(ratio.mean())
     out[f"{p}/write_p50"] = float(torch.quantile(w, 0.5))
     out[f"{p}/write_max"] = float(w.max())
+    out[f"{p}/rope_ext_q_p50"] = float(torch.quantile(rq, 0.5))
+    out[f"{p}/rope_ext_q_max"] = float(rq.max())
+    out[f"{p}/rope_ext_k_p50"] = float(torch.quantile(rk, 0.5))
+    out[f"{p}/rope_ext_k_max"] = float(rk.max())
+    out[f"{p}/rope_ext_pairs_frac"] = float(next(iter(s.values()))["rope_ext_pairs"])
     for name in HIPPOCAMPAL_MEANS:
         out[f"{p}/{name}"] = float(means[name].mean())
     out[f"{p}/boundaries"] = nb
@@ -200,7 +214,7 @@ def hippocampal_line(probe) -> str:
     s = probe.summary()
     if not s:
         raise RuntimeError("hippocampal probe: the forward reached no hippocampal layer")
-    e, c, w, means, ratio = _hippocampal_readings(s)
+    e, c, w, means, ratio, rq, rk = _hippocampal_readings(s)
     nb = _boundaries(s)
     tau, ct = _tau(probe, e), _tau(probe, c)
     m = {k: float(v.mean()) for k, v in means.items()}
@@ -211,5 +225,6 @@ def hippocampal_line(probe) -> str:
             f"{float(torch.quantile(w, 0.5)):.3g} max {float(w.max()):.3g}, firing gate {m['gate_firing']:.3f} ffn in "
             f"{m['ffn_in_firing']:.3f} gate {m['ffn_gate_firing']:.3f} up {m['ffn_up_firing']:.3f}, copy pi "
             f"{m['copy_pi']:.3g} novelty {m['novelty']:.3f} read gain {m['read_gain']:.3g}, pkm entropy "
-            f"{m['pkm_entropy']:.3f} slots used {m['pkm_slots_used']:.3f} gate {m['pkm_gate']:.3f}, boundaries "
-            f"{nb}{at}")
+            f"{m['pkm_entropy']:.3f} slots used {m['pkm_slots_used']:.3f} gate {m['pkm_gate']:.3f}, rope ext share q "
+            f"p50 {float(torch.quantile(rq, 0.5)):.3f} k p50 {float(torch.quantile(rk, 0.5)):.3f} of pairs "
+            f"{float(next(iter(s.values()))['rope_ext_pairs']):.3f}, boundaries {nb}{at}")

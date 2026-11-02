@@ -586,7 +586,7 @@ class Trainer:
         mb = self._val_batch(L)
         for strata in self._val_rows(L).values():
             for _, _, arr in strata:
-                probe, hprobe = DendriticProbe(self.eos_id), HippocampalProbe(self.eos_id)
+                probe, hprobe = DendriticProbe(self.eos_id), HippocampalProbe(self.eos_id, L)
                 with self.arena.use(), probing(self.model, probe, hprobe):
                     w = torch.from_numpy(arr[:mb]).to(self.dev)
                     probe.row(w[:, :-1])
@@ -608,7 +608,7 @@ class Trainer:
         if P % seg:
             raise RuntimeError(f"long probe: the length {P} is not a multiple of the training length {seg}")
         arr = next(iter(self._val_rows(P, unit=1).values()))[0][2]
-        probe, hprobe = DendriticProbe(self.eos_id, horizon=P, segments=P // seg), HippocampalProbe(self.eos_id)
+        probe, hprobe = DendriticProbe(self.eos_id, horizon=P, segments=P // seg), HippocampalProbe(self.eos_id, seg)
         with self.arena.use(), probing(self.model, probe, hprobe):
             w = torch.from_numpy(arr[:1]).to(self.dev)
             probe.row(w[:, :-1])
@@ -642,7 +642,7 @@ class Trainer:
         key = f"val_{L}"
         out, got = {}, {}
         mb = self._val_batch(L)
-        probe, hprobe = DendriticProbe(self.eos_id), HippocampalProbe(self.eos_id)
+        probe, hprobe = DendriticProbe(self.eos_id), HippocampalProbe(self.eos_id, L)
         with probing(self.model, probe, hprobe):
             for name, strata in self._val_rows(L).items():
                 self._beat(f"validation {name}")
@@ -680,7 +680,7 @@ class Trainer:
         if P % seg:
             raise RuntimeError(f"long probe: the length {P} is not a multiple of the training length {seg}")
         n_seg = P // seg
-        probe, hprobe = DendriticProbe(self.eos_id, horizon=P, segments=n_seg), HippocampalProbe(self.eos_id)
+        probe, hprobe = DendriticProbe(self.eos_id, horizon=P, segments=n_seg), HippocampalProbe(self.eos_id, seg)
         out, got, pos = {}, {}, {}
         with probing(self.model, probe, hprobe):
             for name, strata in self._val_rows(P, unit=1).items():
