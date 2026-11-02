@@ -14,7 +14,13 @@ validation rows: ``val_<L>/dendritic/<name>`` over every dendritic head of the m
   read the heads' leak where the retention over the row underflows to 0;
 * ``firing``: the mean head's firing rate (the fraction of the somatic outputs released through the threshold); with
   a probe of several segments also ``firing_seg<k>`` per segment of the row (over every head) and
-  ``layer<NN>/firing_last_seg``, the layer's firing rate in the row's last segment.
+  ``layer<NN>/firing_last_seg``, the layer's firing rate in the row's last segment;
+* at the rows' document boundaries (an EOS followed by the next document's first token): ``boundaries``, their count
+  (over every head only), and when it is not 0: ``boundary_retention_p50`` and ``boundary_retention_max``, the median
+  and the slowest head's retention across a boundary (``exp(A (dt_e + dt_e+1))``, what is left of the old document's
+  potential after the new one's first token); ``boundary_step_ratio_p50`` and ``boundary_step_ratio_max``, the heads'
+  mean step over a boundary's two tokens over their mean step elsewhere (well above 1: a head that flushes its
+  compartments at the boundaries).
 """
 from __future__ import annotations
 
@@ -32,7 +38,18 @@ def _readings(summary: dict):
     rh = torch.cat([v["retention_horizon"] for v in summary.values()])
     e = torch.cat([v["exponent"] for v in summary.values()])
     f = torch.cat([v["firing"] for v in summary.values()])
-    return r, rh, e, f
+    br = torch.cat([v["boundary_retention"] for v in summary.values()])
+    bs = torch.cat([v["boundary_step"] for v in summary.values()])
+    bb = torch.cat([v["body_step"] for v in summary.values()])
+    return r, rh, e, f, br, bs, bb
+
+
+def _boundaries(summary: dict) -> int:
+    """The boundaries the probe saw (the same count in every layer: one row set)."""
+    counts = {int(v["boundaries"]) for v in summary.values()}
+    if len(counts) != 1:
+        raise RuntimeError(f"dendritic probe: the layers saw different boundary counts {sorted(counts)}")
+    return counts.pop()
 
 
 def _tau(probe, e: torch.Tensor) -> torch.Tensor:
@@ -50,9 +67,10 @@ def dendritic_metrics(key: str, probe) -> Dict[str, float]:
     s = probe.summary()
     if not s:
         raise RuntimeError("dendritic probe: the validation forward reached no dendritic neuron layer")
-    hz, out = _horizon_name(probe), {}
+    hz, out, nb = _horizon_name(probe), {}, _boundaries(s)
 
-    def put(prefix: str, r: torch.Tensor, rh: torch.Tensor, e: torch.Tensor, f: torch.Tensor) -> None:
+    def put(prefix: str, r: torch.Tensor, rh: torch.Tensor, e: torch.Tensor, f: torch.Tensor, br: torch.Tensor,
+            bs: torch.Tensor, bb: torch.Tensor) -> None:
         out[f"{prefix}/retention_p50"] = float(torch.quantile(r, 0.5))
         out[f"{prefix}/retention_frac_gt_{RETENTION_SLOW:g}"] = float((r > RETENTION_SLOW).float().mean())
         out[f"{prefix}/retention_max"] = float(r.max())
@@ -63,10 +81,18 @@ def dendritic_metrics(key: str, probe) -> Dict[str, float]:
         out[f"{prefix}/tau_p90"] = float(torch.quantile(tau, 0.9))
         out[f"{prefix}/tau_max"] = float(tau.max())
         out[f"{prefix}/firing"] = float(f.mean())
+        if nb:
+            ratio = bs / bb.clamp_min(1e-12)
+            out[f"{prefix}/boundary_retention_p50"] = float(torch.quantile(br, 0.5))
+            out[f"{prefix}/boundary_retention_max"] = float(br.max())
+            out[f"{prefix}/boundary_step_ratio_p50"] = float(torch.quantile(ratio, 0.5))
+            out[f"{prefix}/boundary_step_ratio_max"] = float(ratio.max())
 
     for i, v in s.items():
-        put(f"{key}/dendritic/layer{i:02d}", v["retention"], v["retention_horizon"], v["exponent"], v["firing"])
+        put(f"{key}/dendritic/layer{i:02d}", v["retention"], v["retention_horizon"], v["exponent"], v["firing"],
+            v["boundary_retention"], v["boundary_step"], v["body_step"])
     put(f"{key}/dendritic", *_readings(s))
+    out[f"{key}/dendritic/boundaries"] = nb
     if int(probe.segments) > 1:
         seg = torch.cat([v["firing_by_segment"] for v in s.values()], dim=1)       # (segments, every head)
         for k in range(seg.shape[0]):
@@ -81,10 +107,15 @@ def dendritic_line(probe) -> str:
     s = probe.summary()
     if not s:
         raise RuntimeError("dendritic probe: the forward reached no dendritic neuron layer")
-    r, rh, e, f = _readings(s)
-    tau = _tau(probe, e)
+    r, rh, e, f, br, bs, bb = _readings(s)
+    tau, nb = _tau(probe, e), _boundaries(s)
+    at = ""
+    if nb:
+        ratio = bs / bb.clamp_min(1e-12)
+        at = (f": step ratio p50 {float(torch.quantile(ratio, 0.5)):.3g} max {float(ratio.max()):.3g}, retention "
+              f"across p50 {float(torch.quantile(br, 0.5)):.3g} max {float(br.max()):.3g}")
     return (f"dendritic probe: retention p50 {float(torch.quantile(r, 0.5)):.3g}, max {float(r.max()):.3g}, heads > "
             f"{RETENTION_SLOW:g} over the row {int((r > RETENTION_SLOW).sum())}/{r.numel()}, > {RETENTION_TAIL:g} "
             f"{int((r > RETENTION_TAIL).sum())}/{r.numel()}, > {HORIZON_SLOW:g} over {int(probe.horizon) // 1024}k "
             f"{int((rh > HORIZON_SLOW).sum())}/{r.numel()}, tau tokens p50 {float(torch.quantile(tau, 0.5)):.3g} max "
-            f"{float(tau.max()):.3g}, firing {float(f.mean()):.3f}")
+            f"{float(tau.max()):.3g}, firing {float(f.mean()):.3f}, boundaries {nb}{at}")

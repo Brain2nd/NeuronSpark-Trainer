@@ -64,7 +64,12 @@ the watchdog interval, when its data preparer keeps failing, or when the supervi
   head's retention and the fraction of the heads above 0.5 (the tail below the slow-leak heads);
   `retention32k_frac_gt_0.5`, the fraction of the heads that would keep half of it over 32K tokens at the row's mean
   step; `tau_p50`, `tau_p90`, `tau_max`, the heads' e-fold lengths in tokens at the row's mean step (the row length
-  over the row's decay exponent `-A Σ dt`; readable where the retention underflows); `firing`, the mean firing rate.
+  over the row's decay exponent `-A Σ dt`; readable where the retention underflows); `firing`, the mean firing rate;
+  and at the rows' document boundaries (an EOS followed by the next document's first token): `boundaries`, their
+  count, and when it is not 0, `boundary_retention_p50` and `boundary_retention_max`, the median and the slowest head's
+  retention across a boundary (`exp(A (dt_e + dt_e+1))`, what is left of the old document's potential after the new
+  one's first token), `boundary_step_ratio_p50` and `boundary_step_ratio_max`, the heads' mean step over a boundary's
+  two tokens over their mean step elsewhere (well above 1: a head that flushes its compartments at the boundaries).
   When the model's longest context (`rope_max_seq_len`) exceeds the training length, every validation also runs
   the long-row probe on each source's held-out rows of that length, one row at a time: `val_<P>/<source>`, `/mix`,
   `/mean` (the loss at the long length), `val_<P>/pos/seg<k>` (the recipe-weighted loss by position, in segments

@@ -173,6 +173,7 @@ class Trainer:
         self.ckpts = Checkpoints(c.ckpt_dir, keep_last=c.checkpoints.keep_last)
         self.line = Line(c.data_work, c.tokens_per_update, seed=c.data_seed)
         self.data_state = json.loads((Path(c.data_work) / "state.json").read_text())
+        self.eos_id = int(self.data_state["eos_id"])                 # ends every document of the rows (the probes)
         self.code = code_versions(self.data_state["tokenizer_sha256"])
         latest = self.ckpts.recover(self.root)
         self.rollback = self._rollback_marker(latest)
@@ -585,8 +586,9 @@ class Trainer:
         mb = self._val_batch(L)
         for strata in self._val_rows(L).values():
             for _, _, arr in strata:
-                with self.arena.use(), probing(self.model, DendriticProbe()) as probe:
+                with self.arena.use(), probing(self.model, DendriticProbe(self.eos_id)) as probe:
                     w = torch.from_numpy(arr[:mb]).to(self.dev)
+                    probe.row(w[:, :-1])
                     self.model.loss(w[:, :-1].contiguous(), w[:, 1:].contiguous())
                     del w
                 print(f"{dendritic_line(probe)} (the warm-up micro-batch of length {L})", flush=True)
@@ -603,8 +605,10 @@ class Trainer:
         if P % seg:
             raise RuntimeError(f"long probe: the length {P} is not a multiple of the training length {seg}")
         arr = next(iter(self._val_rows(P, unit=1).values()))[0][2]
-        with self.arena.use(), probing(self.model, DendriticProbe(horizon=P, segments=P // seg)) as probe:
+        probe = DendriticProbe(self.eos_id, horizon=P, segments=P // seg)
+        with self.arena.use(), probing(self.model, probe):
             w = torch.from_numpy(arr[:1]).to(self.dev)
+            probe.row(w[:, :-1])
             per = self.model.per_token_ce(w[:, :-1].contiguous(), w[:, 1:].contiguous())
             segs = [round(float(x), 3) for x in per.view(-1, seg).mean(dim=1)]
             del w, per
@@ -633,7 +637,7 @@ class Trainer:
         key = f"val_{L}"
         out, got = {}, {}
         mb = self._val_batch(L)
-        probe = DendriticProbe()
+        probe = DendriticProbe(self.eos_id)
         with probing(self.model, probe):
             for name, strata in self._val_rows(L).items():
                 self._beat(f"validation {name}")
@@ -643,6 +647,7 @@ class Trainer:
                     with self.arena.use():                           # (in the arena: memory the trainer holds)
                         for i in range(0, arr.shape[0], mb):
                             w = torch.from_numpy(arr[i:i + mb]).to(self.dev)
+                            probe.row(w[:, :-1])
                             s += float(self.model.loss(w[:, :-1].contiguous(), w[:, 1:].contiguous()).ce)
                             del w
                     acc += share * s / (arr.shape[0] // mb)
@@ -668,7 +673,7 @@ class Trainer:
         if P % seg:
             raise RuntimeError(f"long probe: the length {P} is not a multiple of the training length {seg}")
         n_seg = P // seg
-        probe = DendriticProbe(horizon=P, segments=n_seg)
+        probe = DendriticProbe(self.eos_id, horizon=P, segments=n_seg)
         out, got, pos = {}, {}, {}
         with probing(self.model, probe):
             for name, strata in self._val_rows(P, unit=1).items():
@@ -679,6 +684,7 @@ class Trainer:
                     with self.arena.use():                           # (in the arena: memory the trainer holds)
                         for i in range(arr.shape[0]):
                             w = torch.from_numpy(arr[i:i + 1]).to(self.dev)
+                            probe.row(w[:, :-1])
                             per = self.model.per_token_ce(w[:, :-1].contiguous(), w[:, 1:].contiguous())
                             s += per.view(n_seg, seg).mean(dim=1).double().cpu()
                             del w, per
