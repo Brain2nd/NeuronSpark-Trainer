@@ -9,9 +9,10 @@ one continuous W&B record per line, and a supervisor that keeps a line running u
 
 ## Installation
 
-Requirements: a Linux host with an NVIDIA Blackwell GPU, Python ≥ 3.10, and an environment with NeuronSpark's
-requirements (PyTorch 2.9.1, Triton 3.5.1) plus `numpy`, `safetensors`, `wandb`, `tokenizers`, `pyarrow` and
-`huggingface_hub`.  The package declares no dependencies of its own, so installing it never changes a pinned version.
+Requirements: a Linux host with an NVIDIA datacenter Blackwell GPU (B200, GB200, B300, GB300), Python ≥ 3.10, and an
+environment with NeuronSpark's requirements (PyTorch 2.9.1, Triton 3.5.1) plus `numpy`, `safetensors`, `wandb`,
+`tokenizers`, `pyarrow` and `huggingface_hub`.  The package declares no dependencies of its own, so installing it never
+changes a pinned version.
 
 ```bash
 pip install --no-deps -e .
