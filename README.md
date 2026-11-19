@@ -32,7 +32,8 @@ anything else:
 
 `notify` (optional) is run with an event in JSON on stdin when a line finishes, fails, gets stuck, is restarted by the
 watchdog or after a signal it did not send, stops because the disk is full, waits for data or for the GPU longer than
-the watchdog interval, when its data preparer keeps failing, or when the supervisor itself fails.
+the watchdog interval, when its data preparer or its backup's upload keeps failing, or when the supervisor itself
+fails.
 
 ## Concepts
 
@@ -125,6 +126,7 @@ the watchdog interval, when its data preparer keeps failing, or when the supervi
 <run>/supervisor.json   supervisor state: pids, launches, failures, last event
 <run>/STOP              a stop request
 <run>/branches.json     the branches forked from this line
+<run>/backup/           the Hugging Face backup: what the repository holds (record.json), the uploads' log
 ```
 
 ## Usage
@@ -158,6 +160,13 @@ nstrain run runs/b1
 
 # continue from an earlier checkpoint as a new W&B run (the old run is marked superseded)
 nstrain rollback runs/trunk --to 30000
+nstrain run runs/trunk
+
+# a backup on Hugging Face (see Backup): set with the line, or as run.json's "backup" section at any time
+nstrain new runs/trunk --model ns-2b --data /data/lines/trunk --peak-lr 3e-4 \
+    --backup-repo <account>/trunk-backup --backup-token-file /path/to/hf_token
+nstrain backup runs/trunk --latest          # the newest checkpoint now, before a planned move
+nstrain restore <account>/trunk-backup --token-file /path/to/hf_token      # on another host, at the same paths
 nstrain run runs/trunk
 
 # throughput of one shape (and its kernel-time breakdown with --profile)
@@ -221,6 +230,36 @@ start.  The schedule only grows at its end.
 | W&B is unreachable | calls are retried with backoff (2 h by default) |
 | A run of non-finite updates | skipped one by one; the line stops after too many in a row |
 | The supervisor dies | the trainer stops at the next update boundary with a checkpoint |
+| The host is lost (a rented server expires) | with `backup` set, the line continues on another host from the checkpoint of its last validation (`nstrain restore`, see Backup) |
+
+## Backup
+
+With `backup` in `run.json` (`{"repo": "<account>/<name>", "token_file": "/path/to/hf_token", "private": false}`, or
+`nstrain new ... --backup-repo`; it may be set while the line runs), the supervisor uploads what a resume needs to that
+Hugging Face repository at every validation (`validation.every_tokens`), each upload replacing the one before: the
+checkpoint written at the validation (weights, optimizer state, `trainer.json`), `run.json` and the line's other run
+files, the data line's state (`state.json`, its progress, the cycles' manifests, the file listings), the held-out
+streams and the tokenizer.  Between two uploads only the checkpoint changes; a file the repository holds is not sent
+again.  The data line's streams are not uploaded: they are re-created from their pinned sources and checked against
+their hashes.  Also uploaded: the checkpoint a rollback goes back to, the newest one while the repository holds nothing
+of the line, and the held checkpoint's `trainer.json` when it is marked kept afterwards.  `nstrain backup RUN --latest`
+uploads the newest checkpoint at once (before a planned move).
+
+An upload runs in a process of its own beside the trainer (`nice`; `<run>/backup/upload.log`) and goes on after the
+supervisor ends (under a systemd service, the service's end may stop it: the next start uploads it).  It is one
+commit, checked file by file after it; then the repository's history is squashed and the files of the checkpoint it
+held before are deleted, so it holds one copy of one state.  A checkpoint that fails its hash check is not uploaded; a
+repository that holds another line's backup or files no backup wrote is refused.  A failed upload is started again
+after 60 s, doubling to 30 min; three failures in a row are an event.  `nstrain status` shows what the repository
+holds.  The token is sent to huggingface.co only.
+
+To continue the line on another host: the same environment (`nstrain restore` prints the library versions that
+differ: the data order depends on them), the line's paths free (its run directory, data line, held-out streams and
+tokenizer return to the paths they had), the Hugging Face token and the W&B key at the paths `run.json` names; then
+`nstrain restore <account>/<name> --token-file F` and `nstrain run RUN`.  `restore` downloads the repository at one
+commit, checks every file against `BACKUP.json`, puts each where it was and re-creates the data line's open streams
+(`nstrain data restore --work W` completes that step if it was cut off); the preparer rebuilds the cycle in training,
+and the trainer continues from the checkpoint: data position, optimizer state, W&B run.
 
 ## Disk space
 
@@ -242,6 +281,7 @@ nstrain/engine.py      the CUDA-graph step         nstrain/flat_adamw.py  AdamW 
 nstrain/schedule.py    learning-rate schedules     nstrain/model.py       model presets, construction, groups
 nstrain/status.py      status                      nstrain/bench.py       throughput
 nstrain/gpu.py         the GPU lease and checks    nstrain/host.py        host settings
+nstrain/backup.py      the Hugging Face backup and its restore
 nstrain/data/          data lines: sources, mixture, hf, tokenize, work, stream, batches, preparer
 nstrain/presets/       model configurations
 examples/minicpm-2b/   a 2B line on the open MiniCPM corpora: run.json and the commands

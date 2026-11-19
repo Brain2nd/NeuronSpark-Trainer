@@ -1,4 +1,5 @@
-"""``nstrain status RUN``: where a line stands -- trainer and supervisor, checkpoints, W&B run, data line, disk."""
+"""``nstrain status RUN``: where a line stands -- trainer and supervisor, checkpoints, W&B run, backup, data line,
+disk."""
 from __future__ import annotations
 
 import json
@@ -6,6 +7,7 @@ import shutil
 import time
 from pathlib import Path
 
+from nstrain import backup
 from nstrain import config as C
 from nstrain.ckpt import Checkpoints
 from nstrain.ops import running
@@ -45,6 +47,14 @@ def status(run, log_lines: int = 8) -> dict:
     out["checkpoints"] = cks
     out["latest"] = latest.name if latest is not None else None
     out["wandb"] = dict(_json(r / "wandb_run.json") or {}, project=cfg.wandb.project, entity=cfg.wandb.entity)
+    if cfg.backup is not None:
+        rec = backup.record(cfg) or {}
+        mine = rec.get("repo") == cfg.backup.repo
+        out["backup"] = {"repo": cfg.backup.repo, "holds": rec.get("checkpoint") if mine else None,
+                         "time": rec.get("time") if mine else None, "clean": rec.get("clean") if mine else None,
+                         "pending": backup.pending(cfg), "uploading": backup.running(cfg)}
+    else:
+        out["backup"] = None
     out["stop_requested"] = ((r / "STOP").read_text() or "at the next update") if (r / "STOP").exists() else None
     out["rollback_pending"] = _json(r / "rollback.json")
     w = Path(cfg.data_work)
@@ -89,6 +99,12 @@ def format_status(s: dict) -> str:
     if w.get("run_id"):
         L.append(f"  W&B {w.get('entity') or '<default entity>'}/{w['project']}/{w['run_id']} ({w.get('kind')}, "
                  f"ready {w.get('ready')})")
+    b = s["backup"]
+    if b is not None:
+        L.append(f"  backup {b['repo']}: " + (f"holds {b['holds']} ({b['time']})" if b["holds"] else "nothing yet")
+                 + ("" if b["clean"] in (None, True) else ", its older files not yet deleted")
+                 + (f"; uploading {b['pending']}" if b["pending"] and b["uploading"]
+                    else f"; {b['pending']} not uploaded" if b["pending"] else ""))
     if s["stop_requested"]:
         L.append(f"  STOP requested: {s['stop_requested']}")
     if s["rollback_pending"]:

@@ -48,11 +48,16 @@ nstrain.data.preparer; while another process serves it, it waits and serves it o
 ``<data_work>/preparer.log``; ended (SIGTERM, SIGKILL after 60 s) with the supervisor, which then releases the cycles
 the trainer consumed.  ``nstrain data run-preparer`` runs only this part (``run_preparer``).
 
+Backup (run.json ``backup``, nstrain.backup): whenever a checkpoint is due for the line's Hugging Face repository
+(``backup.pending``: the one written at each validation), ``nice -n 10 python -m nstrain backup RUN`` is started
+(``BackupSupervisor``), in a session of its own: an upload under way goes on after the supervisor ends; a failed one is
+started again with a pause of 60 s doubling to 1800 s.
+
 Logs over 256 MB are rotated (one previous file kept) before a launch.  Events that need attention (the line
 finished, failed, stuck, stopped for disk space; a watchdog kill; the trainer waiting for data longer than stall_s;
-the preparer exiting three times in a row, or another process serving the data line at the start) are written to
-supervisor.json and sent to the host's ``notify`` command (nstrain.host).  ``supervisor.lock`` allows one supervisor
-per line.
+the preparer or the backup's upload exiting three times in a row, or another process serving the data line at the
+start) are written to supervisor.json and sent to the host's ``notify`` command (nstrain.host).  ``supervisor.lock``
+allows one supervisor per line.
 """
 from __future__ import annotations
 
@@ -72,6 +77,7 @@ import time
 from pathlib import Path
 from typing import Callable, List, Optional
 
+from nstrain import backup
 from nstrain import config as C
 from nstrain import exits, host
 from nstrain.data.preparer import HELD_BY_PARENT, release_consumed, serve
@@ -264,6 +270,87 @@ class PreparerSupervisor(threading.Thread):
             self.lock = None
 
 
+class BackupSupervisor(threading.Thread):
+    """The line's backup (run.json ``backup``, nstrain.backup; read again at every look, so it may be set or changed
+    while the line runs): every POLL_S, when a checkpoint is due (``backup.pending``: the one written at each
+    validation) and no upload runs, it starts ``nice -n 10 python -m nstrain backup RUN`` (output appended to
+    ``<run_dir>/backup/upload.log``) in a session of its own, so an upload under way goes on after the supervisor ends;
+    a failed upload is started again after 60 s doubling to 1800 s, three failures in a row are an event.  At the end
+    of the line (``end``) the upload of a checkpoint still due is started."""
+    POLL_S = 10.0
+    BACKOFF = (60.0, 1800.0)
+
+    def __init__(self, root: Path, say, trouble=None):
+        super().__init__(daemon=True, name="backup")
+        self.root, self.say = root, say
+        self.trouble = trouble or (lambda kind, msg: None)
+        self.proc: Optional[subprocess.Popen] = None
+        self.name: Optional[str] = None                              # the checkpoint the upload under way was for
+        self.ended = threading.Event()
+        self.said = None                                             # the last problem said (said once)
+
+    def cmd(self) -> List[str]:
+        return ["nice", "-n", "10", sys.executable, "-u", "-m", "nstrain", "backup", str(self.root)]
+
+    def poke(self) -> None:
+        """Start an upload when one is due and none runs."""
+        cfg = C.load(self.root)
+        name = backup.pending(cfg)
+        if name is None or backup.running(cfg):
+            return
+        d = self.root / backup.DIR
+        d.mkdir(exist_ok=True)
+        _rotate(d / "upload.log")
+        with open(d / "upload.log", "a") as log:
+            self.proc = subprocess.Popen(self.cmd(), stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+                                         start_new_session=True)
+        self.name = name
+        self.say(f"backup: uploading {name} to {cfg.backup.repo} (pid {self.proc.pid})")
+
+    def run(self) -> None:
+        first, longest = self.BACKOFF
+        pause, failed, after = first, 0, 0.0
+        while not self.ended.is_set():
+            try:
+                if self.proc is not None and self.proc.poll() is not None:
+                    rc, self.proc = _code(self.proc.returncode), None
+                    log = self.root / backup.DIR / "upload.log"
+                    if rc == 0 and backup.pending(C.load(self.root)) == self.name:
+                        why = f"ended (exit 0) without the record showing {self.name}"   # (never a loop of uploads)
+                    else:
+                        why = None if rc == 0 else f"exited {rc}"
+                    if why is None:
+                        pause, failed = first, 0
+                        self.say(f"backup: upload of {self.name} finished")
+                    else:
+                        failed += 1
+                        after = time.time() + pause
+                        self.say(f"backup: the upload {why}; again in {pause:.0f} s (see {log})")
+                        if failed == 3:
+                            self.trouble("backup", f"the upload of the line's backup failed {failed} times in a row "
+                                                   f"(last: {why}; see {log})")
+                        pause = min(2 * pause, longest)
+                if self.proc is None and time.time() >= after:
+                    self.poke()
+                self.said = None
+            except Exception as e:                                   # (run.json being edited, a full disk ...)
+                msg = f"backup: {type(e).__name__}: {e}"
+                if msg != self.said:
+                    self.say(msg)
+                    self.said = msg
+            self.ended.wait(self.POLL_S)
+
+    def end(self) -> None:
+        """No more looks; the upload of a checkpoint still due started (it goes on after the supervisor)."""
+        self.ended.set()
+        self.join(timeout=60)
+        if self.proc is None or self.proc.poll() is not None:
+            try:
+                self.poke()
+            except Exception as e:
+                self.say(f"backup: the due checkpoint's upload could not be started: {type(e).__name__}: {e}")
+
+
 def gpu_state() -> str:
     """'busy' (another compute process, or the GPU lease held), 'free', or 'failed' (nvidia-smi failed)."""
     if lease_holder() is not None:
@@ -404,6 +491,8 @@ class LineSupervisor:
             prep = PreparerSupervisor(self.cfg.data_work, self.cfg.supervisor.preparer, self.stop, self.say,
                                       self.event)
             prep.start()
+        bk = BackupSupervisor(self.root, self.say, self.event)
+        bk.start()
         try:
             rc = self._trainer_loop()
         except Exception as e:                                       # the line is no longer supervised: said
@@ -424,6 +513,7 @@ class LineSupervisor:
                         "message": msg})
             raise
         finally:
+            bk.end()
             if prep is not None:
                 served = prep.lock is not None                       # (else another preparer serves the line and
                 prep.end()                                           # releases them, holding the line's lock)

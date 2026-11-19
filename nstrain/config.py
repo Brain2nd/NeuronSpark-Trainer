@@ -45,7 +45,11 @@ produces lives next to it (checkpoints/, run.log, heartbeat, wandb_run.json, sup
      "allow_changes": [],                     # FROZEN keys allowed to differ from the line's checkpoints (on purpose)
      "print_every": 10,
      "wandb": {"project": "ns-pretrain", "entity": null, "retry_s": 7200,
-               "key_file": null}                # a file with the line's W&B API key (null: the host's login)
+               "key_file": null},               # a file with the line's W&B API key (null: the host's login)
+     "backup": {"repo": "<account>/<name>",   # a Hugging Face repository that holds what a resume needs, overwritten
+                "token_file": null,           # at every validation (nstrain.backup); token_file: a file with a write
+                "private": false}             # token (null: the host's login); private: the visibility given when the
+                                              # first upload creates the repository; null: no backup
     }
 
 Every key is checked (unknown keys are errors, also nested ones); the sections that only steer the process
@@ -60,6 +64,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import os
+import re
 import typing
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -153,6 +158,13 @@ class Wandb:
 
 
 @dataclass
+class Backup:
+    repo: str                       # "<account>/<name>": one line's repository (nstrain.backup)
+    token_file: Optional[str] = None    # a file holding a token that may write it; null: the host's login
+    private: bool = False           # the visibility given when the first upload creates the repository
+
+
+@dataclass
 class RunConfig:
     name: str
     model: dict
@@ -175,6 +187,7 @@ class RunConfig:
     print_every: int = 10
     ema: Optional[Ema] = None                   # the parameters' moving average (none without)
     metrics: Optional[str] = None               # the metric set's version (nstrain.probes.METRICS_VERSION)
+    backup: Optional[Backup] = None             # the line's backup on Hugging Face (none without)
     run_dir: Path = field(default=None, metadata={"internal": True})        # where run.json lives (not stored)
 
     # ------------------------------------------------------------------ derived
@@ -373,6 +386,12 @@ def validate(c: RunConfig) -> List[str]:
     k = c.wandb.key_file
     if k is not None and not Path(k).is_absolute():
         p.append(f"wandb.key_file {k!r} must be an absolute path")    # (that it exists: the start checks)
+    b = c.backup
+    if b is not None:
+        if not re.fullmatch(r"[A-Za-z0-9][\w.-]*/[A-Za-z0-9][\w.-]*", b.repo):
+            p.append(f"backup.repo {b.repo!r} must be a repository name \"<account>/<name>\"")
+        if b.token_file is not None and not Path(b.token_file).is_absolute():
+            p.append(f"backup.token_file {b.token_file!r} must be an absolute path")
     return p
 
 

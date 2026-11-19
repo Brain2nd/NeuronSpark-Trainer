@@ -57,7 +57,8 @@ def start_problems(cfg: C.RunConfig, meta: dict, data_state: dict, forking: bool
 def preflight(cfg: C.RunConfig) -> List[str]:
     """The data line loads (tokenizer file and library as at init), every recipe source is calibrated and pinned,
     every sequence length of the line has engine settings and held-out rows (of the line's revisions, holdout rule
-    and text encoding), the W&B key file (when set) holds a key."""
+    and text encoding), the W&B key file and the backup's token file (when set) hold a key, huggingface_hub has
+    what the backup uses (when set)."""
     from nstrain.data.batches import val_rows
     from nstrain.data.sources import SOURCES
     from nstrain.data.tokenize import text_mode
@@ -73,6 +74,19 @@ def preflight(cfg: C.RunConfig) -> List[str]:
                 problems.append(f"wandb.key_file {cfg.wandb.key_file} is empty")
         except OSError as e:
             problems.append(f"wandb.key_file {cfg.wandb.key_file} cannot be read: {e}")
+    if cfg.backup is not None and cfg.backup.token_file is not None:
+        try:
+            if not Path(cfg.backup.token_file).read_text().strip():
+                problems.append(f"backup.token_file {cfg.backup.token_file} is empty")
+        except OSError as e:
+            problems.append(f"backup.token_file {cfg.backup.token_file} cannot be read: {e}")
+    if cfg.backup is not None:
+        import huggingface_hub
+        lack = [m for m in ("super_squash_history", "list_lfs_files", "permanently_delete_lfs_files")
+                if not hasattr(huggingface_hub.HfApi, m)]
+        if lack:
+            problems.append(f"backup: huggingface_hub {huggingface_hub.__version__} has no {', '.join(lack)} "
+                            "(nstrain.backup needs a newer one)")
     try:
         st = Work(cfg.data_work).load()
     except (OSError, RuntimeError, KeyError, ValueError) as e:

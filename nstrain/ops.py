@@ -63,14 +63,17 @@ def running(cfg: C.RunConfig) -> dict:
 def new(run_dir, model: str, data_work: str, val_work: Optional[str] = None, name: Optional[str] = None,
         peak_lr: float = 3e-4, warmup_tokens: Optional[float] = None, wandb_project: str = "ns-pretrain",
         tokens_per_update=None, shape_from: Optional[str] = None, wandb_key_file: Optional[str] = None,
-        weight_decay_batch: Optional[int] = None, ema_horizon_tokens: Optional[float] = None) -> C.RunConfig:
+        weight_decay_batch: Optional[int] = None, ema_horizon_tokens: Optional[float] = None,
+        backup_repo: Optional[str] = None, backup_token_file: Optional[str] = None) -> C.RunConfig:
     """A trunk-type line (warmup, then a constant rate).  ``model``: a preset name or a model-config JSON file;
     ``shape_from``: the preset whose run defaults (lengths, tokens per update, warmup) a model file uses;
     ``tokens_per_update``: a number, or the pieces of a batch-size ramp (nstrain.batch); ``weight_decay_batch``:
     the batch whose decay is the optimizer's weight_decay (the decay follows the batch; None: a constant decay);
     ``ema_horizon_tokens``: keep the parameters' moving average with this horizon, from the warmup's end (None:
-    none); ``wandb_key_file``: a file with the line's W&B API key (default: the host's login).  The line records
-    the metric set of this nstrain (``metrics``)."""
+    none); ``wandb_key_file``: a file with the line's W&B API key (default: the host's login); ``backup_repo``: the
+    line's Hugging Face repository for its backup (nstrain.backup; None: none), ``backup_token_file`` a file with a
+    token that may write it (default: the host's login).  The line records the metric set of this nstrain
+    (``metrics``)."""
     from nstrain.probes import METRICS_VERSION
     run_dir = Path(run_dir).resolve()
     if run_dir.exists() and any(run_dir.iterdir()):
@@ -92,7 +95,9 @@ def new(run_dir, model: str, data_work: str, val_work: Optional[str] = None, nam
         "ema": None if ema_horizon_tokens is None else {"horizon_tokens": float(ema_horizon_tokens), "from_tokens": w},
         "metrics": METRICS_VERSION,
         "wandb": {"project": wandb_project,
-                  "key_file": str(Path(wandb_key_file).resolve()) if wandb_key_file else None}},
+                  "key_file": str(Path(wandb_key_file).resolve()) if wandb_key_file else None},
+        "backup": None if backup_repo is None else {
+            "repo": backup_repo, "token_file": str(Path(backup_token_file).resolve()) if backup_token_file else None}},
         where=str(run_dir / C.RUN_FILE))
     cfg.run_dir = run_dir
     from nstrain.checks import preflight
@@ -132,7 +137,7 @@ def branch(run_dir, parent_run, k: int, plan: str, data_work: str, cycle_tokens:
     d = json.loads(json.dumps(meta["run"]))                          # the parent's settings at the fork
     d.update(name=name or run_dir.name, data_work=str(Path(data_work).resolve()), fork_from=str(fork),
              schedule=sched.branch(meta["run"]["schedule"], at, at + total, shape, final), stop_at_tokens=None,
-             allow_changes=[])
+             allow_changes=[], backup=None)                          # (a repository holds one line)
     cfg = C.from_dict(d, where=str(run_dir / C.RUN_FILE))
     missing = sorted({int(e["seq_len"]) for e in entries} - set(cfg.lengths))
     if missing:

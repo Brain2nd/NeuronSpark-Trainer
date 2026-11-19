@@ -6,16 +6,20 @@
     nstrain data fork --work B --from TRUNK --at-cycle K --plan decay:25e9,long:4e9 --line b1 [--cycle-tokens C]
     nstrain data {plan,status} --work W                         nstrain data loop --work W   (one preparer process)
     nstrain data run-preparer --work W [--foreground]   the preparer under supervision (no trainer), in the background
+    nstrain data restore --work W   re-create the open files' streams of a data line restored from a backup
 
     nstrain new RUN --model ns-2b --data W [--val W] [--peak-lr ..] [--warmup-tokens ..] [--wandb-project ..]
                     [--wandb-key-file F] [--tokens-per-update N | '[{"from":0,"to":1e10,"tokens":393216},..]']
-                    [--weight-decay-batch N] [--ema-horizon-tokens N]
+                    [--weight-decay-batch N] [--ema-horizon-tokens N] [--backup-repo R [--backup-token-file F]]
     nstrain branch RUN --from PARENT_RUN --at-cycle K --plan decay:25e9,long:4e9 --data W_B [--cycle-tokens ..]
     nstrain check RUN          start checks without a GPU
     nstrain run RUN [--foreground]   the line under supervision (trainer + data preparer), in the background
     nstrain train RUN          one trainer process (what the supervisor runs)
     nstrain status RUN [--json]
     nstrain stop RUN [--at-cycle-end K | --now]   nstrain rollback RUN --to UPDATE [--force]
+    nstrain backup RUN [--latest]   the checkpoint due to the line's Hugging Face repository (what the supervisor
+                               runs at every validation); --latest: the newest checkpoint
+    nstrain restore REPO [--token-file F] [--revision R]   a line back from its backup, at the same paths
     nstrain bench --model ns-2b --seq-len 4096 --rows 4 --accum 4 [--ac none|dendritic|all] [--profile]
     nstrain tune RUN [--margin-gib 10] [--dry-run] [--shared]   the fastest shape per length that fits the GPU (beside
                                                     other processes: --shared), into run.json
@@ -102,6 +106,9 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--cycles", type=int, default=30)
     p = ds.add_parser("status")
     p.add_argument("--work", required=True)
+    p = ds.add_parser("restore", help="re-create the open files' streams of a data line restored from a backup")
+    p.add_argument("--work", required=True)
+    _workers(p)
     for name in ("loop", "run-preparer"):
         p = ds.add_parser(name)
         p.add_argument("--work", required=True)
@@ -132,6 +139,9 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--shape-from", help="the preset whose run defaults a model-config file uses")
     p.add_argument("--wandb-project", default="ns-pretrain")
     p.add_argument("--wandb-key-file", help="a file with the line's W&B API key (default: the host's login)")
+    p.add_argument("--backup-repo", help="a Hugging Face repository \"<account>/<name>\" holding the checkpoint of "
+                                          "the line's last validation and what a resume needs (nstrain.backup)")
+    p.add_argument("--backup-token-file", help="a file with a token that may write it (default: the host's login)")
     p = sub.add_parser("branch", help="a branch line from a parent's cycle end (data fork + run.json)")
     p.add_argument("run")
     p.add_argument("--from", dest="parent", required=True)
@@ -159,6 +169,15 @@ def _parser() -> argparse.ArgumentParser:
     g = p.add_mutually_exclusive_group()
     g.add_argument("--at-cycle-end", type=int, help="after the last update of this data cycle")
     g.add_argument("--now", action="store_true", help="SIGTERM to the supervisor (stops at the next boundary too)")
+    p = sub.add_parser("backup", help="the checkpoint due (at every validation) to the line's Hugging Face repository")
+    p.add_argument("run")
+    p.add_argument("--latest", action="store_true", help="the newest checkpoint, whatever its validation interval")
+    p = sub.add_parser("restore", help="a line back from its Hugging Face backup, at the paths it had")
+    p.add_argument("repo")
+    p.add_argument("--token-file", help="a file with a token that may read the repository (default: the host's "
+                                        "login; none needed for a public one)")
+    p.add_argument("--revision", help="a commit of the repository (default: its newest)")
+    _workers(p)
     p = sub.add_parser("rollback", help="continue the line from an earlier checkpoint as a new W&B run")
     p.add_argument("run")
     p.add_argument("--to", type=int, required=True)
@@ -253,7 +272,11 @@ def _data(a) -> int:
         print({k: round(v, 3) for k, v in st["bytes_per_token"].items()})
         return 0
     with w.lock():                                                   # the writers of state.json: one at a time
-        if a.dcmd == "init":
+        if a.dcmd == "restore":
+            got = w.restore_streams(**_kw(a))
+            print(f"{len(got['pool'])} open streams re-created, cycles {got['released'] or 'none'} set back to "
+                  "released (the preparer rebuilds them)")
+        elif a.dcmd == "init":
             tok = a.tokenizer or host.get("tokenizer")
             if not tok:
                 raise SystemExit("--tokenizer (or \"tokenizer\" in the host settings)")
@@ -308,7 +331,8 @@ def main(argv=None) -> int:
     from nstrain import host
     host.apply()
     a = _parser().parse_args(argv)
-    if a.cmd in ("new", "branch", "check", "status", "stop", "rollback") or (a.cmd == "run" and not a.foreground):
+    if (a.cmd in ("new", "branch", "check", "status", "stop", "rollback", "backup", "restore")
+            or (a.cmd == "run" and not a.foreground)):
         try:
             return _dispatch(a)
         except OPERATOR_ERRORS as e:                                 # a refusal, not a bug: one line, exit 2
@@ -341,7 +365,7 @@ def _dispatch(a) -> int:
         from nstrain import ops
         cfg = ops.new(a.run, a.model, a.data, a.val, a.name, a.peak_lr, a.warmup_tokens, a.wandb_project,
                       a.tokens_per_update, a.shape_from, a.wandb_key_file, a.weight_decay_batch,
-                      a.ema_horizon_tokens)
+                      a.ema_horizon_tokens, a.backup_repo, a.backup_token_file)
         print(f"{cfg.run_dir / 'run.json'}: line {cfg.name}, model {a.model}, data {cfg.data_work}")
         return 0
     if a.cmd == "branch":
@@ -370,6 +394,20 @@ def _dispatch(a) -> int:
     if a.cmd == "rollback":
         from nstrain import ops
         print(ops.rollback(a.run, a.to, a.force))
+        return 0
+    if a.cmd == "backup":
+        from nstrain import backup
+        return backup.run(a.run, a.latest)
+    if a.cmd == "restore":
+        from nstrain import backup
+        rec = backup.restore(a.repo, a.token_file, a.revision, **_kw(a))
+        code = rec.get("code") or {}
+        print(f"restored {rec['line']} at {rec['checkpoint']} ({rec['tokens'] / 1e9:.2f}B tokens): {rec['run_dir']}")
+        print(f"the line trained with neuronspark {code.get('neuronspark')} and nstrain {code.get('nstrain')}, "
+              f"python {rec.get('python')}")
+        for x in backup.differences(rec):
+            print(f"differs: {x}")
+        print(f"next: nstrain check {rec['run_dir']}; nstrain run {rec['run_dir']}")
         return 0
     if a.cmd == "bench":
         import signal
