@@ -1,15 +1,17 @@
 """A line's backup on Hugging Face: one repository holds what a resume needs, overwritten at every validation.
 
-With ``backup`` in run.json (``{"repo": "<account>/<name>", "token_file": F, "private": false}``) the supervisor starts
-``nstrain backup RUN`` (nstrain.supervise.BackupSupervisor) whenever a checkpoint is due (``pending``): the first
-checkpoint of every validation interval (``validation.every_tokens``), which is the one written at the validation (the
-trainer writes both at the update that reaches it); the checkpoint ``latest`` names after ``nstrain rollback`` (the
-line went back); the newest one while the repository holds nothing of the line.  The checkpoint the repository holds is
-sent again when its trainer.json changed (marked kept).  ``nstrain backup RUN --latest`` sends the newest checkpoint
-whatever its interval (before a planned move of the line).  An upload replaces the repository's content in one commit,
-so the repository always holds one whole state; its history is then squashed and the stored files it no longer
-references (the checkpoint it held before) are deleted, so it holds one copy.  A file the repository already holds is
-not sent again.  The repository::
+A Hugging Face key turns it on: ``nstrain new ... --hf-key KEY`` or ``nstrain run RUN --hf-key KEY`` (``enable``) keeps
+the key in ``<run_dir>/backup/hf_key`` (mode 600; never uploaded, never in run.json) and sets run.json's ``backup``
+(``{"repo": "<the key's account>/<line>-backup", "token_file": that file, "private": false}``: public).  Then the
+supervisor starts ``nstrain backup RUN`` (nstrain.supervise.BackupSupervisor) whenever a checkpoint is due
+(``pending``): the first checkpoint of every validation interval (``validation.every_tokens``), which is the one written
+at the validation (the trainer writes both at the update that reaches it); the checkpoint ``latest`` names after
+``nstrain rollback`` (the line went back); the newest one while the repository holds nothing of the line.  The
+checkpoint the repository holds is sent again when its trainer.json changed (marked kept).  ``nstrain backup RUN
+--latest`` sends the newest checkpoint whatever its interval (before a planned move of the line).  An upload replaces
+the repository's content in one commit, so the repository always holds one whole state; its history is then squashed and
+the stored files it no longer references (the checkpoint it held before) are deleted, so it holds one copy.  A file the
+repository already holds is not sent again.  The repository::
 
     BACKUP.json                     what it holds: line, checkpoint, update, tokens, time; run_dir, data_work, val_work
                                     and the tokenizer (the paths a resume needs); code and library versions; every
@@ -29,16 +31,16 @@ cycle (what the trainer marks when it resumes).
 Before a commit the checkpoint's files are checked against their blake2b (a damaged checkpoint never replaces the
 repository's), after it every file the repository holds against the upload (sha256 of a stored file, git blob id of a
 small one).  A repository that holds another line's backup, or files no backup wrote, is refused: an upload replaces
-a repository's whole content.  The token goes to huggingface.co only (``ENDPOINT``; a download mirror set in
-``HF_ENDPOINT`` never sees it) and is never written or printed.
+a repository's whole content.  The key goes to huggingface.co only (``ENDPOINT``; a download mirror set in
+``HF_ENDPOINT`` never sees it) and is never printed; it is written only to ``hf_key``.
 
-``nstrain restore REPO`` puts a line back on another host at the same absolute paths (the checkpoints and the data
-state name them; they must be free there), checks every file against BACKUP.json and re-creates the open files'
-streams; then ``nstrain run RUN``.
+``nstrain restore REPO --hf-key KEY`` puts a line back on another host at the same absolute paths (the checkpoints and
+the data state name them; they must be free there), checks every file against BACKUP.json, re-creates the open files'
+streams and keeps the key for the line's backup; then ``nstrain run RUN``.
 
-In ``<run_dir>/backup/``: ``record.json`` (what the repository holds, written after each upload), ``lock`` (one upload
-at a time), ``upload.log``, ``hashes.json`` (the sha256 of the files sent, by inode, size and time: a file unchanged
-since is not read again), ``stage/`` (the files of the upload under way).
+In ``<run_dir>/backup/``: ``hf_key``, ``record.json`` (what the repository holds, written after each upload), ``lock``
+(one upload at a time), ``upload.log``, ``hashes.json`` (the sha256 of the files sent, by inode, size and time: a file
+unchanged since is not read again), ``stage/`` (the files of the upload under way).
 """
 from __future__ import annotations
 
@@ -50,6 +52,7 @@ import json
 import math
 import os
 import platform
+import re
 import shutil
 import tempfile
 import time
@@ -67,6 +70,7 @@ TEMPORARY = ("*.bin.part*", "*.bin.raw*", "*.json.tmp*")     # a crashed writer'
 REGULAR_MAX = 10 << 20          # larger files are stored files (LFS) on the Hub; a smaller one may be a regular one
 LIBRARIES = ("torch", "triton", "numpy", "tokenizers", "safetensors", "pyarrow", "wandb", "huggingface_hub", "hf_xet")
 FORMAT = 1
+KEY_FILE = "hf_key"             # <run_dir>/backup/hf_key: the key given with --hf-key (mode 600; never uploaded)
 
 Digest = Tuple[int, str, Optional[str]]          # size, sha256, git blob id (files up to REGULAR_MAX)
 
@@ -93,6 +97,50 @@ def token(token_file: Optional[str]) -> Optional[str]:
 def hub(token_file: Optional[str]):
     from huggingface_hub import HfApi
     return HfApi(endpoint=ENDPOINT, token=token(token_file))
+
+
+def account(key: str) -> str:
+    """The Hugging Face account of ``key`` (the key checked)."""
+    from huggingface_hub import HfApi
+    try:
+        return HfApi(endpoint=ENDPOINT, token=key).whoami()["name"]
+    except Exception as e:
+        raise RuntimeError(f"--hf-key: Hugging Face does not take the key ({type(e).__name__}: "
+                           f"{str(e).replace(key, '***')[:300]})") from None
+
+
+def repo_name(line: str) -> str:
+    """The repository name of a line's backup: ``<line>-backup`` (letters, digits, '-', '_', '.')."""
+    s = re.sub(r"[-.]{2,}", "-", re.sub(r"[^A-Za-z0-9._-]+", "-", line)).strip("-.")
+    return f"{s or 'line'}-backup"
+
+
+def enable(run, key: str, owner: Optional[str] = None) -> C.RunConfig:
+    """``--hf-key KEY`` (nstrain new, run, restore): the line backs up with ``key``.  The key goes to
+    ``<run_dir>/backup/hf_key`` (mode 600), run.json's ``backup`` names that file and the line's repository: the one it
+    has, else ``<owner or the key's account>/<line>-backup``, public."""
+    key = key.strip()
+    if not key:
+        raise ValueError("--hf-key: no key given")
+    cfg = C.load(run)
+    if cfg.backup is not None:
+        repo, private = cfg.backup.repo, cfg.backup.private
+    else:
+        repo, private = f"{owner or account(key)}/{repo_name(cfg.name)}", False
+    d = cfg.run_dir / DIR
+    d.mkdir(exist_ok=True)
+    tmp = d / (KEY_FILE + ".tmp")
+    if tmp.exists():
+        tmp.unlink()
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(key + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, d / KEY_FILE)
+    cfg.backup = C.Backup(repo=repo, token_file=str(d / KEY_FILE), private=private)
+    C.save(cfg)
+    return cfg
 
 
 def _tree(api, repo: str, revision: str) -> dict:
@@ -247,7 +295,7 @@ def _readme(cfg: C.RunConfig) -> str:
             "configuration, the state of its data line, its held-out streams and its tokenizer.  Written by "
             "`nstrain backup` at every validation, each time replacing the content; `BACKUP.json` lists what it "
             "holds.  To continue the line on another host (the same paths free there):\n\n"
-            f"```\nnstrain restore {b.repo}\nnstrain run {cfg.run_dir}\n```\n")
+            f"```\nnstrain restore {b.repo} --hf-key <key>\nnstrain run {cfg.run_dir}\n```\n")
 
 
 def _stage(cfg: C.RunConfig, name: str, stage: Path) -> Tuple[Dict[str, Path], dict, dict]:
@@ -511,16 +559,18 @@ def _place(src: Path, dst: Path) -> None:
         os.replace(part, dst)
 
 
-def restore(repo: str, token_file: Optional[str] = None, revision: Optional[str] = None, say=_say,
-            **workers) -> dict:
-    """``nstrain restore REPO``: the line of a backup back at its paths (see the module documentation); returns
-    BACKUP.json.  ``workers``: dl_workers, tok_workers, rayon of the streams' re-creation."""
-    from huggingface_hub import hf_hub_download
-    api = hub(token_file)
+def restore(repo: str, key: Optional[str] = None, revision: Optional[str] = None, say=_say, **workers) -> dict:
+    """``nstrain restore REPO [--hf-key KEY]``: the line of a backup back at its paths (see the module documentation);
+    returns BACKUP.json.  ``key``: read with it (a private repository), and the line backs up with it (``enable``);
+    without it, ``nstrain run RUN --hf-key KEY`` gives the key back to the line.  ``workers``: dl_workers,
+    tok_workers, rayon of the streams' re-creation."""
+    from huggingface_hub import HfApi, hf_hub_download
+    key = key.strip() if key else None
+    api = HfApi(endpoint=ENDPOINT, token=key)
     sha = api.repo_info(repo, revision=revision).sha
     with tempfile.TemporaryDirectory() as t:
         rec = json.loads(Path(hf_hub_download(repo, "BACKUP.json", revision=sha, local_dir=t, endpoint=ENDPOINT,
-                                              token=token(token_file))).read_text())
+                                              token=key)).read_text())
     run_dir = Path(rec["run_dir"])
     if (run_dir / C.RUN_FILE).exists():
         raise FileExistsError(f"{run_dir} holds a line: a restore puts the line {rec['line']} back at the paths its "
@@ -546,6 +596,8 @@ def restore(repo: str, token_file: Optional[str] = None, revision: Optional[str]
         if q is not None and (p.startswith("run/") or not q.exists()):
             _place(tmp / p, q)
     shutil.rmtree(tmp)
+    if key:
+        enable(run_dir, key)
     say(f"the line is at {run_dir}, its data line at {rec['data_work']}; re-creating the open files' streams")
     from nstrain.data.work import Work
     w = Work(rec["data_work"])

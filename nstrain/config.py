@@ -46,10 +46,11 @@ produces lives next to it (checkpoints/, run.log, heartbeat, wandb_run.json, sup
      "print_every": 10,
      "wandb": {"project": "ns-pretrain", "entity": null, "retry_s": 7200,
                "key_file": null},               # a file with the line's W&B API key (null: the host's login)
-     "backup": {"repo": "<account>/<name>",   # a Hugging Face repository that holds what a resume needs, overwritten
-                "token_file": null,           # at every validation (nstrain.backup); token_file: a file with a write
-                "private": false}             # token (null: the host's login); private: the visibility given when the
-                                              # first upload creates the repository; null: no backup
+     "backup": {"repo": "<account>/<name>",   # set by --hf-key KEY (nstrain new / run): the Hugging Face repository
+                "token_file": null,           # that holds what a resume needs, overwritten at every validation
+                "private": false}             # (nstrain.backup); token_file: the file with the key (null: the host's
+                                              # login); private: the visibility given when the first upload creates
+                                              # the repository; null: no backup
     }
 
 Every key is checked (unknown keys are errors, also nested ones); the sections that only steer the process

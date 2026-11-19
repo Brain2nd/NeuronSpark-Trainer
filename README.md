@@ -126,7 +126,7 @@ fails.
 <run>/supervisor.json   supervisor state: pids, launches, failures, last event
 <run>/STOP              a stop request
 <run>/branches.json     the branches forked from this line
-<run>/backup/           the Hugging Face backup: what the repository holds (record.json), the uploads' log
+<run>/backup/           the Hugging Face backup: its key, what the repository holds, the uploads' log
 ```
 
 ## Usage
@@ -162,11 +162,10 @@ nstrain run runs/b1
 nstrain rollback runs/trunk --to 30000
 nstrain run runs/trunk
 
-# a backup on Hugging Face (see Backup): set with the line, or as run.json's "backup" section at any time
-nstrain new runs/trunk --model ns-2b --data /data/lines/trunk --peak-lr 3e-4 \
-    --backup-repo <account>/trunk-backup --backup-token-file /path/to/hf_token
+# a backup on Hugging Face (see Backup): a key turns it on, with `new` or `run`
+nstrain run runs/trunk --hf-key hf_...
 nstrain backup runs/trunk --latest          # the newest checkpoint now, before a planned move
-nstrain restore <account>/trunk-backup --token-file /path/to/hf_token      # on another host, at the same paths
+nstrain restore <account>/trunk-backup --hf-key hf_...     # on another host, at the same paths
 nstrain run runs/trunk
 
 # throughput of one shape (and its kernel-time breakdown with --profile)
@@ -234,10 +233,11 @@ start.  The schedule only grows at its end.
 
 ## Backup
 
-With `backup` in `run.json` (`{"repo": "<account>/<name>", "token_file": "/path/to/hf_token", "private": false}`, or
-`nstrain new ... --backup-repo`; it may be set while the line runs), the supervisor uploads what a resume needs to that
-Hugging Face repository at every validation (`validation.every_tokens`), each upload replacing the one before: the
-checkpoint written at the validation (weights, optimizer state, `trainer.json`), `run.json` and the line's other run
+A Hugging Face key turns it on: `nstrain new ... --hf-key KEY` or `nstrain run RUN --hf-key KEY` keeps the key in
+`<run>/backup/hf_key` (mode 600; never uploaded, never in `run.json`) and sets `run.json`'s `backup` to the repository
+`<the key's account>/<line>-backup` (public; created by the first upload).  From then on the supervisor uploads what a
+resume needs to that repository at every validation (`validation.every_tokens`), each upload replacing the one before:
+the checkpoint written at the validation (weights, optimizer state, `trainer.json`), `run.json` and the line's other run
 files, the data line's state (`state.json`, its progress, the cycles' manifests, the file listings), the held-out
 streams and the tokenizer.  Between two uploads only the checkpoint changes; a file the repository holds is not sent
 again.  The data line's streams are not uploaded: they are re-created from their pinned sources and checked against
@@ -251,15 +251,15 @@ commit, checked file by file after it; then the repository's history is squashed
 held before are deleted, so it holds one copy of one state.  A checkpoint that fails its hash check is not uploaded; a
 repository that holds another line's backup or files no backup wrote is refused.  A failed upload is started again
 after 60 s, doubling to 30 min; three failures in a row are an event.  `nstrain status` shows what the repository
-holds.  The token is sent to huggingface.co only.
+holds.  The key is sent to huggingface.co only.
 
 To continue the line on another host: the same environment (`nstrain restore` prints the library versions that
 differ: the data order depends on them), the line's paths free (its run directory, data line, held-out streams and
-tokenizer return to the paths they had), the Hugging Face token and the W&B key at the paths `run.json` names; then
-`nstrain restore <account>/<name> --token-file F` and `nstrain run RUN`.  `restore` downloads the repository at one
-commit, checks every file against `BACKUP.json`, puts each where it was and re-creates the data line's open streams
-(`nstrain data restore --work W` completes that step if it was cut off); the preparer rebuilds the cycle in training,
-and the trainer continues from the checkpoint: data position, optimizer state, W&B run.
+tokenizer return to the paths they had), the W&B key at the path `run.json` names; then `nstrain restore
+<account>/<name> --hf-key KEY` and `nstrain run RUN`.  `restore` downloads the repository at one commit, checks every
+file against `BACKUP.json`, puts each where it was, keeps the key for the line's backup and re-creates the data line's
+open streams (`nstrain data restore --work W` completes that step if it was cut off); the preparer rebuilds the cycle in
+training, and the trainer continues from the checkpoint: data position, optimizer state, W&B run.
 
 ## Disk space
 

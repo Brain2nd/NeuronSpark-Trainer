@@ -10,16 +10,17 @@
 
     nstrain new RUN --model ns-2b --data W [--val W] [--peak-lr ..] [--warmup-tokens ..] [--wandb-project ..]
                     [--wandb-key-file F] [--tokens-per-update N | '[{"from":0,"to":1e10,"tokens":393216},..]']
-                    [--weight-decay-batch N] [--ema-horizon-tokens N] [--backup-repo R [--backup-token-file F]]
+                    [--weight-decay-batch N] [--ema-horizon-tokens N] [--hf-key KEY]
     nstrain branch RUN --from PARENT_RUN --at-cycle K --plan decay:25e9,long:4e9 --data W_B [--cycle-tokens ..]
     nstrain check RUN          start checks without a GPU
-    nstrain run RUN [--foreground]   the line under supervision (trainer + data preparer), in the background
+    nstrain run RUN [--foreground] [--hf-key KEY]   the line under supervision (trainer + data preparer), in the
+                               background; --hf-key: its backup on Hugging Face from now on (nstrain.backup)
     nstrain train RUN          one trainer process (what the supervisor runs)
     nstrain status RUN [--json]
     nstrain stop RUN [--at-cycle-end K | --now]   nstrain rollback RUN --to UPDATE [--force]
     nstrain backup RUN [--latest]   the checkpoint due to the line's Hugging Face repository (what the supervisor
                                runs at every validation); --latest: the newest checkpoint
-    nstrain restore REPO [--token-file F] [--revision R]   a line back from its backup, at the same paths
+    nstrain restore REPO [--hf-key KEY] [--revision R]   a line back from its backup, at the same paths
     nstrain bench --model ns-2b --seq-len 4096 --rows 4 --accum 4 [--ac none|dendritic|all] [--profile]
     nstrain tune RUN [--margin-gib 10] [--dry-run] [--shared]   the fastest shape per length that fits the GPU (beside
                                                     other processes: --shared), into run.json
@@ -139,9 +140,7 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--shape-from", help="the preset whose run defaults a model-config file uses")
     p.add_argument("--wandb-project", default="ns-pretrain")
     p.add_argument("--wandb-key-file", help="a file with the line's W&B API key (default: the host's login)")
-    p.add_argument("--backup-repo", help="a Hugging Face repository \"<account>/<name>\" holding the checkpoint of "
-                                          "the line's last validation and what a resume needs (nstrain.backup)")
-    p.add_argument("--backup-token-file", help="a file with a token that may write it (default: the host's login)")
+    p.add_argument("--hf-key", help=HF_KEY_HELP)
     p = sub.add_parser("branch", help="a branch line from a parent's cycle end (data fork + run.json)")
     p.add_argument("run")
     p.add_argument("--from", dest="parent", required=True)
@@ -161,6 +160,7 @@ def _parser() -> argparse.ArgumentParser:
             p.add_argument("--foreground", action="store_true",
                            help="the supervisor in this terminal (its hangup stops the line); by default it runs in "
                                 "the background, independent of the login (output in <run>/supervisor.out)")
+            p.add_argument("--hf-key", help=HF_KEY_HELP)
     p = sub.add_parser("status")
     p.add_argument("run")
     p.add_argument("--json", action="store_true")
@@ -174,8 +174,7 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--latest", action="store_true", help="the newest checkpoint, whatever its validation interval")
     p = sub.add_parser("restore", help="a line back from its Hugging Face backup, at the paths it had")
     p.add_argument("repo")
-    p.add_argument("--token-file", help="a file with a token that may read the repository (default: the host's "
-                                        "login; none needed for a public one)")
+    p.add_argument("--hf-key", help="a Hugging Face key: to read a private repository; the line backs up with it")
     p.add_argument("--revision", help="a commit of the repository (default: its newest)")
     _workers(p)
     p = sub.add_parser("rollback", help="continue the line from an earlier checkpoint as a new W&B run")
@@ -325,6 +324,8 @@ def _data(a) -> int:
 
 
 OPERATOR_ERRORS = (ValueError, FileExistsError, FileNotFoundError, RuntimeError)
+HF_KEY_HELP = ("a Hugging Face key: the line backs up to <the key's account>/<line>-backup at every validation "
+               "(nstrain.backup; the key kept in <run>/backup/hf_key)")
 
 
 def main(argv=None) -> int:
@@ -351,6 +352,14 @@ def _dispatch(a) -> int:
         from nstrain.trainer import main as train
         return train(a.run)
     if a.cmd == "run":
+        if a.hf_key:
+            from nstrain import backup
+            try:
+                cfg = backup.enable(a.run, a.hf_key)
+            except OPERATOR_ERRORS as e:
+                print(f"nstrain run: {e}", file=sys.stderr)
+                return 2
+            print(f"backup: {cfg.backup.repo} at every validation (the key in {cfg.backup.token_file})")
         if a.foreground:
             from nstrain.supervise import run_line
             return run_line(a.run)
@@ -365,8 +374,9 @@ def _dispatch(a) -> int:
         from nstrain import ops
         cfg = ops.new(a.run, a.model, a.data, a.val, a.name, a.peak_lr, a.warmup_tokens, a.wandb_project,
                       a.tokens_per_update, a.shape_from, a.wandb_key_file, a.weight_decay_batch,
-                      a.ema_horizon_tokens, a.backup_repo, a.backup_token_file)
-        print(f"{cfg.run_dir / 'run.json'}: line {cfg.name}, model {a.model}, data {cfg.data_work}")
+                      a.ema_horizon_tokens, a.hf_key)
+        print(f"{cfg.run_dir / 'run.json'}: line {cfg.name}, model {a.model}, data {cfg.data_work}"
+              + (f"; backup {cfg.backup.repo}" if cfg.backup is not None else ""))
         return 0
     if a.cmd == "branch":
         from nstrain import ops
@@ -400,14 +410,15 @@ def _dispatch(a) -> int:
         return backup.run(a.run, a.latest)
     if a.cmd == "restore":
         from nstrain import backup
-        rec = backup.restore(a.repo, a.token_file, a.revision, **_kw(a))
+        rec = backup.restore(a.repo, a.hf_key, a.revision, **_kw(a))
         code = rec.get("code") or {}
         print(f"restored {rec['line']} at {rec['checkpoint']} ({rec['tokens'] / 1e9:.2f}B tokens): {rec['run_dir']}")
         print(f"the line trained with neuronspark {code.get('neuronspark')} and nstrain {code.get('nstrain')}, "
               f"python {rec.get('python')}")
         for x in backup.differences(rec):
             print(f"differs: {x}")
-        print(f"next: nstrain check {rec['run_dir']}; nstrain run {rec['run_dir']}")
+        print(f"next: nstrain check {rec['run_dir']}; nstrain run {rec['run_dir']}"
+              + ("" if a.hf_key else " --hf-key KEY  (the key of its backup)"))
         return 0
     if a.cmd == "bench":
         import signal

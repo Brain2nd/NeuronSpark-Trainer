@@ -79,7 +79,8 @@ def preflight(cfg: C.RunConfig) -> List[str]:
             if not Path(cfg.backup.token_file).read_text().strip():
                 problems.append(f"backup.token_file {cfg.backup.token_file} is empty")
         except OSError as e:
-            problems.append(f"backup.token_file {cfg.backup.token_file} cannot be read: {e}")
+            problems.append(f"backup.token_file {cfg.backup.token_file} cannot be read: {e} (the line's Hugging "
+                            "Face key: nstrain run RUN --hf-key KEY)")
     if cfg.backup is not None:
         import huggingface_hub
         lack = [m for m in ("super_squash_history", "list_lfs_files", "permanently_delete_lfs_files")
