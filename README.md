@@ -238,18 +238,21 @@ A Hugging Face key turns it on: `nstrain new ... --hf-key KEY` or `nstrain run R
 `<the key's account>/<line>-backup` (public; created by the first upload).  From then on the supervisor uploads what a
 resume needs to that repository at every validation (`validation.every_tokens`), each upload replacing the one before:
 the checkpoint written at the validation (weights, optimizer state, `trainer.json`), `run.json` and the line's other run
-files, the data line's state (`state.json`, its progress, the cycles' manifests, the file listings), the held-out
-streams and the tokenizer.  Between two uploads only the checkpoint changes; a file the repository holds is not sent
-again.  The data line's streams are not uploaded: they are re-created from their pinned sources and checked against
-their hashes.  Also uploaded: the checkpoint a rollback goes back to, the newest one while the repository holds nothing
-of the line, and the held checkpoint's `trainer.json` when it is marked kept afterwards.  `nstrain backup RUN --latest`
-uploads the newest checkpoint at once (before a planned move).
+files, the data line's state (`state.json`, its progress, the cycles' manifests, the file listings) and its streams
+(the prepared cycles' and the open files'), the held-out streams and the tokenizer: what the line reads when it
+continues on its own host.  A file the repository holds is not sent again (between two uploads: the checkpoint, and a
+new cycle's streams once); a stream that is one file under two names (a cycle's hard link to an open file) is sent once.
+Also uploaded: the checkpoint a rollback goes back to, the newest one while the repository holds nothing of the line,
+and the held checkpoint's `trainer.json` when it is marked kept afterwards.  `nstrain backup RUN --latest` uploads the
+newest checkpoint at once (before a planned move).
 
 An upload runs in a process of its own beside the trainer (`nice`; `<run>/backup/upload.log`) and goes on after the
 supervisor ends (under a systemd service, the service's end may stop it: the next start uploads it).  It is one
-commit, checked file by file after it; then the repository's history is squashed and the files of the checkpoint it
-held before are deleted, so it holds one copy of one state.  A checkpoint that fails its hash check is not uploaded; a
-repository that holds another line's backup or files no backup wrote is refused.  A failed upload is started again
+commit, checked file by file after it; then the repository's history is squashed and the files it held before and
+no longer holds (the checkpoint before, the streams of released cycles) are deleted, so it holds one copy of one state.
+A checkpoint that fails its hash check is not uploaded; a repository that holds another line's backup or files no
+backup wrote is refused.  A request to the Hub that gets no byte for 10 min fails (the client sets no timeout of its
+own: a stalled connection would hold the upload, and every later one, for good).  A failed upload is started again
 after 60 s, doubling to 30 min; three failures in a row are an event.  `nstrain status` shows what the repository
 holds.  The key is sent to huggingface.co only.
 
@@ -257,9 +260,8 @@ To continue the line on another host: the same environment (`nstrain restore` pr
 differ: the data order depends on them), the line's paths free (its run directory, data line, held-out streams and
 tokenizer return to the paths they had), the W&B key at the path `run.json` names; then `nstrain restore
 <account>/<name> --hf-key KEY` and `nstrain run RUN`.  `restore` downloads the repository at one commit, checks every
-file against `BACKUP.json`, puts each where it was, keeps the key for the line's backup and re-creates the data line's
-open streams (`nstrain data restore --work W` completes that step if it was cut off); the preparer rebuilds the cycle in
-training, and the trainer continues from the checkpoint: data position, optimizer state, W&B run.
+file against `BACKUP.json`, puts each where it was (the hard links too) and keeps the key for the line's backup; the
+trainer continues from the checkpoint as on its own host: data position, optimizer state, W&B run.
 
 ## Disk space
 

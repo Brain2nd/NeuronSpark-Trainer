@@ -10,33 +10,38 @@ at the validation (the trainer writes both at the update that reaches it); the c
 checkpoint the repository holds is sent again when its trainer.json changed (marked kept).  ``nstrain backup RUN
 --latest`` sends the newest checkpoint whatever its interval (before a planned move of the line).  An upload replaces
 the repository's content in one commit, so the repository always holds one whole state; its history is then squashed and
-the stored files it no longer references (the checkpoint it held before) are deleted, so it holds one copy.  A file the
-repository already holds is not sent again.  The repository::
+the stored files it no longer references (the checkpoint it held before, the streams of released cycles) are deleted,
+so it holds one copy.  A file the repository already holds is not sent again.  The repository::
 
     BACKUP.json                     what it holds: line, checkpoint, update, tokens, time; run_dir, data_work, val_work
                                     and the tokenizer (the paths a resume needs); code and library versions; every
-                                    file's size and sha256
+                                    file's size and sha256; ``links``: the names of a file held under another name
+                                    (on the host one file: a cycle's stream is a hard link to the open file's)
     README.md
     run/run.json, run/wandb_run.json, run/branches.json, run/rollback.json        (those the line has)
     run/checkpoints/latest, run/checkpoints/u<N>/{model,optimizer}.safetensors, trainer.json
     data/state.json, data/progress.json, data/manifests/*.json, data/listings/*.json      the data line's state
+    data/pool/<source>/*            the open files' streams and their metas
+    data/cycles/cycle_<K>/...       every prepared cycle's streams, their metas and its manifest.json
     val/<source>/...                the held-out streams (val_work)
     tokenizer/<file>                the tokenizer of the data line
 
-The data line's streams (cycles/, pool/: hundreds of GB) are not in it: every stream is re-created from its pinned
-provenance and checked against its blake2b -- the open files' streams by ``nstrain restore``, the cycles by the
-preparer, from their permanent manifests, when the trainer needs them.  ``data/progress.json`` holds the checkpoint's
-cycle (what the trainer marks when it resumes).
+That is what the line reads when it continues on its own host: the trainer the checkpoint and the cycles from its
+position on, the preparer the state, the open files and the listings for the cycles after them.  A cycle the trainer
+finished and released before the upload read the state (the trainer goes on during an upload) is not in it: the
+preparer rebuilds it from its permanent manifest when the trainer needs it, as after a rollback.
+``data/progress.json`` holds the checkpoint's cycle (what the trainer marks when it resumes).
 
 Before a commit the checkpoint's files are checked against their blake2b (a damaged checkpoint never replaces the
 repository's), after it every file the repository holds against the upload (sha256 of a stored file, git blob id of a
 small one).  A repository that holds another line's backup, or files no backup wrote, is refused: an upload replaces
 a repository's whole content.  The key goes to huggingface.co only (``ENDPOINT``; a download mirror set in
-``HF_ENDPOINT`` never sees it) and is never printed; it is written only to ``hf_key``.
+``HF_ENDPOINT`` never sees it) and is never printed; it is written only to ``hf_key``.  Every request has a timeout
+(nstrain.data.hf.hub_timeouts): one that stalls fails the upload, which the supervisor starts again.
 
 ``nstrain restore REPO --hf-key KEY`` puts a line back on another host at the same absolute paths (the checkpoints and
-the data state name them; they must be free there), checks every file against BACKUP.json, re-creates the open files'
-streams and keeps the key for the line's backup; then ``nstrain run RUN``.
+the data state name them; they must be free there): every file checked against BACKUP.json and put where it was, the
+hard links made again, the key kept for the line's backup; then ``nstrain run RUN``.
 
 In ``<run_dir>/backup/``: ``hf_key``, ``record.json`` (what the repository holds, written after each upload), ``lock``
 (one upload at a time), ``upload.log``, ``hashes.json`` (the sha256 of the files sent, by inode, size and time: a file
@@ -61,6 +66,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from nstrain import config as C
+from nstrain.data.hf import hub_timeouts
 from nstrain.data.work import _write_atomic
 
 ENDPOINT = "https://huggingface.co"
@@ -69,7 +75,8 @@ RUN_FILES = ("run.json", "wandb_run.json", "branches.json", "rollback.json")
 TEMPORARY = ("*.bin.part*", "*.bin.raw*", "*.json.tmp*")     # a crashed writer's files (nstrain.data.work)
 REGULAR_MAX = 10 << 20          # larger files are stored files (LFS) on the Hub; a smaller one may be a regular one
 LIBRARIES = ("torch", "triton", "numpy", "tokenizers", "safetensors", "pyarrow", "wandb", "huggingface_hub", "hf_xet")
-FORMAT = 1
+FORMAT = 2                      # 2: the data line's streams in the repository
+STAGE_TRIES = 5                 # readings of the data state whose streams were released meanwhile, at most
 KEY_FILE = "hf_key"             # <run_dir>/backup/hf_key: the key given with --hf-key (mode 600; never uploaded)
 
 Digest = Tuple[int, str, Optional[str]]          # size, sha256, git blob id (files up to REGULAR_MAX)
@@ -94,16 +101,21 @@ def token(token_file: Optional[str]) -> Optional[str]:
     return t
 
 
-def hub(token_file: Optional[str]):
+def _client(key: Optional[str]):
+    """The backup's Hugging Face client: huggingface.co with ``key``, every request under a timeout."""
     from huggingface_hub import HfApi
-    return HfApi(endpoint=ENDPOINT, token=token(token_file))
+    hub_timeouts()
+    return HfApi(endpoint=ENDPOINT, token=key)
+
+
+def hub(token_file: Optional[str]):
+    return _client(token(token_file))
 
 
 def account(key: str) -> str:
     """The Hugging Face account of ``key`` (the key checked)."""
-    from huggingface_hub import HfApi
     try:
-        return HfApi(endpoint=ENDPOINT, token=key).whoami()["name"]
+        return _client(key).whoami()["name"]
     except Exception as e:
         raise RuntimeError(f"--hf-key: Hugging Face does not take the key ({type(e).__name__}: "
                            f"{str(e).replace(key, '***')[:300]})") from None
@@ -138,8 +150,10 @@ def enable(run, key: str, owner: Optional[str] = None) -> C.RunConfig:
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp, d / KEY_FILE)
-    cfg.backup = C.Backup(repo=repo, token_file=str(d / KEY_FILE), private=private)
-    C.save(cfg)
+    new = C.Backup(repo=repo, token_file=str(d / KEY_FILE), private=private)
+    if cfg.backup != new:                                            # (a restored line's run.json stays as it was)
+        cfg.backup = new
+        C.save(cfg)
     return cfg
 
 
@@ -292,18 +306,72 @@ def _copy(src: Path, dst: Path) -> None:
 def _readme(cfg: C.RunConfig) -> str:
     b = cfg.backup
     return (f"# {cfg.name}\n\nA checkpoint of the training line `{cfg.name}` and what continuing it needs: its "
-            "configuration, the state of its data line, its held-out streams and its tokenizer.  Written by "
+            "configuration, its data line (state and streams), its held-out streams and its tokenizer.  Written by "
             "`nstrain backup` at every validation, each time replacing the content; `BACKUP.json` lists what it "
             "holds.  To continue the line on another host (the same paths free there):\n\n"
             f"```\nnstrain restore {b.repo} --hf-key <key>\nnstrain run {cfg.run_dir}\n```\n")
 
 
-def _stage(cfg: C.RunConfig, name: str, stage: Path) -> Tuple[Dict[str, Path], dict, dict]:
+def _streams(work: Path, st: dict) -> Tuple[List[str], List[str]]:
+    """The streams the data line in state ``st`` reads (paths in the data line): every open file's and every prepared
+    cycle's (named by its permanent manifest); and what goes with them where present: each stream's meta, each
+    prepared cycle's manifest.json."""
+    bins, cycles = {p["bin"] for ps in st["pool"].values() for p in ps}, []
+    for k, v in st["cycles"].items():
+        if v["status"] == "prepared":
+            man = json.loads((work / "manifests" / f"cycle_{int(k):05d}.json").read_text())
+            bins |= {p["bin"] for ps in man["sources"].values() for p in ps}
+            cycles.append(int(k))
+    names = []
+    for b in sorted(bins):
+        try:
+            names.append(Path(b).relative_to(work).as_posix())
+        except ValueError:
+            raise RuntimeError(f"{b}: a stream outside the data line {work}") from None
+    extra = [n[:-len(".bin")] + ".json" for n in names if n.endswith(".bin")]
+    return names, extra + [f"cycles/cycle_{k:05d}/manifest.json" for k in sorted(cycles)]
+
+
+def _data_state(work: Path, stage: Path) -> Tuple[dict, Dict[str, Path]]:
+    """The data line's state (copied into ``stage``) and its streams (``_streams``) as {path in the data line: local
+    file}: hard-linked into ``stage`` (the preparer may release them during the upload: the link keeps the bytes), or
+    read where they are (another filesystem).  A stream the state names that is gone (released after the state was
+    read): the state is read again."""
+    for _ in range(STAGE_TRIES):
+        for sub in ("pool", "cycles"):
+            shutil.rmtree(stage / "data" / sub, ignore_errors=True)
+        _copy(work / "state.json", stage / "data/state.json")
+        st = json.loads((stage / "data/state.json").read_text())
+        names, extra = _streams(work, st)
+        out, gone = {}, []
+        for n in names + extra:
+            src, dst = work / n, stage / "data" / n
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                os.link(src, dst)
+                out[n] = dst
+            except FileNotFoundError:
+                if n in names:
+                    gone.append(n)
+            except OSError as e:
+                if e.errno != errno.EXDEV:
+                    raise
+                if src.exists():
+                    out[n] = src
+                elif n in names:
+                    gone.append(n)
+        if not gone:
+            return st, out
+    raise RuntimeError(f"{work}: streams its state names were gone {STAGE_TRIES} times ({', '.join(gone[:3])})")
+
+
+def _stage(cfg: C.RunConfig, name: str, stage: Path) -> Tuple[Dict[str, Path], dict, dict, Dict[str, str]]:
     """{path in the repository: local file} of an upload of checkpoint ``name``, its trainer.json, the data line's
-    state.  Copied into ``stage``: what is rewritten while the line runs (trainer.json, the run's files, state.json --
-    first: it names only manifests already written); hard-linked: the checkpoint's tensors (retention may remove the
-    checkpoint meanwhile, the link keeps the bytes); read where they are: files written once (manifests, listings,
-    held-out streams, the tokenizer)."""
+    state, the links ({path: the path of the same file}: a stream under several names, uploaded once).  Copied into
+    ``stage``: what is rewritten while the line runs (trainer.json, the run's files, state.json -- first: it names only
+    manifests already written); hard-linked: the checkpoint's tensors (retention may remove the checkpoint meanwhile,
+    the link keeps the bytes) and the data line's streams (``_data_state``); read where they are: files written once
+    (manifests, listings, held-out streams, the tokenizer)."""
     if stage.exists():
         shutil.rmtree(stage)
     stage.mkdir(parents=True)
@@ -332,14 +400,22 @@ def _stage(cfg: C.RunConfig, name: str, stage: Path) -> Tuple[Dict[str, Path], d
             _copy(cfg.run_dir / f, stage / "run" / f)
             files[f"run/{f}"] = stage / "run" / f
     work = Path(cfg.data_work)
-    _copy(work / "state.json", stage / "data/state.json")
-    st = json.loads((stage / "data/state.json").read_text())
+    st, streams = _data_state(work, stage)
     files["data/state.json"] = stage / "data/state.json"
     (stage / "data/progress.json").write_text(json.dumps({"cycle": int(meta["data"]["cycle"]), "done": False}))
     files["data/progress.json"] = stage / "data/progress.json"
     for sub in ("manifests", "listings"):
         if (work / sub).is_dir():
             files.update({f"data/{sub}/{p.name}": p for p in sorted((work / sub).glob("*.json"))})
+    same: Dict[Tuple[int, int], List[str]] = {}                      # the names of one file (hard links)
+    for n, p in streams.items():
+        s = os.stat(p)
+        same.setdefault((s.st_dev, s.st_ino), []).append(n)
+    links = {}
+    for ns in same.values():
+        ns.sort(key=lambda n: (not n.startswith("pool/"), n))        # an open file's name: it stays the longest
+        files[f"data/{ns[0]}"] = streams[ns[0]]
+        links.update({f"data/{n}": f"data/{ns[0]}" for n in ns[1:]})
     val = Path(cfg.val_work) / "val"
     if val.is_dir():
         files.update({f"val/{p.relative_to(val).as_posix()}": p for p in sorted(val.rglob("*"))
@@ -348,7 +424,7 @@ def _stage(cfg: C.RunConfig, name: str, stage: Path) -> Tuple[Dict[str, Path], d
     files[f"tokenizer/{tok.name}"] = tok
     (stage / "README.md").write_text(_readme(cfg))
     files["README.md"] = stage / "README.md"
-    return files, meta, st
+    return files, meta, st, links
 
 
 def _check_owner(cfg: C.RunConfig, revision: str, remote: dict, stage: Path) -> None:
@@ -393,7 +469,7 @@ def upload(cfg: C.RunConfig, name: str, say=_say) -> dict:
     b, d = cfg.backup, cfg.run_dir / DIR
     stage, t0 = d / "stage", time.time()
     try:
-        files, meta, st = _stage(cfg, name, stage)
+        files, meta, st, links = _stage(cfg, name, stage)
         api = hub(b.token_file)
         api.create_repo(b.repo, private=b.private, exist_ok=True)
         head = api.repo_info(b.repo).sha
@@ -418,7 +494,8 @@ def upload(cfg: C.RunConfig, name: str, say=_say) -> dict:
                "tokenizer": {"path": st["tokenizer"], "sha256": st["tokenizer_sha256"],
                              "tokenizers": st["tokenizers_version"]},
                "code": meta.get("code"), "python": platform.python_version(), "libraries": _versions(),
-               "files": {p: {"size": s, "sha256": h} for p, (s, h, _) in sorted(digests.items())}}
+               "files": {p: {"size": s, "sha256": h} for p, (s, h, _) in sorted(digests.items())},
+               "links": dict(sorted(links.items()))}
         body = (json.dumps(rec, indent=1) + "\n").encode()
         ops.append(CommitOperationAdd(path_in_repo="BACKUP.json", path_or_fileobj=body))
         keep = set(digests) | {"BACKUP.json", ".gitattributes"}
@@ -536,13 +613,16 @@ def _destination(path: str, rec: dict) -> Optional[Path]:
 
 
 def _order(path: str) -> int:
-    """Placing order: the held-out streams and the tokenizer, the data line (state.json last), the checkpoint, its
-    `latest`, the run's files, run.json last (a run directory without run.json is a restore not finished)."""
-    for i, p in enumerate(("val/", "tokenizer/", "data/manifests/", "data/listings/", "data/progress.json",
-                           "data/state.json", "run/checkpoints/u", "run/checkpoints/latest")):
-        if path.startswith(p):
+    """Placing order: the held-out streams and the tokenizer; the data line: its streams, the cycles' manifest.json
+    (a cycle is visible once its streams are in place), its manifests, listings, progress, state.json; the checkpoint,
+    its `latest`, the run's files, run.json last (a run directory without run.json is a restore not finished)."""
+    if path.startswith("data/cycles/") and path.endswith("/manifest.json"):
+        return 4
+    for i, p in enumerate(("val/", "tokenizer/", "data/pool/", "data/cycles/", "", "data/manifests/", "data/listings/",
+                           "data/progress.json", "data/state.json", "run/checkpoints/u", "run/checkpoints/latest")):
+        if p and path.startswith(p):
             return i
-    return 9 if path == "run/run.json" else 8
+    return 12 if path == "run/run.json" else 11
 
 
 def _place(src: Path, dst: Path) -> None:
@@ -559,56 +639,64 @@ def _place(src: Path, dst: Path) -> None:
         os.replace(part, dst)
 
 
-def restore(repo: str, key: Optional[str] = None, revision: Optional[str] = None, say=_say, **workers) -> dict:
+def restore(repo: str, key: Optional[str] = None, revision: Optional[str] = None, say=_say) -> dict:
     """``nstrain restore REPO [--hf-key KEY]``: the line of a backup back at its paths (see the module documentation);
     returns BACKUP.json.  ``key``: read with it (a private repository), and the line backs up with it (``enable``);
-    without it, ``nstrain run RUN --hf-key KEY`` gives the key back to the line.  ``workers``: dl_workers,
-    tok_workers, rayon of the streams' re-creation."""
-    from huggingface_hub import HfApi, hf_hub_download
+    without it, ``nstrain run RUN --hf-key KEY`` gives the key back to the line."""
+    from huggingface_hub import hf_hub_download
     key = key.strip() if key else None
-    api = HfApi(endpoint=ENDPOINT, token=key)
+    api = _client(key)
     sha = api.repo_info(repo, revision=revision).sha
     with tempfile.TemporaryDirectory() as t:
         rec = json.loads(Path(hf_hub_download(repo, "BACKUP.json", revision=sha, local_dir=t, endpoint=ENDPOINT,
                                               token=key)).read_text())
+    if rec.get("format") != FORMAT:
+        raise RuntimeError(f"{repo}: a backup of format {rec.get('format')}; this nstrain restores format {FORMAT} "
+                           "(with the data line's streams)")
     run_dir = Path(rec["run_dir"])
     if (run_dir / C.RUN_FILE).exists():
         raise FileExistsError(f"{run_dir} holds a line: a restore puts the line {rec['line']} back at the paths its "
                               "checkpoints and data state name, into a run directory without run.json")
-    dest = {p: _destination(p, rec) for p in rec["files"]}
+    links = rec["links"]
+    held = dict(rec["files"], **{p: rec["files"][t] for p, t in links.items()})   # what each path holds
+    dest = {p: _destination(p, rec) for p in held}
     clash = [str(q) for p, q in dest.items() if q is not None and not p.startswith("run/") and q.exists()
-             and (q.stat().st_size != rec["files"][p]["size"] or _sha256(q) != rec["files"][p]["sha256"])]
+             and (q.stat().st_size != held[p]["size"] or _sha256(q) != held[p]["sha256"])]
     if clash:
         raise FileExistsError(f"{len(clash)} files of the backup exist here with other contents ({', '.join(clash[:5])}"
                               f"{' ...' if len(clash) > 5 else ''}): another data line?  Move them away and restore "
                               "again")
-    tmp = run_dir.parent / f".{run_dir.name}.restore"
-    tmp.mkdir(parents=True, exist_ok=True)
+    work = Path(rec["data_work"])                                   # downloaded beside where they go (renamed there)
+    tmps = {"data/": work.parent / f".{work.name}.restore", "": run_dir.parent / f".{run_dir.name}.restore"}
     say(f"{repo} at {sha[:12]}: line {rec['line']}, {rec['checkpoint']} ({rec['tokens'] / 1e9:.2f}B tokens, "
-        f"{rec['time']}); downloading {sum(f['size'] for f in rec['files'].values()) / 1e9:.2f} GB into {tmp}")
-    api.snapshot_download(repo, revision=sha, local_dir=tmp)
+        f"{rec['time']}); downloading {sum(f['size'] for f in rec['files'].values()) / 1e9:.2f} GB")
+    for prefix, tmp in tmps.items():
+        tmp.mkdir(parents=True, exist_ok=True)
+        if prefix:
+            api.snapshot_download(repo, revision=sha, local_dir=tmp, allow_patterns=[f"{prefix}*"])
+        else:
+            api.snapshot_download(repo, revision=sha, local_dir=tmp, ignore_patterns=["data/*"])
+
+    def got(p: str) -> Path:
+        return tmps["data/" if p.startswith("data/") else ""] / p
     for p, f in rec["files"].items():
-        q = tmp / p
+        q = got(p)
         if not q.is_file() or q.stat().st_size != f["size"] or _sha256(q) != f["sha256"]:
             raise RuntimeError(f"{p}: the download differs from BACKUP.json")
-    for p in sorted(rec["files"], key=lambda p: (_order(p), p)):
+    for p in sorted(held, key=lambda p: (_order(p), p in links, p)):    # a link after the file it names
         q = dest[p]
-        if q is not None and (p.startswith("run/") or not q.exists()):
-            _place(tmp / p, q)
-    shutil.rmtree(tmp)
+        if q is None or (q.exists() and not p.startswith("run/")):
+            continue
+        if p in links:
+            q.parent.mkdir(parents=True, exist_ok=True)
+            os.link(dest[links[p]], q)
+        else:
+            _place(got(p), q)
+    for tmp in tmps.values():
+        shutil.rmtree(tmp)
     if key:
         enable(run_dir, key)
-    say(f"the line is at {run_dir}, its data line at {rec['data_work']}; re-creating the open files' streams")
-    from nstrain.data.work import Work
-    w = Work(rec["data_work"])
-    try:
-        with w.lock():
-            got = w.restore_streams(**workers)
-    except Exception as e:
-        raise RuntimeError(f"the line's files are in place, its data line's open streams are not: {e}  (once this is "
-                           f"solved: nstrain data restore --work {rec['data_work']})") from e
-    say(f"{len(got['pool'])} open streams re-created, cycles {got['released'] or 'none'} set back to released (the "
-        "preparer rebuilds them)")
+    say(f"the line is at {run_dir}, its data line at {rec['data_work']}")
     return rec
 
 

@@ -52,8 +52,7 @@ Determinism: every input is pinned -- dataset revisions (commit sha), the strata
 (``doc_seed`` from the line's seed, source, path and epoch), the tokenizer file (sha256) and library version.  A
 cycle's manifest lists, per source, pieces {bin, start, count, stratum} with their provenance (repo, path, revision,
 epoch, doc_seed, tokens, blake2b of the whole stream); ``rebuild`` re-creates a released cycle from its permanent
-manifest and checks every blake2b; ``restore_streams`` re-creates the open files' streams of a state that came back
-from a backup without them (nstrain.backup).
+manifest and checks every blake2b.
 """
 from __future__ import annotations
 
@@ -957,51 +956,3 @@ class Work:
         self.save(st)
         _write_atomic(cdir / "manifest.json", text)
         return man
-
-    def restore_streams(self, dl_workers: int = 8, tok_workers: int = 8, rayon: int = 8) -> dict:
-        """The streams of a data line whose state came back from a backup (nstrain.backup), which holds no stream:
-        the open files' streams re-created from their provenance (the same documents in the same order: each
-        blake2b is checked), and every prepared cycle with a stream missing set back to released, so the preparer
-        rebuilds it from its manifest when the trainer needs it.  Streams already here and whole are kept; running it
-        again completes an interrupted one.  The caller holds the lock.  Returns {"pool": the streams re-created,
-        "released": the cycles set back}."""
-        st = self.load()
-        hold = self.root / "pool"
-        if hold.exists():
-            for f in _temporaries(hold):
-                f.unlink()                                           # writers of an interrupted re-creation
-        jobs, made, seen = [], [], set()
-        for s, ps in st["pool"].items():
-            for p in ps:
-                b = Path(p["bin"])
-                if (s, p["path"], p["epoch"]) in seen:
-                    continue
-                seen.add((s, p["path"], p["epoch"]))
-                if b.exists():
-                    if _blake2b_file(str(b)) == p["blake2b"]:
-                        continue
-                    b.unlink()                                       # not this stream: re-created
-                jobs.append((s, {"path": p["path"], "epoch": p["epoch"], "stratum": p["stratum"]}, b.parent))
-                made.append(str(b))
-        got = self._fetch(st, jobs, dl_workers, tok_workers, rayon) if jobs else {}
-        for s, ps in st["pool"].items():
-            for p in ps:
-                m = got.get((s, p["path"], p["epoch"]))
-                if m is not None and (m["blake2b"] != p["blake2b"] or Path(m["bin"]) != Path(p["bin"])):
-                    raise RuntimeError(f"re-created {s} {p['path']} (epoch {p['epoch']}) differs from the line's "
-                                       f"stream: {m['bin']} blake2b {m['blake2b']}, the line has {p['bin']} "
-                                       f"{p['blake2b']}")
-        released = []
-        for k, v in sorted(st["cycles"].items(), key=lambda kv: int(kv[0])):
-            if v["status"] != "prepared":
-                continue
-            man = json.loads((self.root / "manifests" / f"cycle_{int(k):05d}.json").read_text())
-            if all(Path(p["bin"]).exists() for ps in man["sources"].values() for p in ps):
-                continue
-            m = self.cycle_dir(int(k)) / "manifest.json"                # (the trainer would read missing streams)
-            if m.exists():
-                m.unlink()
-            v["status"] = "released"
-            released.append(int(k))
-        self.save(st)
-        return {"pool": made, "released": released}

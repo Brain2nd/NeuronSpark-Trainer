@@ -6,7 +6,6 @@
     nstrain data fork --work B --from TRUNK --at-cycle K --plan decay:25e9,long:4e9 --line b1 [--cycle-tokens C]
     nstrain data {plan,status} --work W                         nstrain data loop --work W   (one preparer process)
     nstrain data run-preparer --work W [--foreground]   the preparer under supervision (no trainer), in the background
-    nstrain data restore --work W   re-create the open files' streams of a data line restored from a backup
 
     nstrain new RUN --model ns-2b --data W [--val W] [--peak-lr ..] [--warmup-tokens ..] [--wandb-project ..]
                     [--wandb-key-file F] [--tokens-per-update N | '[{"from":0,"to":1e10,"tokens":393216},..]']
@@ -107,9 +106,6 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--cycles", type=int, default=30)
     p = ds.add_parser("status")
     p.add_argument("--work", required=True)
-    p = ds.add_parser("restore", help="re-create the open files' streams of a data line restored from a backup")
-    p.add_argument("--work", required=True)
-    _workers(p)
     for name in ("loop", "run-preparer"):
         p = ds.add_parser(name)
         p.add_argument("--work", required=True)
@@ -176,7 +172,6 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("repo")
     p.add_argument("--hf-key", help="a Hugging Face key: to read a private repository; the line backs up with it")
     p.add_argument("--revision", help="a commit of the repository (default: its newest)")
-    _workers(p)
     p = sub.add_parser("rollback", help="continue the line from an earlier checkpoint as a new W&B run")
     p.add_argument("run")
     p.add_argument("--to", type=int, required=True)
@@ -271,11 +266,7 @@ def _data(a) -> int:
         print({k: round(v, 3) for k, v in st["bytes_per_token"].items()})
         return 0
     with w.lock():                                                   # the writers of state.json: one at a time
-        if a.dcmd == "restore":
-            got = w.restore_streams(**_kw(a))
-            print(f"{len(got['pool'])} open streams re-created, cycles {got['released'] or 'none'} set back to "
-                  "released (the preparer rebuilds them)")
-        elif a.dcmd == "init":
+        if a.dcmd == "init":
             tok = a.tokenizer or host.get("tokenizer")
             if not tok:
                 raise SystemExit("--tokenizer (or \"tokenizer\" in the host settings)")
@@ -410,7 +401,7 @@ def _dispatch(a) -> int:
         return backup.run(a.run, a.latest)
     if a.cmd == "restore":
         from nstrain import backup
-        rec = backup.restore(a.repo, a.hf_key, a.revision, **_kw(a))
+        rec = backup.restore(a.repo, a.hf_key, a.revision)
         code = rec.get("code") or {}
         print(f"restored {rec['line']} at {rec['checkpoint']} ({rec['tokens'] / 1e9:.2f}B tokens): {rec['run_dir']}")
         print(f"the line trained with neuronspark {code.get('neuronspark')} and nstrain {code.get('nstrain')}, "

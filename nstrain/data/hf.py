@@ -1,7 +1,8 @@
 """Hugging Face side: pinned revisions, the file listing of a source at its revision (cached), the source's strata
 (its subdirectories: languages, crawl dumps, L3 sub-types ...; or its files, ``file_strata``), the order of a
 stratum's files (fixed shuffle per epoch), and single-file downloads at the pinned revision.  Validation data are
-held-out documents of the files (nstrain.data.tokenize.held), not held-out files."""
+held-out documents of the files (nstrain.data.tokenize.held), not held-out files.  Every request to the Hub has a
+timeout (``hub_timeouts``; nstrain.backup's too)."""
 from __future__ import annotations
 
 import json
@@ -15,11 +16,49 @@ from typing import Dict, List
 from nstrain.data.sources import Source
 
 DATA_EXT = (".parquet", ".jsonl")
+TIMEOUT = (60.0, 600.0)                 # s: to connect; then the longest wait for a byte
+
+
+def hub_timeouts() -> None:
+    """``TIMEOUT`` for every request of huggingface_hub in this process that sets none.  Its API calls (listings,
+    repository info, commits) set none, and a connection that stalls then waits for good: a preparer's listing, or an
+    upload of the line's backup and every later one behind its lock, would never end.  With it the request fails and
+    the caller's retry takes over.  huggingface_hub 0.x: a requests session per thread; 1.x on: one httpx client."""
+    import huggingface_hub as hh
+    s = hh.get_session()
+    if hasattr(s, "get_adapter"):                                    # requests
+        base = type(s.get_adapter("https://huggingface.co"))         # the library's adapter (its request ids)
+        if getattr(base, "default_timeout", None) == TIMEOUT:
+            return
+        import requests
+
+        class Timed(base):
+            default_timeout = TIMEOUT
+
+            def send(self, request, *args, **kw):
+                if kw.get("timeout") is None:
+                    kw["timeout"] = TIMEOUT
+                return super().send(request, *args, **kw)
+
+        def session():
+            r = requests.Session()
+            r.mount("http://", Timed())
+            r.mount("https://", Timed())
+            return r
+
+        hh.configure_http_backend(backend_factory=session)
+    elif hasattr(s, "timeout"):                                      # httpx: the client's default for every request
+        if s.timeout.read is None:
+            s.timeout = type(s.timeout)(connect=TIMEOUT[0], read=TIMEOUT[1], write=TIMEOUT[1], pool=TIMEOUT[0])
+    else:
+        raise RuntimeError(f"huggingface_hub {hh.__version__}: its HTTP client ({type(s).__module__}."
+                           f"{type(s).__name__}) is one nstrain cannot give a timeout")
 
 
 def pin(repo: str) -> str:
     """The dataset repository's current commit sha (the run then reads only this revision)."""
     from huggingface_hub import HfApi
+    hub_timeouts()
     return HfApi().dataset_info(repo).sha
 
 
@@ -30,6 +69,7 @@ def list_files(src: Source, cache_dir: Path, revision: str) -> List[Dict]:
     if cache.exists():
         return json.loads(cache.read_text())
     from huggingface_hub import HfApi
+    hub_timeouts()
     files = []
     for e in HfApi().list_repo_tree(src.repo, repo_type="dataset", path_in_repo=src.prefix, recursive=True,
                                     revision=revision):
@@ -101,6 +141,7 @@ def download(src: Source, path: str, dest_dir: Path, revision: str, retries: int
     """One file at ``revision`` into ``dest_dir`` (HF_ENDPOINT honoured); retried with back-off.  ``stop`` (a
     threading.Event): set, no further try starts (a try under way runs to its end)."""
     from huggingface_hub import hf_hub_download
+    hub_timeouts()
     last = None
     for i in range(retries):
         if stop is not None and stop.is_set():
