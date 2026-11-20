@@ -7,6 +7,10 @@ accumulates straight into the flat gradients, the gradient norms are one pass ov
 tensor, fused; the groups' and any bucketing of the tensors -- the model's layers -- are sums of squares of those,
 :meth:`FlatAdamW.grad_norms`) and the update is one kernel per group that reads the gradient once: clip coefficient,
 moments, decoupled weight decay, bias-corrected step, the moving average, and the gradient zeroed for the next update.
+An ``nn.Embedding`` of the model whose weight is held here is set to ``sparse``: the gradient of its lookup is then the
+rows that were read, added into the flat gradient view in place (no dense gradient of the whole table, no sort, no
+add over the whole table; rows read several times are summed in no fixed order).  An embedding with a padding index,
+a norm bound or gradients scaled by frequency is left as it is.
 
 A group with ``"linear": True`` holds the weights of the model's linear operator (``neuronspark.ops.linear``): its
 2-D parameters are bound with the operator's ``bind_grad_``, so the operator's backward accumulates each weight
@@ -133,6 +137,13 @@ class FlatAdamW:
         self.params = [p for g in self.groups for p in g["params"]]
         self._names = names
         self.refresh_bf16()
+        # a lookup table held here receives the gradient of its lookup as the rows that were read: autograd adds the
+        # sparse gradient into the table's flat gradient view in place
+        held = {id(p) for p in self.params}
+        for m in model.modules():
+            if isinstance(m, torch.nn.Embedding) and id(m.weight) in held and m.padding_idx is None \
+                    and m.max_norm is None and not m.scale_grad_by_freq:
+                m.sparse = True
         # the gradient norms' pieces: every parameter's slice of its group's gradient buffer, its group, its bucket
         self._slices = [self.groups[gi]["flat"]["g"][off:off + k] for gi, off, k, _ in self.slots.values()]
         self._slice_group = torch.tensor([gi for gi, _, _, _ in self.slots.values()], device=dev)
