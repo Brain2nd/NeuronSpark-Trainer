@@ -13,7 +13,9 @@ Three graphs share one memory pool:
   average by the device scalar ``ema_c``, set per update); the sums are zeroed.
 
 The optimizer state is created at construction; the warm-up before capture runs at learning rate 0 (weights unchanged)
-and the optimizer state is restored afterwards; buffers the forward may write are snapshotted and restored as well
+and the optimizer state is restored afterwards (with the bf16 values of the linear operator's weights the optimizer
+keeps, nstrain.flat_adamw, refreshed before the warm-up and after the restore); buffers the forward may write are
+snapshotted and restored as well
 (the snapshot lives on the host: the weights, the optimizer's moments and the buffers of a large model are tens of
 GiB that the warm-up and the capture would otherwise have to fit beside).  A new shape (a sequence-length change) gets
 a new engine over the same model and optimizer, in the same ``arena`` (nstrain.gpu.Arena): it warms up and captures
@@ -86,8 +88,9 @@ class StepEngine:
         a.stream.wait_stream(torch.cuda.current_stream())
         saved = self._snapshot()
         with a.use():
-            self.opt.lr.zero_()                                      # warm-up steps leave the weights unchanged
-            self.opt.ema_c.zero_()                                   # and the moving average
+            self.opt.refresh_bf16()                                  # (weights written since the optimizer was built:
+            self.opt.lr.zero_()                                      # the launch calibration); warm-up steps leave the
+            self.opt.ema_c.zero_()                                   # weights unchanged, and the moving average
             for _ in range(warmup_iters):
                 for _ in range(min(2, self.accum)):
                     self._micro()
@@ -140,6 +143,7 @@ class StepEngine:
         self.opt.bc.copy_(saved["bc"])
         self.opt.lr.copy_(saved["lr"])
         self.opt.ema_c.copy_(saved["ema_c"])
+        self.opt.refresh_bf16()                                      # the bf16 values of the restored weights
         torch.cuda.synchronize()
 
     # ------------------------------------------------------------------ use
@@ -151,7 +155,8 @@ class StepEngine:
         average untouched).  Returns (metrics, applied); a non-finite gradient norm skips the update."""
         if inputs.ndim != 2 or inputs.shape[1] != self.L or inputs.shape[0] % self.rows or inputs.shape[0] == 0:
             raise ValueError(f"update of shape {tuple(inputs.shape)}, engine is (n x {self.rows}) x {self.L}")
-        accum = int(inputs.shape[0]) // self.rows
+        self.opt.check_bf16()                                        # (a replayed graph reads the bf16 values kept
+        accum = int(inputs.shape[0]) // self.rows                    # by the optimizer and cannot check them itself)
         if accum != self.accum:
             self.accum = accum
             self.inv_accum.fill_(1.0 / accum)

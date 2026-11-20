@@ -10,7 +10,15 @@ moments, decoupled weight decay, bias-corrected step, the moving average, and th
 
 A group with ``"linear": True`` holds the weights of the model's linear operator (``neuronspark.ops.linear``): its
 2-D parameters are bound with the operator's ``bind_grad_``, so the operator's backward accumulates each weight
-gradient into the flat gradient buffer with its own GEMM (no temporary, no separate add).
+gradient into the flat gradient buffer with its own GEMM (no temporary, no separate add).  The group also has a flat
+bf16 buffer ``h`` holding the bf16 values of its parameters: the kernel stores them with the new weights in the same
+pass, and the operator's training forward reads each weight's part of it instead of casting the weight
+(``bind_train_bf16_``).  A 2-D parameter (N, K) of such a group occupies ``padded_extent(N) * K`` elements of every
+buffer (the operator's padded extent of N; the elements past the parameter are zero in every buffer and stay zero
+through the update: ``eps`` must be positive in fp32), so its bf16 part is the operator's padded weight.  ``h``
+follows every write of the weights made here (the update, :meth:`swap_ema`); after any other write of a weight call
+:meth:`refresh_bf16` (the step engine does before it captures and after it restores its snapshot, and refuses an
+update when a weight was written in place through its parameter since, :meth:`check_bf16`).
 
 Update rule (torch.optim.AdamW, decoupled weight decay)::
 
@@ -36,8 +44,8 @@ ALIGN = 64
 
 
 @triton.jit
-def _adamw_kernel(P, G, M, V, E, n, lr_ptr, wd_ptr, c_ptr, coef_ptr, bc_ptr, lr_mult, wd_group, b1, b2, eps,
-                  EMA: tl.constexpr, BLOCK: tl.constexpr):
+def _adamw_kernel(P, G, M, V, E, H, n, lr_ptr, wd_ptr, c_ptr, coef_ptr, bc_ptr, lr_mult, wd_group, b1, b2, eps,
+                  EMA: tl.constexpr, BF16: tl.constexpr, BLOCK: tl.constexpr):
     pid = tl.program_id(0).to(tl.int64)
     offs = pid * BLOCK + tl.arange(0, BLOCK)
     mask = offs < n
@@ -57,6 +65,8 @@ def _adamw_kernel(P, G, M, V, E, n, lr_ptr, wd_ptr, c_ptr, coef_ptr, bc_ptr, lr_
     tl.store(M + offs, m, mask=mask)
     tl.store(V + offs, v, mask=mask)
     tl.store(P + offs, p, mask=mask)
+    if BF16:
+        tl.store(H + offs, p.to(tl.bfloat16), mask=mask)
     tl.store(G + offs, tl.zeros_like(g), mask=mask)
     if EMA:
         c = tl.load(c_ptr)
@@ -73,6 +83,9 @@ class FlatAdamW:
         name giving the bucket its gradient norm is summed into (:meth:`grad_norms`; None: no buckets)."""
         self.b1, self.b2 = float(betas[0]), float(betas[1])
         self.eps = float(eps)
+        if not float(torch.tensor(self.eps, dtype=torch.float32)) > 0.0:
+            raise ValueError(f"eps {eps} is not positive in fp32 (the update of an element whose gradient and moments "
+                             "are zero, the padding of the flat buffers among them, would be 0 / 0)")
         self.ema = bool(ema)
         names = {id(p): n for n, p in model.named_parameters()}
         dev = groups[0]["params"][0].device
@@ -86,12 +99,18 @@ class FlatAdamW:
         keys = ("p", "g", "m", "v") + (("e",) if self.ema else ())
         for gi, g in enumerate(groups):
             params = g["params"]
+            linear = bool(g.get("linear"))
+            if linear:
+                from neuronspark.ops.linear import bind_grad_, padded_extent
             offs, o = [], 0
             for p in params:
                 offs.append(o)
-                o += (p.numel() + ALIGN - 1) // ALIGN * ALIGN
+                extent = padded_extent(p.shape[0]) * p.shape[1] if linear and p.ndim == 2 else p.numel()
+                o += (extent + ALIGN - 1) // ALIGN * ALIGN
             n = o
             flat = {k: torch.zeros(n, dtype=torch.float32, device=dev) for k in keys}
+            if linear:
+                flat["h"] = torch.zeros(n, dtype=torch.bfloat16, device=dev)
             with torch.no_grad():
                 for p, off in zip(params, offs):
                     if p.dtype != torch.float32 or not p.is_contiguous():
@@ -101,15 +120,19 @@ class FlatAdamW:
                     p.data = flat["p"][off:off + k].view(p.shape)
                     p.grad = flat["g"][off:off + k].view(p.shape)
                     self.slots[names[id(p)]] = (gi, off, k, tuple(p.shape))
-            if g.get("linear"):
-                from neuronspark.ops.linear import bind_grad_
-                for p in params:
+            bf16 = []                                                # (parameter, its (padded N, K) part of h)
+            if linear:
+                for p, off in zip(params, offs):
                     if p.ndim == 2:
                         bind_grad_(p)
+                        rows = padded_extent(p.shape[0])
+                        bf16.append((p, flat["h"][off:off + rows * p.shape[1]].view(rows, p.shape[1])))
             self.groups.append({"name": g.get("name", str(gi)), "flat": flat, "n": n,
                                 "lr_mult": float(g.get("lr_mult", 1.0)), "wd": float(g.get("weight_decay", 0.0)),
-                                "params": params, "linear": bool(g.get("linear"))})
+                                "params": params, "linear": linear, "bf16": bf16, "bf16_versions": []})
         self.params = [p for g in self.groups for p in g["params"]]
+        self._names = names
+        self.refresh_bf16()
         # the gradient norms' pieces: every parameter's slice of its group's gradient buffer, its group, its bucket
         self._slices = [self.groups[gi]["flat"]["g"][off:off + k] for gi, off, k, _ in self.slots.values()]
         self._slice_group = torch.tensor([gi for gi, _, _, _ in self.slots.values()], device=dev)
@@ -148,13 +171,42 @@ class FlatAdamW:
         for g in self.groups:
             f = g["flat"]
             grid = (triton.cdiv(g["n"], self.BLOCK),)
-            _adamw_kernel[grid](f["p"], f["g"], f["m"], f["v"], f["e"] if self.ema else f["p"], g["n"], self.lr,
-                                self.wd, self.ema_c, coef, self.bc, g["lr_mult"], g["wd"], self.b1, self.b2, self.eps,
-                                EMA=self.ema, BLOCK=self.BLOCK, num_warps=8)
+            _adamw_kernel[grid](f["p"], f["g"], f["m"], f["v"], f["e"] if self.ema else f["p"],
+                                f["h"] if g["linear"] else f["p"], g["n"], self.lr, self.wd, self.ema_c, coef, self.bc,
+                                g["lr_mult"], g["wd"], self.b1, self.b2, self.eps, EMA=self.ema, BF16=g["linear"],
+                                BLOCK=self.BLOCK, num_warps=8)
 
     def zero_grad(self) -> None:
         for g in self.groups:
             g["flat"]["g"].zero_()
+
+    # ------------------------------------------------------------------ the linear operator's bf16 weights
+    def refresh_bf16(self) -> None:
+        """Bring the bf16 values of the linear groups up to the weights as they are now and bind every weight's part
+        to it again: after any write of a weight that is not this optimizer's update."""
+        from_linear = [g for g in self.groups if g["linear"]]
+        if not from_linear:
+            return
+        from neuronspark.ops.linear import bind_train_bf16_
+        with torch.no_grad():
+            for g in from_linear:
+                g["flat"]["h"].copy_(g["flat"]["p"])
+                for p, part in g["bf16"]:
+                    bind_train_bf16_(p, part)
+                g["bf16_versions"] = [p._version for p, _ in g["bf16"]]
+
+    def check_bf16(self) -> None:
+        """Raise when a weight of a linear group was written in place through its parameter since its bf16 values
+        were last brought up to date: a captured step would compute with the values before the write."""
+        for g in self.groups:
+            for (p, _), version in zip(g["bf16"], g["bf16_versions"]):
+                if p._version != version:
+                    raise RuntimeError(f"nstrain.flat_adamw: {self._names[id(p)]} was written in place outside the "
+                                       "optimizer and its bf16 values are those before the write: call refresh_bf16()")
+
+    def bf16_copies(self) -> Dict[str, Tuple[torch.Tensor, torch.Tensor]]:
+        """Per parameter name of the linear groups: (the parameter, its bf16 part ``(padded N, K)``)."""
+        return {self._names[id(p)]: (p, part) for g in self.groups for p, part in g["bf16"]}
 
     # ------------------------------------------------------------------ the moving average
     def ema_init(self) -> None:
@@ -172,6 +224,7 @@ class FlatAdamW:
                 f["p"].copy_(f["e"])
                 f["e"].copy_(tmp)
                 del tmp
+        self.refresh_bf16()
 
     # ------------------------------------------------------------------ state by parameter name
     def state(self) -> Dict[str, Dict[str, torch.Tensor]]:
