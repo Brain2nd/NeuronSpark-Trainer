@@ -96,13 +96,14 @@ DENDRITIC_DECAYED_VECTORS = ("A_log", "dt_bias", "D", "gamma", "conv_bias", "pre
 
 def param_groups(model, weight_decay: float = WEIGHT_DECAY, lexical_lr_mult: float = LEXICAL_LR_MULT) -> List[Dict]:
     """0 matrices (decayed), 1 vectors / scalars (not decayed), 2 lexical n-gram tables (not decayed, lr x
-    ``lexical_lr_mult``), 3 dendritic population vectors (decayed); each group carries ``lr_mult``."""
+    ``lexical_lr_mult``), 3 dendritic population vectors (decayed); each group carries ``lr_mult``.  The matrices
+    group holds every weight of the model's linear operator and is marked ``linear`` (nstrain.flat_adamw)."""
     named = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
     lexical = {id(p) for p in model.backbone.lexical_memory.tables}
     dvec = {id(p) for n, p in named if ".mixer_a." in n and n.rsplit(".", 1)[-1] in DENDRITIC_DECAYED_VECTORS}
     groups = [
         {"params": [p for n, p in named if p.ndim >= 2 and id(p) not in lexical and id(p) not in dvec],
-         "weight_decay": weight_decay, "lr_mult": 1.0, "name": "matrices"},
+         "weight_decay": weight_decay, "lr_mult": 1.0, "name": "matrices", "linear": True},
         {"params": [p for n, p in named if p.ndim < 2 and id(p) not in lexical and id(p) not in dvec],
          "weight_decay": 0.0, "lr_mult": 1.0, "name": "vectors"},
         {"params": [p for n, p in named if id(p) in lexical], "weight_decay": 0.0, "lr_mult": float(lexical_lr_mult),

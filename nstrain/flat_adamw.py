@@ -8,6 +8,10 @@ tensor, fused; the groups' and any bucketing of the tensors -- the model's layer
 :meth:`FlatAdamW.grad_norms`) and the update is one kernel per group that reads the gradient once: clip coefficient,
 moments, decoupled weight decay, bias-corrected step, the moving average, and the gradient zeroed for the next update.
 
+A group with ``"linear": True`` holds the weights of the model's linear operator (``neuronspark.ops.linear``): its
+2-D parameters are bound with the operator's ``bind_grad_``, so the operator's backward accumulates each weight
+gradient into the flat gradient buffer with its own GEMM (no temporary, no separate add).
+
 Update rule (torch.optim.AdamW, decoupled weight decay)::
 
     g = g * clip;  m = b1 m + (1 - b1) g;  v = b2 v + (1 - b2) g^2
@@ -97,9 +101,14 @@ class FlatAdamW:
                     p.data = flat["p"][off:off + k].view(p.shape)
                     p.grad = flat["g"][off:off + k].view(p.shape)
                     self.slots[names[id(p)]] = (gi, off, k, tuple(p.shape))
+            if g.get("linear"):
+                from neuronspark.ops.linear import bind_grad_
+                for p in params:
+                    if p.ndim == 2:
+                        bind_grad_(p)
             self.groups.append({"name": g.get("name", str(gi)), "flat": flat, "n": n,
                                 "lr_mult": float(g.get("lr_mult", 1.0)), "wd": float(g.get("weight_decay", 0.0)),
-                                "params": params})
+                                "params": params, "linear": bool(g.get("linear"))})
         self.params = [p for g in self.groups for p in g["params"]]
         # the gradient norms' pieces: every parameter's slice of its group's gradient buffer, its group, its bucket
         self._slices = [self.groups[gi]["flat"]["g"][off:off + k] for gi, off, k, _ in self.slots.values()]
