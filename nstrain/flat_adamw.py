@@ -4,9 +4,10 @@ Every parameter group gets four flat fp32 buffers: parameters, gradients, first 
 ``ema``, a fifth: the exponential moving average of the parameters).  The model's parameters become views into the
 parameter buffer and their ``.grad`` views into the gradient buffer (offsets padded to 64 elements), so autograd
 accumulates straight into the flat gradients, the gradient norms are one pass over the buffers (per parameter
-tensor, fused; the groups' and any bucketing of the tensors -- the model's layers -- are sums of squares of those,
-:meth:`FlatAdamW.grad_norms`) and the update is one kernel per group that reads the gradient once: clip coefficient,
-moments, decoupled weight decay, bias-corrected step, the moving average, and the gradient zeroed for the next update.
+tensor, fused; the groups' and any bucketing of the tensors -- the model's layers -- are sums of squares of those in
+a fixed order, :meth:`FlatAdamW.grad_norms`) and the update is one kernel per group that reads the gradient once:
+clip coefficient, moments, decoupled weight decay, bias-corrected step, the moving average, and the gradient zeroed for
+the next update.
 An ``nn.Embedding`` of the model whose weight is held here is set to ``sparse``: the gradient of its lookup is then the
 rows that were read, added into the flat gradient view in place (no dense gradient of the whole table, no sort, no
 add over the whole table; rows read several times are summed in no fixed order).  An embedding with a padding index,
@@ -78,6 +79,15 @@ def _adamw_kernel(P, G, M, V, E, H, n, lr_ptr, wd_ptr, c_ptr, coef_ptr, bc_ptr, 
         tl.store(E + offs, e + c * (p - e), mask=mask)
 
 
+def _segments(ids: List[int], n: int, dev) -> torch.Tensor:
+    """(n, longest) int64: row s lists the positions i with ``ids[i] == s``, padded with ``len(ids)``; a sum over the
+    rows of a vector gathered with it adds every segment's values in a fixed order (unlike ``index_add_``, whose
+    atomic additions have none: data-parallel replicas compute the same norms from the same gradients)."""
+    rows = [[i for i, s in enumerate(ids) if s == k] for k in range(n)]
+    width = max([len(r) for r in rows] + [1])
+    return torch.tensor([r + [len(ids)] * (width - len(r)) for r in rows], dtype=torch.int64, device=dev)
+
+
 class FlatAdamW:
     BLOCK = 2048
 
@@ -146,14 +156,14 @@ class FlatAdamW:
                 m.sparse = True
         # the gradient norms' pieces: every parameter's slice of its group's gradient buffer, its group, its bucket
         self._slices = [self.groups[gi]["flat"]["g"][off:off + k] for gi, off, k, _ in self.slots.values()]
-        self._slice_group = torch.tensor([gi for gi, _, _, _ in self.slots.values()], device=dev)
+        self._slice_group = _segments([gi for gi, _, _, _ in self.slots.values()], len(self.groups), dev)
         self.buckets: List[str] = []
         self.slot_bucket: Dict[str, str] = {}
         if bucket is not None:
             self.slot_bucket = {name: bucket(name) for name in self.slots}
             self.buckets = sorted(set(self.slot_bucket.values()))
-            self._slice_bucket = torch.tensor([self.buckets.index(self.slot_bucket[name]) for name in self.slots],
-                                              device=dev)
+            self._slice_bucket = _segments([self.buckets.index(self.slot_bucket[name]) for name in self.slots],
+                                           len(self.buckets), dev)
 
     # ------------------------------------------------------------------ captured pieces
     def grad_norms(self) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -161,11 +171,10 @@ class FlatAdamW:
         fp32: one fused pass over the parameters' slices of the gradient buffers (``torch._foreach_norm``), the
         groups' and the buckets' norms the square roots of the sums of squares."""
         sq = torch.stack(torch._foreach_norm(self._slices)).square()
-        groups = torch.zeros(len(self.groups), dtype=torch.float32, device=sq.device).index_add_(0, self._slice_group,
-                                                                                                 sq).sqrt()
+        sq = torch.cat([sq, sq.new_zeros(1)])                        # (the padding of the segments reads the zero)
+        groups = sq[self._slice_group].sum(1).sqrt()
         if self.buckets:
-            buckets = torch.zeros(len(self.buckets), dtype=torch.float32, device=sq.device).index_add_(
-                0, self._slice_bucket, sq).sqrt()
+            buckets = sq[self._slice_bucket].sum(1).sqrt()
         else:
             buckets = torch.zeros(0, dtype=torch.float32, device=sq.device)
         return groups, buckets

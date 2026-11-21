@@ -12,6 +12,12 @@ Three graphs share one memory pool:
 * ``step``: clip by that norm and the AdamW kernels (which also zero the gradients and move the parameters' moving
   average by the device scalar ``ema_c``, set per update); the sums are zeroed.
 
+Data-parallel replicas (``data_parallel``: nstrain.data_parallel, more than one process): the loss scale is
+``1 / (accum * world)`` and a fourth graph, ``reduce``, replayed after the update's last micro-batch, sums every
+group's flat gradient buffer and the loss sums across the replicas; the earlier micro-batches reduce nothing.  The
+loss sums are then divided by ``world``: the metrics are the global batch's, and every replica takes the same decision
+on a non-finite norm.  With one process (``data_parallel`` None or of world 1) the engine is the one-GPU step.
+
 The optimizer state is created at construction; the warm-up before capture runs at learning rate 0 (weights unchanged)
 and the optimizer state is restored afterwards (with the bf16 values of the linear operator's weights the optimizer
 keeps, nstrain.flat_adamw, refreshed before the warm-up and after the restore); buffers the forward may write are
@@ -35,16 +41,19 @@ from nstrain.flat_adamw import FlatAdamW
 class StepEngine:
     def __init__(self, model, optimizer: FlatAdamW, rows: int, seq_len: int, accum: int,
                  grad_clip: float = 1.0, warmup_iters: int = 3, compile: bool = False, arena=None,
-                 before_capture=None):
+                 before_capture=None, data_parallel=None):
         self.model, self.opt = model, optimizer
+        self.rep = data_parallel if data_parallel is not None and data_parallel.world > 1 else None
+        self.world = self.rep.world if self.rep is not None else 1
         self.loss_fn = torch.compile(model.loss, dynamic=False) if compile else model.loss
         self.rows, self.L, self.accum, self.clip = int(rows), int(seq_len), int(accum), float(grad_clip)
         self.dev = next(model.parameters()).device
         self.x = torch.zeros((self.rows, self.L), dtype=torch.int64, device=self.dev)
         self.y = torch.zeros((self.rows, self.L), dtype=torch.int64, device=self.dev)
         f32 = dict(dtype=torch.float32, device=self.dev)
-        self.inv_accum = torch.full((), 1.0 / self.accum, **f32)      # the micro-batches' loss scale (set per update)
-        self.loss_sum, self.ce_sum, self.aux_sum = (torch.zeros((), **f32) for _ in range(3))
+        self.inv_accum = torch.full((), 1.0 / (self.accum * self.world), **f32)   # the micro-batches' loss scale
+        self.sums = torch.zeros(3, **f32)                            # (set per update); the loss terms' sums
+        self.loss_sum, self.ce_sum, self.aux_sum = self.sums[0], self.sums[1], self.sums[2]
         self.gnorm = torch.zeros((), **f32)
         self.gnorms = torch.zeros(len(optimizer.groups), **f32)      # per parameter group (the diagnostic of a
         self.group_names = [g["name"] for g in optimizer.groups]     # spike: nstrain.trainer logs them by name)
@@ -62,6 +71,11 @@ class StepEngine:
         self.ce_sum.add_(out.ce.detach())
         self.aux_sum.add_(out.aux.detach())
 
+    def _reduce(self) -> None:
+        self.rep.reduce_grads(self.opt)
+        self.rep.all_reduce_(self.sums)
+        self.sums.mul_(1.0 / self.world)
+
     def _norm(self) -> None:
         groups, buckets = self.opt.grad_norms()
         self.gnorms.copy_(groups)
@@ -74,8 +88,7 @@ class StepEngine:
         self._zero_sums()
 
     def _zero_sums(self) -> None:
-        for t in (self.loss_sum, self.ce_sum, self.aux_sum):
-            t.zero_()
+        self.sums.zero_()
 
     # ------------------------------------------------------------------ capture
     def _capture(self, warmup_iters: int, before_capture=None) -> None:
@@ -94,12 +107,16 @@ class StepEngine:
             for _ in range(warmup_iters):
                 for _ in range(min(2, self.accum)):
                     self._micro()
+                if self.rep is not None:
+                    self._reduce()
                 self._norm()
                 self._step()
         torch.cuda.synchronize()
         if before_capture is not None:                               # eager work whose first-call caches must be
             before_capture()                                         # live before the arena's free blocks become
-        for name, body in (("micro", self._micro), ("norm", self._norm), ("step", self._step)):   # graph scratch
+        bodies = [("micro", self._micro)] + ([("reduce", self._reduce)] if self.rep is not None else []) + \
+            [("norm", self._norm), ("step", self._step)]
+        for name, body in bodies:                                    # graph scratch
             g = torch.cuda.CUDAGraph()
             with torch.cuda.stream(a.stream):
                 g.capture_begin(pool=a.pool.id, capture_error_mode="thread_local")
@@ -157,14 +174,10 @@ class StepEngine:
             raise ValueError(f"update of shape {tuple(inputs.shape)}, engine is (n x {self.rows}) x {self.L}")
         self.opt.check_bf16()                                        # (a replayed graph reads the bf16 values kept
         accum = int(inputs.shape[0]) // self.rows                    # by the optimizer and cannot check them itself)
-        if accum != self.accum:
-            self.accum = accum
-            self.inv_accum.fill_(1.0 / accum)
+        self.set_accum(accum)
         for m in range(accum):
             sl = slice(m * self.rows, (m + 1) * self.rows)
-            self.x.copy_(inputs[sl], non_blocking=True)
-            self.y.copy_(targets[sl], non_blocking=True)
-            self.graphs["micro"].replay()
+            self.micro_batch(inputs[sl], targets[sl], last=m == accum - 1)
         self.graphs["norm"].replay()
         sums = torch.cat([torch.stack([self.gnorm, self.loss_sum, self.ce_sum, self.aux_sum]), self.gnorms,
                           self.gnorm_buckets]).tolist()
@@ -181,6 +194,22 @@ class StepEngine:
         self.opt.ema_c.fill_(ema_c)
         self.graphs["step"].replay()
         return metrics, True
+
+    def set_accum(self, accum: int) -> None:
+        """The number of micro-batches of the next update (per replica): the loss scale ``1 / (accum * world)``."""
+        if accum != self.accum:
+            self.accum = accum
+            self.inv_accum.fill_(1.0 / (accum * self.world))
+
+    def micro_batch(self, x: torch.Tensor, y: torch.Tensor, last: bool) -> None:
+        """Forward and backward of one micro-batch of pinned (rows, L) inputs / targets, its gradient added into the
+        flat gradient buffers; ``last``: the update's last micro-batch, after which the replicas' gradients are summed
+        (nothing is reduced after the others)."""
+        self.x.copy_(x, non_blocking=True)
+        self.y.copy_(y, non_blocking=True)
+        self.graphs["micro"].replay()
+        if last and self.rep is not None:
+            self.graphs["reduce"].replay()
 
     def release(self) -> None:
         self.graphs.clear()
