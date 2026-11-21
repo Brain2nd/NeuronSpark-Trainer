@@ -100,15 +100,20 @@ def param_groups(model, weight_decay: float = WEIGHT_DECAY, lexical_lr_mult: flo
     group holds every weight of the model's linear operator and is marked ``linear`` (nstrain.flat_adamw); its
     projection weights (the backbone's ``inference_linear_weights``) come first and the matrices read in fp32 (the
     gathered tables, the convolution taps) after them, so the projections of consecutive layers are contiguous in the
-    flat buffers (nstrain.data_parallel splits them among the replicas in buckets of consecutive layers)."""
+    flat buffers (nstrain.data_parallel splits them among the replicas in buckets of consecutive layers).  The group's
+    ``written_first`` counts those projection weights (the tied embedding among them): the linear operator's GEMM is
+    the first writer of each one's gradient in every backward (the tied embedding's readout runs before its lookup
+    adds the rows), so the step can leave their gradients for the next update's first backward to write
+    (nstrain.flat_adamw, nstrain.engine)."""
     named = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
     lexical = {id(p) for p in model.backbone.lexical_memory.tables}
     dvec = {id(p) for n, p in named if ".mixer_a." in n and n.rsplit(".", 1)[-1] in DENDRITIC_DECAYED_VECTORS}
     projections = {id(p) for _, p in model.backbone.inference_linear_weights()}
     matrices = [p for n, p in named if p.ndim >= 2 and id(p) not in lexical and id(p) not in dvec]
+    first = [p for p in matrices if id(p) in projections]
     groups = [
-        {"params": [p for p in matrices if id(p) in projections] + [p for p in matrices if id(p) not in projections],
-         "weight_decay": weight_decay, "lr_mult": 1.0, "name": "matrices", "linear": True},
+        {"params": first + [p for p in matrices if id(p) not in projections], "weight_decay": weight_decay,
+         "lr_mult": 1.0, "name": "matrices", "linear": True, "written_first": len(first)},
         {"params": [p for n, p in named if p.ndim < 2 and id(p) not in lexical and id(p) not in dvec],
          "weight_decay": 0.0, "lr_mult": 1.0, "name": "vectors"},
         {"params": [p for n, p in named if id(p) in lexical], "weight_decay": 0.0, "lr_mult": float(lexical_lr_mult),

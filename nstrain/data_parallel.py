@@ -11,7 +11,9 @@ those the module holding the layers lists with ``inference_linear_weights``, the
 not the tied embedding, whose lookup reads its fp32 rows, nor the weights other operators read in fp32 -- the
 dendritic convolution taps, the PKM values and sub-keys, the attention's short convolution) are updated in parts
 (ZeRO stage 1): their buckets are summed by a reduce-scatter, which leaves replica r the sum of
-the r-th part of every bucket (the rest of the bucket, this replica's own gradient, is zeroed for the next update);
+the r-th part of every bucket (the rest of the bucket, this replica's own gradient, is zeroed for the next update, or
+left for the next update's first backward to write when the engine arms the weights, ``overwrite``:
+nstrain.engine);
 the optimizer updates its parts and gathers the bf16 values of the buckets from their owners after the update
 (:meth:`nstrain.flat_adamw.FlatAdamW.shard`).  Every other gradient is summed by an all-reduce and updated on every
 replica.  The collectives hand every process the same values, and everything computed from them (the norms from the
@@ -77,8 +79,8 @@ class DataParallel:
         self.world = dist.get_world_size(group)
         self.device = torch.device("cuda", torch.cuda.current_device())
         self.side = None                                             # the reduction's stream (attach)
-        self.layer_buckets: Dict[int, List[Tuple[torch.Tensor, bool]]] = {}   # layer -> its input hook's buckets
-        #                                                              (a bucket: its view, whether it is split)
+        self.layer_buckets: Dict[int, List[Tuple[torch.Tensor, bool, bool]]] = {}   # layer -> its input hook's
+        #                  buckets (a bucket: its view, whether it is split, whether the rest is zeroed after its sum)
         self.tail: List[torch.Tensor] = []
         self.early: List[Tuple[torch.Tensor, Tuple[str, ...]]] = []  # the parts summed once autograd has accumulated
         #                                                              every gradient in them (view, parameter names)
@@ -121,11 +123,13 @@ class DataParallel:
         dist.all_reduce(t, group=self.group)
 
     # ------------------------------------------------------------------ the reduction hidden behind the backward
-    def attach(self, model, opt, stream) -> None:
+    def attach(self, model, opt, stream, overwrite: bool = False) -> None:
         """Cut the flat gradient buffers of ``opt`` into the layers' buckets and the tail, split the linear group's
         layer buckets among the replicas (``opt``'s layout, :meth:`nstrain.flat_adamw.FlatAdamW.shard`), and hook the
         input of every layer of ``model`` (its modules named ``...layers.<i>``); ``stream``: the stream the backward
-        runs on."""
+        runs on; ``overwrite``: the caller arms the optimizer's ``written_first`` weights in every update's first
+        backward (their gradients written, not added), so a split bucket of theirs leaves the rest of the bucket as it
+        is after its reduce-scatter."""
         self._stream = stream
         self.side = torch.cuda.Stream(priority=torch.cuda.Stream.priority_range()[1])   # (the highest: its
         #                     collectives dispatched ahead of the backward's pending blocks, nstrain.engine.Graph)
@@ -149,7 +153,7 @@ class DataParallel:
         # the weights whose gradients the linear operator adds into their buffers itself (bound by the optimizer):
         # autograd never accumulates them; every other weight's gradient is autograd's accumulation
         bound = {names[id(q)] for g in opt.groups for q, _ in g["bf16"] if id(q) in names}
-        buckets: Dict[int, List[Tuple[torch.Tensor, bool]]] = {}
+        buckets: Dict[int, List[Tuple[torch.Tensor, bool, bool]]] = {}   # (view, split, the rest zeroed)
         tail: List[torch.Tensor] = []
         early: List[Tuple[torch.Tensor, Tuple[str, ...]]] = []
         head: List[torch.Tensor] = []
@@ -184,8 +188,10 @@ class DataParallel:
             # dendritic convolution taps, the PKM values and sub-keys, the attention's short convolution) placed between
             # a layer's projections would cut them into several buckets (nstrain.model.param_groups places the
             # projections of all layers first, contiguous)
-            def close(cur, buf=buf, gi=gi):
-                buckets.setdefault(cur[0], []).append((buf[cur[1]:cur[2]], cur[3]))
+            keep = g["keep"] if overwrite else 0                     # (below: written by the first backward)
+
+            def close(cur, buf=buf, gi=gi, keep=keep):
+                buckets.setdefault(cur[0], []).append((buf[cur[1]:cur[2]], cur[3], cur[3] and cur[2] > keep))
                 if cur[3]:
                     split.setdefault(gi, []).append((cur[1], cur[2]))
             cur = None                                               # [lowest layer, lo, hi, split]
@@ -210,13 +216,14 @@ class DataParallel:
                     cur = [layer, lo, hi, part]
             if cur is not None:
                 close(cur)
-        covered = sum(v.numel() for vs in buckets.values() for v, _ in vs) + \
+        covered = sum(v.numel() for vs in buckets.values() for v, _, _ in vs) + \
             sum(v.numel() for v in tail + head + [v for v, _ in early])
         if covered != sum(g["n"] for g in opt.groups):
             raise RuntimeError("DataParallel: the buckets do not cover the gradient buffers exactly once")
         self.layer_buckets, self.tail, self.head, self.early = buckets, tail, head, early
         self.bucket_numels = [v.numel() for v in head] + \
-            [v.numel() for j in sorted(buckets, reverse=True) for v, _ in buckets[j]] + [sum(v.numel() for v in tail)]
+            [v.numel() for j in sorted(buckets, reverse=True) for v, _, _ in buckets[j]] + \
+            [sum(v.numel() for v in tail)]
         self.split_numel = sum(hi - lo for rs in split.values() for lo, hi in rs)
         self._unhook()
         opt.shard(self.group, split)                                 # (a new layout gathers the present one first)
@@ -275,7 +282,7 @@ class DataParallel:
         if self._armed and layer not in self._issued:
             self._issued.add(layer)
             if layer == HEAD:
-                self._issue([(v, False) for v in self.head], "head")
+                self._issue([(v, False, False) for v in self.head], "head")
             else:
                 self._issue(self.layer_buckets.get(layer, ()), f"layer {layer}")
         return None
@@ -291,13 +298,14 @@ class DataParallel:
         self._seen.add(name)
         self._left[i] -= 1
         if self._left[i] == 0:
-            self._issue([(self.early[i][0], False)], f"early {i}", after=torch.cuda.current_stream())
+            self._issue([(self.early[i][0], False, False)], f"early {i}", after=torch.cuda.current_stream())
 
     def _issue(self, views, what: str, after=None) -> None:
-        """Sum the (view, split) pairs ``views`` across the replicas, in order, on the side stream, once the backward's
-        stream (and ``after``, when given) has reached this point: a split view by a reduce-scatter (this replica's
-        part of the sum stays in its part of the view; the rest of the view, this replica's own gradient, is zeroed for
-        the next update), any other by an all-reduce."""
+        """Sum the (view, split, zero the rest) triples ``views`` across the replicas, in order, on the side stream,
+        once the backward's stream (and ``after``, when given) has reached this point: a split view by a reduce-scatter
+        (this replica's part of the sum stays in its part of the view; the rest of the view, this replica's own
+        gradient, is zeroed for the next update unless the next update's first backward writes it), any other by an
+        all-reduce."""
         if not views:
             return
         self.order.append(what)
@@ -305,15 +313,15 @@ class DataParallel:
         if after is not None and after != self._stream:
             self.side.wait_stream(after)
         with torch.cuda.stream(self.side):
-            for v, split in views:
+            for v, split, zero_rest in views:
                 if not split:
                     dist.all_reduce(v, group=self.group)
                     continue
                 c = v.numel() // self.world
                 dist.reduce_scatter_tensor(v[self.rank * c:(self.rank + 1) * c], v, group=self.group)
-                if self.rank > 0:
+                if zero_rest and self.rank > 0:
                     v[:self.rank * c].zero_()
-                if self.rank < self.world - 1:
+                if zero_rest and self.rank < self.world - 1:
                     v[(self.rank + 1) * c:].zero_()
 
     def begin(self) -> None:
@@ -344,7 +352,7 @@ class DataParallel:
             idx, val = g._indices()[0].contiguous(), g._values().contiguous()
             gathered.append((name, idx, val, idx.new_empty(self.world * idx.numel()),
                              val.new_empty((self.world * val.shape[0],) + tuple(val.shape[1:]))))
-        self._issue([(v, False) for v in self.tail + [sums]], "tail")
+        self._issue([(v, False, False) for v in self.tail + [sums]], "tail")
         if gathered:
             self.side.wait_stream(self._stream)
             with torch.cuda.stream(self.side):

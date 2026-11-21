@@ -1,21 +1,29 @@
 """The training step as CUDA graphs, for one shape (micro-batch rows x sequence length).
 
-Three graphs share one memory pool:
+Four graphs share one memory pool:
 
-* ``micro``: forward + loss + backward of one micro-batch from the static input buffers; the loss is scaled by
-  ``1 / accum`` (a device scalar: an update may have another number of micro-batches than the last, a batch-size
-  ramp, nstrain.batch, without a new capture) and the gradients accumulate in the flat gradient buffers of
-  :class:`FlatAdamW` (the parameters' ``.grad`` are views into them); the loss terms accumulate in static sums.
+* ``micro_first`` and ``micro``: forward + loss + backward of one micro-batch from the static input buffers, the
+  first micro-batch of an update and the others; the loss is scaled by ``1 / accum`` (a device scalar: an update may
+  have another number of micro-batches than the last, a batch-size ramp, nstrain.batch, without a new capture) and the
+  gradients accumulate in the flat gradient buffers of :class:`FlatAdamW` (the parameters' ``.grad`` are views into
+  them); the loss terms accumulate in static sums.  In ``micro_first`` the weights the optimizer lists as
+  ``written_first`` (the projections and the tied embedding: the linear operator's GEMM writes each one's gradient
+  before anything else in the backward) are armed (``neuronspark.ops.linear.arm_grad_overwrite_``), so their first
+  GEMM writes the gradient instead of adding it into zeros, and the step does not zero their part of the buffers;
+  the capture refuses a ``micro_first`` that leaves one of them armed (a weight its backward did not reach).
 * ``norm``: the gradient norms (fp32) into static tensors: the groups' and the buckets' (the model's layers,
   nstrain.flat_adamw) and the global one.  The host reads them once per update: a non-finite global norm skips the
   update (the gradients are zeroed, the optimizer and the weights are untouched).
-* ``step``: clip by that norm and the AdamW kernels (which also zero the gradients and move the parameters' moving
-  average by the device scalar ``ema_c``, set per update); the sums are zeroed.
+* ``step``: clip by that norm and the AdamW kernels (which also zero the gradients but those of the ``written_first``
+  weights, and move the parameters' moving average by the device scalar ``ema_c``, set per update); the sums are
+  zeroed.  Between updates the ``written_first`` weights' gradients are those of the last update (a skipped update
+  and the end of the capture zero every gradient, :meth:`StepEngine.release` too).
 
 Data-parallel replicas (``data_parallel``: nstrain.data_parallel, more than one process): the loss scale is
-``1 / (accum * world)`` and a fourth graph, ``micro_last``, replaces ``micro`` for the update's last micro-batch: its
-backward sums the flat gradient buffers across the replicas bucket by bucket as the layers' gradients are written,
-then the rest of the buffers and the loss sums; the earlier micro-batches reduce nothing.  The loss sums are then
+``1 / (accum * world)`` and two more graphs replace ``micro`` for the update's last micro-batch, ``micro_last`` and,
+for an update of one micro-batch, ``micro_only`` (``micro_first``'s arming as well): its backward sums the flat
+gradient buffers across the replicas bucket by bucket as the layers' gradients are written, then the rest of the
+buffers and the loss sums; the earlier micro-batches reduce nothing.  The loss sums are then
 divided by ``world``: the metrics are the global batch's, and every replica takes the same decision on a non-finite
 norm.  The weights read through their bf16 values are updated in parts (the optimizer split by
 :meth:`nstrain.data_parallel.DataParallel.attach`): the ``norm`` graph gathers the replicas' sums of squares, the
@@ -155,27 +163,46 @@ class StepEngine:
         self.group_names = [g["name"] for g in optimizer.groups]     # spike: nstrain.trainer logs them by name)
         self.gnorm_buckets = torch.zeros(len(optimizer.buckets), **f32)   # per bucket (the model's layers)
         self.graphs: Dict[str, Graph] = {}
+        self.first = optimizer.written_first()                       # armed in an update's first micro-batch
         from nstrain.gpu import Arena
         self.arena = arena if arena is not None else Arena()          # the trainer's: memory it already holds
         if self.rep is not None:
-            self.rep.attach(model, optimizer, self.arena.stream)
+            self.rep.attach(model, optimizer, self.arena.stream, overwrite=bool(self.first))
         self.sharding = optimizer.sharding                           # the split the graphs are captured for
         self.bf16_at = optimizer.bf16_buffers()                      # and the bf16 buffers they read and write
         self._capture(warmup_iters, before_capture)
 
     # ------------------------------------------------------------------ bodies (eager and captured)
-    def _micro(self) -> None:
+    def _backward(self, loss: torch.Tensor, first: bool) -> None:
+        """``loss.backward()``; ``first``: the update's first micro-batch, the ``written_first`` weights armed (their
+        first GEMM writes the gradient) and refused if one is left armed."""
+        if not (first and self.first):
+            loss.backward()
+            return
+        from neuronspark.ops.linear import arm_grad_overwrite_, armed_grad_overwrites
+        arm_grad_overwrite_(self.first)
+        try:
+            loss.backward()
+        finally:
+            left = armed_grad_overwrites(self.first)
+            arm_grad_overwrite_(left, armed=False)
+        if left:
+            names = {id(p): n for n, p in self.model.named_parameters()}
+            raise RuntimeError(f"StepEngine: {len(left)} weight(s) the optimizer lists as written first got no "
+                               f"gradient from the linear operator in the backward: {[names.get(id(p)) for p in left]}")
+
+    def _micro(self, first: bool = False) -> None:
         out = self.loss_fn(self.x, self.y)
-        (out.loss * self.inv_accum).backward()
+        self._backward(out.loss * self.inv_accum, first)
         self.loss_sum.add_(out.loss.detach())
         self.ce_sum.add_(out.ce.detach())
         self.aux_sum.add_(out.aux.detach())
 
-    def _micro_last(self) -> None:
+    def _micro_last(self, first: bool = False) -> None:
         self.rep.begin()
         out = self.loss_fn(self.x, self.y)
         self.rep.forward_done()
-        (out.loss * self.inv_accum).backward()
+        self._backward(out.loss * self.inv_accum, first)
         self.loss_sum.add_(out.loss.detach())
         self.ce_sum.add_(out.ce.detach())
         self.aux_sum.add_(out.aux.detach())
@@ -190,8 +217,8 @@ class StepEngine:
 
     def _step(self) -> None:
         coef = torch.clamp(self.clip / (self.gnorm + 1e-6), max=1.0)
-        self.opt.step(coef)
-        self._zero_sums()
+        self.opt.step(coef, keep=True)                               # (the next update's first backward writes the
+        self._zero_sums()                                            # written-first weights' gradients)
 
     def _zero_sums(self) -> None:
         self.sums.zero_()
@@ -212,10 +239,10 @@ class StepEngine:
             self.opt.ema_c.zero_()                                   # weights unchanged, and the moving average
             for _ in range(warmup_iters):
                 if self.rep is None:
-                    for _ in range(min(2, self.accum)):
-                        self._micro()
-                else:
+                    self._micro(first=True)
                     self._micro()
+                else:
+                    self._micro(first=True)
                     self._micro_last()
                 self._norm()
                 self._step()
@@ -223,8 +250,10 @@ class StepEngine:
         if before_capture is not None:                               # eager work whose first-call caches must be
             self.opt.gather_()                                       # (its reads of the fp32 weights: whole)
             before_capture()                                         # live before the arena's free blocks become
-        bodies = [("micro", self._micro)] + ([("micro_last", self._micro_last)] if self.rep is not None else []) + \
-            [("norm", self._norm), ("step", self._step)]
+        bodies = [("micro_first", lambda: self._micro(first=True)), ("micro", self._micro)]
+        if self.rep is not None:
+            bodies += [("micro_last", self._micro_last), ("micro_only", lambda: self._micro_last(first=True))]
+        bodies += [("norm", self._norm), ("step", self._step)]
         for name, body in bodies:                                    # graph scratch
             g = Graph()
             with torch.cuda.stream(a.stream):
@@ -290,7 +319,7 @@ class StepEngine:
         self.set_accum(accum)
         for m in range(accum):
             sl = slice(m * self.rows, (m + 1) * self.rows)
-            self.micro_batch(inputs[sl], targets[sl], last=m == accum - 1)
+            self.micro_batch(inputs[sl], targets[sl], first=m == 0, last=m == accum - 1)
         self.graphs["norm"].replay()
         sums = torch.cat([torch.stack([self.gnorm, self.loss_sum, self.ce_sum, self.aux_sum]), self.gnorms,
                           self.gnorm_buckets]).tolist()
@@ -325,18 +354,25 @@ class StepEngine:
             self.accum = accum
             self.inv_accum.fill_(1.0 / (accum * self.world))
 
-    def micro_batch(self, x: torch.Tensor, y: torch.Tensor, last: bool) -> None:
+    def micro_batch(self, x: torch.Tensor, y: torch.Tensor, first: bool, last: bool) -> None:
         """Forward and backward of one micro-batch of pinned (rows, L) inputs / targets, its gradient added into the
-        flat gradient buffers; ``last``: the update's last micro-batch, whose backward sums the replicas' gradients
-        (nothing is reduced in the others)."""
+        flat gradient buffers; ``first``: the update's first micro-batch, whose backward writes the gradients of the
+        ``written_first`` weights (the step left them); ``last``: the update's last micro-batch, whose backward sums
+        the replicas' gradients (nothing is reduced in the others)."""
         self._check_split()
         self.x.copy_(x, non_blocking=True)
         self.y.copy_(y, non_blocking=True)
-        self.graphs["micro_last" if last and self.rep is not None else "micro"].replay()
+        if self.rep is not None and last:
+            name = "micro_only" if first else "micro_last"
+        else:
+            name = "micro_first" if first else "micro"
+        self.graphs[name].replay()
 
     def release(self) -> None:
+        """Release the graphs and zero the gradients (the written-first weights' were left by the last step)."""
         for g in self.graphs.values():
             g.release()
         self.graphs.clear()
+        self.opt.zero_grad()
         if self.rep is not None:
             self.rep.detach()

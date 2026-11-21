@@ -19,7 +19,13 @@ A group with ``"linear": True`` holds the weights of the model's linear operator
 gradient into the flat gradient buffer with its own GEMM (no temporary, no separate add).  The group also has a flat
 bf16 buffer ``h`` holding the bf16 values of its parameters: the kernel stores them with the new weights in the same
 pass, and the operator's training forward reads each weight's part of it instead of casting the weight
-(``bind_train_bf16_``).  A 2-D parameter (N, K) of such a group occupies ``padded_extent(N) * K`` elements of every
+(``bind_train_bf16_``).  The group's ``"written_first"`` leading parameters (nstrain.model.param_groups: the
+projections and the tied embedding, whose gradients the operator's GEMM writes before anything else in every backward)
+can have their gradients written instead: a step with ``keep`` leaves their part of the gradient buffer as it is
+(:meth:`FlatAdamW.step`), and the caller arms them (:meth:`FlatAdamW.written_first`,
+``neuronspark.ops.linear.arm_grad_overwrite_``) before the backward of the next update's first micro-batch, whose
+GEMMs then write their gradients (beta 0) instead of adding into zeros (nstrain.engine).  A 2-D parameter (N, K) of
+such a group occupies ``padded_extent(N) * K`` elements of every
 buffer (the operator's padded extent of N; the elements past the parameter are zero in every buffer and stay zero
 through the update: ``eps`` must be positive in fp32), so its bf16 part is the operator's padded weight.  ``h``
 follows every write of the weights made here (the update, :meth:`swap_ema`); after any other write of a weight call
@@ -78,8 +84,8 @@ NORM_BLOCK = 2048                   # and per step of a program
 
 
 @triton.jit
-def _adamw_kernel(P, G, M, V, E, H, n, starts, ends, lr_ptr, wd_ptr, c_ptr, coef_ptr, bc_ptr, lr_mult, wd_group, b1,
-                  b2, eps, EMA: tl.constexpr, BF16: tl.constexpr, RAGGED: tl.constexpr, BLOCK: tl.constexpr):
+def _adamw_kernel(P, G, M, V, E, H, n, keep, starts, ends, lr_ptr, wd_ptr, c_ptr, coef_ptr, bc_ptr, lr_mult, wd_group,
+                  b1, b2, eps, EMA: tl.constexpr, BF16: tl.constexpr, RAGGED: tl.constexpr, BLOCK: tl.constexpr):
     pid = tl.program_id(0).to(tl.int64)
     if RAGGED:                             # the program's block [start, end) of a range (multiples of SHARD_ALIGN)
         lo = tl.multiple_of(tl.load(starts + pid), 16)
@@ -107,7 +113,7 @@ def _adamw_kernel(P, G, M, V, E, H, n, starts, ends, lr_ptr, wd_ptr, c_ptr, coef
     tl.store(P + offs, p, mask=mask)
     if BF16:
         tl.store(H + offs, p.to(tl.bfloat16), mask=mask)
-    tl.store(G + offs, tl.zeros_like(g), mask=mask)
+    tl.store(G + offs, tl.zeros_like(g), mask=mask & (offs >= keep))    # (below keep: written by the next writer)
     if EMA:
         c = tl.load(c_ptr)
         e = tl.load(E + offs, mask=mask, other=0.0)
@@ -279,6 +285,11 @@ class FlatAdamW:
                     p.data = flat["p"][off:off + k].view(p.shape)
                     p.grad = flat["g"][off:off + k].view(p.shape)
                     self.slots[names[id(p)]] = (gi, off, k, tuple(p.shape))
+            first = int(g.get("written_first", 0))
+            if first and (not linear or first > len(params) or any(p.ndim != 2 for p in params[:first])):
+                raise ValueError(f"FlatAdamW: group {g.get('name', gi)}: written_first {first} must count 2-D leading "
+                                 "parameters of a linear group")
+            keep = 0 if not first else (offs[first] if first < len(params) else n)
             bf16 = []                                                # (parameter, its (padded N, K) part of h)
             if linear:
                 for p, off in zip(params, offs):
@@ -288,7 +299,8 @@ class FlatAdamW:
                         bf16.append((p, flat["h"][off:off + rows * p.shape[1]].view(rows, p.shape[1])))
             self.groups.append({"name": g.get("name", str(gi)), "flat": flat, "n": n,
                                 "lr_mult": float(g.get("lr_mult", 1.0)), "wd": float(g.get("weight_decay", 0.0)),
-                                "params": params, "linear": linear, "bf16": bf16, "bf16_versions": []})
+                                "params": params, "linear": linear, "bf16": bf16, "bf16_versions": [],
+                                "keep": keep, "written_first": list(params[:first])})
         self.params = [p for g in self.groups for p in g["params"]]
         self._names = names
         self.refresh_bf16()
@@ -346,9 +358,10 @@ class FlatAdamW:
     def grad_norm(self) -> torch.Tensor:
         return torch.linalg.vector_norm(self.grad_norms()[0])
 
-    def step(self, coef: torch.Tensor) -> None:
-        """One update with gradients scaled by the device scalar ``coef``; zeroes the gradients; moves the average
-        by ``ema_c``.  Sharded: this replica's part of every split range in turn, each range's bf16 values brought to
+    def step(self, coef: torch.Tensor, keep: bool = False) -> None:
+        """One update with gradients scaled by the device scalar ``coef``; zeroes the gradients (with ``keep``: but the
+        gradients of the parameters :meth:`written_first` lists, which the caller has the next backward write); moves
+        the average by ``ema_c``.  Sharded: this replica's part of every split range in turn, each range's bf16 values brought to
         the other replicas as soon as its part is updated (on a side stream, while the next part and then the
         replicated ranges are updated; the step waits for the side stream): two replicas copy their part into the
         other's buffer between two barriers of theirs (before the first copy: both have finished everything they
@@ -360,7 +373,7 @@ class FlatAdamW:
         sh = self.sharding
         if sh is None:
             for g in self.groups:
-                self._update(g, coef)
+                self._update(g, coef, keep=keep)
             return
         self.stale = True                                            # (a replay: the engine marks it)
         cur, side = torch.cuda.current_stream(), sh["stream"]
@@ -368,7 +381,7 @@ class FlatAdamW:
         if push is not None:
             from neuronspark.ops.triton.tp_bulk import tp_fence
         for i, ((gi, starts, ends), rng) in enumerate(zip(sh["owned"], sh["buckets"])):
-            self._update(self.groups[gi], coef, starts, ends)
+            self._update(self.groups[gi], coef, starts, ends, keep=keep)
             side.wait_stream(cur)
             with torch.cuda.stream(side):
                 if push is None:
@@ -380,20 +393,22 @@ class FlatAdamW:
                     _, _, _, olo, ohi = rng
                     push.remote[gi][olo:ohi].copy_(self.groups[gi]["flat"]["h"][olo:ohi])
         for gi, starts, ends in sh["replicated"]:
-            self._update(self.groups[gi], coef, starts, ends)
+            self._update(self.groups[gi], coef, starts, ends, keep=keep)
         cur.wait_stream(side)
         if push is not None:
             push.epoch.add_(1)
             tp_fence(push.flag_peer, push.flag, push.epoch)
 
     def _update(self, g: dict, coef: torch.Tensor, starts: Optional[torch.Tensor] = None,
-                ends: Optional[torch.Tensor] = None) -> None:
-        """The update kernel over the whole group, or over the blocks ``starts`` / ``ends`` (:func:`_blocks`)."""
+                ends: Optional[torch.Tensor] = None, keep: bool = False) -> None:
+        """The update kernel over the whole group, or over the blocks ``starts`` / ``ends`` (:func:`_blocks`); with
+        ``keep`` the gradient below the group's ``keep`` element is left as it is."""
         f = g["flat"]
         ragged = starts is not None
         grid = (int(starts.numel()) if ragged else triton.cdiv(g["n"], self.BLOCK),)
         _adamw_kernel[grid](f["p"], f["g"], f["m"], f["v"], f["e"] if self.ema else f["p"],
-                            f["h"] if g["linear"] else f["p"], g["n"], starts if ragged else f["p"],
+                            f["h"] if g["linear"] else f["p"], g["n"], g["keep"] if keep else 0,
+                            starts if ragged else f["p"],
                             ends if ragged else f["p"], self.lr, self.wd, self.ema_c, coef, self.bc, g["lr_mult"],
                             g["wd"], self.b1, self.b2, self.eps, EMA=self.ema, BF16=g["linear"], RAGGED=ragged,
                             BLOCK=self.BLOCK, num_warps=8)
@@ -401,6 +416,12 @@ class FlatAdamW:
     def zero_grad(self) -> None:
         for g in self.groups:
             g["flat"]["g"].zero_()
+
+    def written_first(self) -> List[torch.Tensor]:
+        """The parameters whose gradients a step with ``keep`` leaves (the leading ``written_first`` parameters of
+        their groups): the caller arms them (``neuronspark.ops.linear.arm_grad_overwrite_``) before the backward of
+        the next update's first micro-batch."""
+        return [p for g in self.groups for p in g["written_first"]]
 
     # ------------------------------------------------------------------ the linear operator's bf16 weights
     def refresh_bf16(self) -> None:

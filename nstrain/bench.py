@@ -72,6 +72,7 @@ def _setup(model_spec, rows: int, seq_len: int, ac: str, shared: bool = False, m
     cfg = model_spec if isinstance(model_spec, dict) else M.model_config(model_spec)
     torch.manual_seed(0)
     model = M.build(cfg, dev, init="launch")
+    cfg = dict(cfg, vocab_size=int(model.config.vocab_size))         # (a config may leave it at the default)
     print(f"params {sum(p.numel() for p in model.parameters()) / 1e9:.3f} B", flush=True)
     g = torch.Generator(device="cpu").manual_seed(1)
     cal_rows, cal_len = min(rows, 8), min(seq_len, 4096)            # a run's launch calibration reads 4K rows
@@ -135,13 +136,13 @@ def profile(model_spec: str, rows: int, seq_len: int, ac: str = "none", top: int
     eng.x.copy_(x)
     eng.y.copy_(y)
     with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA]):   # the first session can be empty
-        eng._micro()
+        eng._micro(first=True)
         torch.cuda.synchronize()
     eng.opt.zero_grad()
     eng._zero_sums()
     with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA]) as prof:
-        for _ in range(n):
-            eng._micro()
+        for _ in range(n):          # each a one-micro-batch update: its backward writes the gradients the step kept
+            eng._micro(first=True)
             eng._norm()
             eng._step()
         torch.cuda.synchronize()
