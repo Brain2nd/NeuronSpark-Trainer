@@ -17,7 +17,11 @@ Data-parallel replicas (``data_parallel``: nstrain.data_parallel, more than one 
 backward sums the flat gradient buffers across the replicas bucket by bucket as the layers' gradients are written,
 then the rest of the buffers and the loss sums; the earlier micro-batches reduce nothing.  The loss sums are then
 divided by ``world``: the metrics are the global batch's, and every replica takes the same decision on a non-finite
-norm.  With one process (``data_parallel`` None or of world 1) the engine is the one-GPU step.
+norm.  The weights read through their bf16 values are updated in parts (the optimizer split by
+:meth:`nstrain.data_parallel.DataParallel.attach`): the ``norm`` graph gathers the replicas' sums of squares, the
+``step`` graph updates this replica's parts and gathers the bf16 values of the others.  An engine runs only with the
+split it was captured for (another split of the optimizer, or none, needs a new engine).  With one process
+(``data_parallel`` None or of world 1) the engine is the one-GPU step.
 
 The optimizer state is created at construction; the warm-up before capture runs at learning rate 0 (weights unchanged)
 and the optimizer state is restored afterwards (with the bf16 values of the linear operator's weights the optimizer
@@ -45,6 +49,9 @@ class StepEngine:
                  before_capture=None, data_parallel=None):
         self.model, self.opt = model, optimizer
         self.rep = data_parallel if data_parallel is not None and data_parallel.world > 1 else None
+        if self.rep is None and optimizer.sharding is not None:
+            raise RuntimeError("StepEngine: the optimizer is split among data-parallel replicas (FlatAdamW.shard); "
+                               "a one-GPU engine needs it whole: call unshard() on every replica first")
         self.world = self.rep.world if self.rep is not None else 1
         self.loss_fn = torch.compile(model.loss, dynamic=False) if compile else model.loss
         self.rows, self.L, self.accum, self.clip = int(rows), int(seq_len), int(accum), float(grad_clip)
@@ -64,6 +71,7 @@ class StepEngine:
         self.arena = arena if arena is not None else Arena()          # the trainer's: memory it already holds
         if self.rep is not None:
             self.rep.attach(model, optimizer, self.arena.stream)
+        self.sharding = optimizer.sharding                           # the split the graphs are captured for
         self._capture(warmup_iters, before_capture)
 
     # ------------------------------------------------------------------ bodies (eager and captured)
@@ -124,6 +132,7 @@ class StepEngine:
                 self._step()
         torch.cuda.synchronize()
         if before_capture is not None:                               # eager work whose first-call caches must be
+            self.opt.gather_()                                       # (its reads of the fp32 weights: whole)
             before_capture()                                         # live before the arena's free blocks become
         bodies = [("micro", self._micro)] + ([("micro_last", self._micro_last)] if self.rep is not None else []) + \
             [("norm", self._norm), ("step", self._step)]
@@ -154,7 +163,7 @@ class StepEngine:
         bufs = {n: b.detach().to("cpu") for n, b in self.model.named_buffers()}
         torch.cuda.synchronize()
         return {"flat": flat, "others": others, "bufs": bufs, "t": self.opt.t.to("cpu"), "bc": self.opt.bc.to("cpu"),
-                "lr": self.opt.lr.to("cpu"), "ema_c": self.opt.ema_c.to("cpu")}
+                "lr": self.opt.lr.to("cpu"), "ema_c": self.opt.ema_c.to("cpu"), "stale": self.opt.stale}
 
     @torch.no_grad()
     def _restore(self, saved: dict) -> None:
@@ -171,6 +180,7 @@ class StepEngine:
         self.opt.bc.copy_(saved["bc"])
         self.opt.lr.copy_(saved["lr"])
         self.opt.ema_c.copy_(saved["ema_c"])
+        self.opt.stale = saved["stale"]
         self.opt.refresh_bf16()                                      # the bf16 values of the restored weights
         torch.cuda.synchronize()
 
@@ -183,6 +193,7 @@ class StepEngine:
         average untouched).  Returns (metrics, applied); a non-finite gradient norm skips the update."""
         if inputs.ndim != 2 or inputs.shape[1] != self.L or inputs.shape[0] % self.rows or inputs.shape[0] == 0:
             raise ValueError(f"update of shape {tuple(inputs.shape)}, engine is (n x {self.rows}) x {self.L}")
+        self._check_split()
         self.opt.check_bf16()                                        # (a replayed graph reads the bf16 values kept
         accum = int(inputs.shape[0]) // self.rows                    # by the optimizer and cannot check them itself)
         self.set_accum(accum)
@@ -204,7 +215,15 @@ class StepEngine:
         self.opt.wd.fill_(wd_scale)
         self.opt.ema_c.fill_(ema_c)
         self.graphs["step"].replay()
+        self.opt.stale = self.sharding is not None
         return metrics, True
+
+    def _check_split(self) -> None:
+        """Refuse to replay graphs captured for another split of the optimizer among the replicas: they would reduce
+        and update the old parts while the optimizer reads the new ones."""
+        if self.opt.sharding is not self.sharding:
+            raise RuntimeError("StepEngine: the optimizer's split among the data-parallel replicas changed since this "
+                               "engine was captured (FlatAdamW.shard / unshard): release it and build a new engine")
 
     def set_accum(self, accum: int) -> None:
         """The number of micro-batches of the next update (per replica): the loss scale ``1 / (accum * world)``."""
@@ -216,6 +235,7 @@ class StepEngine:
         """Forward and backward of one micro-batch of pinned (rows, L) inputs / targets, its gradient added into the
         flat gradient buffers; ``last``: the update's last micro-batch, whose backward sums the replicas' gradients
         (nothing is reduced in the others)."""
+        self._check_split()
         self.x.copy_(x, non_blocking=True)
         self.y.copy_(y, non_blocking=True)
         self.graphs["micro_last" if last and self.rep is not None else "micro"].replay()

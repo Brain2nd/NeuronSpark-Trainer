@@ -339,7 +339,11 @@ OPT_CHUNK = 1 << 28                  # elements per pass over a flat buffer (1 G
 @torch.no_grad()
 def optimizer_metrics(opt, base_lr: float) -> Dict[str, float]:
     """The state of a nstrain.flat_adamw.FlatAdamW per parameter group and per bucket (see the module docstring),
-    summed in float64 over chunks of the flat buffers (the padding between the parameters is zero in every buffer)."""
+    summed in float64 over chunks of the flat buffers (the padding between the parameters is zero in every buffer);
+    a sharded optimizer is read after its ``gather_`` (refused before it, as its ``state``)."""
+    if opt.stale:
+        raise RuntimeError("optimizer_metrics: the parts other data-parallel replicas own were updated by them since "
+                           "the optimizer's last gather_: call gather_() on every replica first")
     out = {}
     t = float(opt.t)
     bc1 = 1.0 - opt.b1 ** t

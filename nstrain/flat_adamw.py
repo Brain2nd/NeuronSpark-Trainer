@@ -36,24 +36,42 @@ group's weight decay (1: the groups' values; a batch-size ramp scales it with th
 the device tensor ``c`` of the moving average (the update's tokens over the average's horizon in tokens,
 nstrain.trainer; the average starts as a copy of the parameters, :meth:`ema_init`), ``t`` a device step counter, so
 the step can be captured in a CUDA graph.
+
+Sharded state (:meth:`shard`, data-parallel replicas, nstrain.data_parallel): ranges of a linear group's buffers whose
+weights the training forward reads only through their bf16 values are split among the replicas in equal parts.  A
+replica updates its part of every such range (its reduction leaves the summed gradient there and zeroes the rest of
+the range) and every range outside them (replicated: every replica holds the summed gradient and updates it); the bf16
+values of the split ranges are then gathered from their owners, so they are whole on every replica after every update.
+The weights, moments and moving average of the parts other replicas own are left as they were (stale) until
+:meth:`gather_` brings them from the owners.  The gradient norms are the sums of squares of each replica's parts
+(the replicated ranges split among the replicas too), gathered and added in rank order.
 """
 from __future__ import annotations
 
-from typing import Dict, List, Tuple
+import bisect
+from typing import Dict, List, Optional, Tuple
 
 import torch
+import torch.distributed as dist
 import triton
 import triton.language as tl
 
 ALIGN = 64
+SHARD_ALIGN = 16                    # the boundaries of the replicas' parts: multiples of 16 elements
 
 
 @triton.jit
-def _adamw_kernel(P, G, M, V, E, H, n, lr_ptr, wd_ptr, c_ptr, coef_ptr, bc_ptr, lr_mult, wd_group, b1, b2, eps,
-                  EMA: tl.constexpr, BF16: tl.constexpr, BLOCK: tl.constexpr):
+def _adamw_kernel(P, G, M, V, E, H, n, starts, ends, lr_ptr, wd_ptr, c_ptr, coef_ptr, bc_ptr, lr_mult, wd_group, b1,
+                  b2, eps, EMA: tl.constexpr, BF16: tl.constexpr, RAGGED: tl.constexpr, BLOCK: tl.constexpr):
     pid = tl.program_id(0).to(tl.int64)
-    offs = pid * BLOCK + tl.arange(0, BLOCK)
-    mask = offs < n
+    if RAGGED:                             # the program's block [start, end) of a range (multiples of SHARD_ALIGN)
+        lo = tl.multiple_of(tl.load(starts + pid), 16)
+        hi = tl.multiple_of(tl.load(ends + pid), 16)
+        offs = lo + tl.arange(0, BLOCK)
+        mask = offs < hi
+    else:
+        offs = pid * BLOCK + tl.arange(0, BLOCK)
+        mask = offs < n
     lr = tl.load(lr_ptr) * lr_mult
     wd = tl.load(wd_ptr) * wd_group
     coef = tl.load(coef_ptr)
@@ -88,6 +106,14 @@ def _segments(ids: List[int], n: int, dev) -> torch.Tensor:
     return torch.tensor([r + [len(ids)] * (width - len(r)) for r in rows], dtype=torch.int64, device=dev)
 
 
+def _blocks(ranges: List[Tuple[int, int]], block: int, dev) -> Tuple[torch.Tensor, torch.Tensor]:
+    """(starts, ends), int64: one entry per program of an update over the element ranges ``ranges`` of a flat buffer:
+    the first element of the program's block and the end of the block (the range's end in its last block)."""
+    starts = [torch.arange(lo, hi, block, dtype=torch.int64) for lo, hi in ranges]
+    ends = [torch.clamp(s + block, max=hi) for s, (_, hi) in zip(starts, ranges)]
+    return torch.cat(starts).to(dev), torch.cat(ends).to(dev)
+
+
 class FlatAdamW:
     BLOCK = 2048
 
@@ -110,6 +136,9 @@ class FlatAdamW:
         self.bc = torch.zeros(2, dtype=torch.float32, device=dev)
         self.groups = []
         self.slots: Dict[str, tuple] = {}                                # name -> (group index, offset, numel, shape)
+        self.sharding: Optional[dict] = None                             # the replicas' parts (:meth:`shard`)
+        self.stale = False                                               # split: the parts other replicas own have
+        #                                                                  been updated since the last gather_
         keys = ("p", "g", "m", "v") + (("e",) if self.ema else ())
         for gi, g in enumerate(groups):
             params = g["params"]
@@ -169,8 +198,22 @@ class FlatAdamW:
     def grad_norms(self) -> Tuple[torch.Tensor, torch.Tensor]:
         """(the gradient norm of every group in the groups' order, the norm of every bucket in ``buckets``' order),
         fp32: one fused pass over the parameters' slices of the gradient buffers (``torch._foreach_norm``), the
-        groups' and the buckets' norms the square roots of the sums of squares."""
-        sq = torch.stack(torch._foreach_norm(self._slices)).square()
+        groups' and the buckets' norms the square roots of the sums of squares.  Sharded: the pass is over this
+        replica's pieces of the parameters (:meth:`shard`), and every parameter's sum of squares is the sum of the
+        replicas' in rank order (an all-gather: the same values on every replica)."""
+        sh = self.sharding
+        if sh is None:
+            sq = torch.stack(torch._foreach_norm(self._slices)).square()
+        else:
+            mine = torch.zeros(len(self._slices), dtype=torch.float32, device=self.t.device)
+            if sh["pieces"]:
+                mine.index_copy_(0, sh["piece_slot"], torch.stack(torch._foreach_norm(sh["pieces"])).square())
+            every = torch.empty(sh["world"] * mine.numel(), dtype=torch.float32, device=mine.device)
+            dist.all_gather_into_tensor(every, mine, group=sh["group"])
+            every = every.view(sh["world"], -1)
+            sq = every[0]
+            for r in range(1, sh["world"]):
+                sq = sq + every[r]
         sq = torch.cat([sq, sq.new_zeros(1)])                        # (the padding of the segments reads the zero)
         groups = sq[self._slice_group].sum(1).sqrt()
         if self.buckets:
@@ -184,17 +227,38 @@ class FlatAdamW:
 
     def step(self, coef: torch.Tensor) -> None:
         """One update with gradients scaled by the device scalar ``coef``; zeroes the gradients; moves the average
-        by ``ema_c``."""
+        by ``ema_c``.  Sharded: this replica's parts of the split ranges first, then the replicated ranges while the
+        bf16 values of the split ranges are gathered from their owners (on a side stream the step waits for)."""
         self.t.add_(1.0)
         self.bc[0].copy_(1.0 - torch.pow(self.b1, self.t))
         self.bc[1].copy_(torch.sqrt(1.0 - torch.pow(self.b2, self.t)))
-        for g in self.groups:
-            f = g["flat"]
-            grid = (triton.cdiv(g["n"], self.BLOCK),)
-            _adamw_kernel[grid](f["p"], f["g"], f["m"], f["v"], f["e"] if self.ema else f["p"],
-                                f["h"] if g["linear"] else f["p"], g["n"], self.lr, self.wd, self.ema_c, coef, self.bc,
-                                g["lr_mult"], g["wd"], self.b1, self.b2, self.eps, EMA=self.ema, BF16=g["linear"],
-                                BLOCK=self.BLOCK, num_warps=8)
+        sh = self.sharding
+        if sh is None:
+            for g in self.groups:
+                self._update(g, coef)
+            return
+        self.stale = True                                            # (a replay: the engine marks it)
+        for gi, starts, ends in sh["owned"]:
+            self._update(self.groups[gi], coef, starts, ends)
+        cur, side = torch.cuda.current_stream(), sh["stream"]
+        side.wait_stream(cur)
+        with torch.cuda.stream(side):
+            self._gather_bf16()
+        for gi, starts, ends in sh["replicated"]:
+            self._update(self.groups[gi], coef, starts, ends)
+        cur.wait_stream(side)
+
+    def _update(self, g: dict, coef: torch.Tensor, starts: Optional[torch.Tensor] = None,
+                ends: Optional[torch.Tensor] = None) -> None:
+        """The update kernel over the whole group, or over the blocks ``starts`` / ``ends`` (:func:`_blocks`)."""
+        f = g["flat"]
+        ragged = starts is not None
+        grid = (int(starts.numel()) if ragged else triton.cdiv(g["n"], self.BLOCK),)
+        _adamw_kernel[grid](f["p"], f["g"], f["m"], f["v"], f["e"] if self.ema else f["p"],
+                            f["h"] if g["linear"] else f["p"], g["n"], starts if ragged else f["p"],
+                            ends if ragged else f["p"], self.lr, self.wd, self.ema_c, coef, self.bc, g["lr_mult"],
+                            g["wd"], self.b1, self.b2, self.eps, EMA=self.ema, BF16=g["linear"], RAGGED=ragged,
+                            BLOCK=self.BLOCK, num_warps=8)
 
     def zero_grad(self) -> None:
         for g in self.groups:
@@ -203,7 +267,8 @@ class FlatAdamW:
     # ------------------------------------------------------------------ the linear operator's bf16 weights
     def refresh_bf16(self) -> None:
         """Bring the bf16 values of the linear groups up to the weights as they are now and bind every weight's part
-        to it again: after any write of a weight that is not this optimizer's update."""
+        to it again: after any write of a weight that is not this optimizer's update.  Sharded: the parts other
+        replicas own are gathered from them (a collective: every replica calls it)."""
         from_linear = [g for g in self.groups if g["linear"]]
         if not from_linear:
             return
@@ -211,6 +276,8 @@ class FlatAdamW:
         with torch.no_grad():
             for g in from_linear:
                 g["flat"]["h"].copy_(g["flat"]["p"])
+            self._gather_bf16()
+            for g in from_linear:
                 for p, part in g["bf16"]:
                     bind_train_bf16_(p, part)
                 g["bf16_versions"] = [p._version for p, _ in g["bf16"]]
@@ -236,7 +303,9 @@ class FlatAdamW:
                 g["flat"]["e"].copy_(g["flat"]["p"])
 
     def swap_ema(self) -> None:
-        """Exchange the parameters and their average (the model then computes with the average; again to undo)."""
+        """Exchange the parameters and their average (the model then computes with the average; again to undo).
+        Sharded: both are gathered whole first (a collective)."""
+        self.gather_()
         with torch.no_grad():
             for g in self.groups:
                 f = g["flat"]
@@ -248,7 +317,11 @@ class FlatAdamW:
 
     # ------------------------------------------------------------------ state by parameter name
     def state(self) -> Dict[str, Dict[str, torch.Tensor]]:
-        """Per parameter name: ``exp_avg``, ``exp_avg_sq``, ``step`` (and ``ema`` with the moving average)."""
+        """Per parameter name: ``exp_avg``, ``exp_avg_sq``, ``step`` (and ``ema`` with the moving average); views of
+        the buffers (sharded: whole after :meth:`gather_`, refused before it)."""
+        if self.stale:
+            raise RuntimeError("FlatAdamW.state: the parts other replicas own were updated by them since the last "
+                               "gather_ (sharded): call gather_() on every replica first")
         out = {}
         for name, (gi, off, k, shape) in self.slots.items():
             f = self.groups[gi]["flat"]
@@ -288,3 +361,109 @@ class FlatAdamW:
                 g["flat"]["m"].zero_()
                 g["flat"]["v"].zero_()
             self.t.zero_()
+
+    # ------------------------------------------------------------------ the replicas' parts (data parallel)
+    def shard(self, group, ranges: Dict[int, List[Tuple[int, int]]]) -> None:
+        """Split the element ranges ``ranges[gi]`` of linear group gi's buffers among the replicas of the process
+        group ``group`` (None: the default group) in equal parts: replica r of W owns the r-th W-th of every range
+        (whose summed gradient its reduction leaves there), updates it and nothing else of the range, and the range's
+        bf16 values are gathered from the owners after every update; every other range is replicated (see the module
+        documentation).  The ranges must be weights the training forward reads only through their bf16 values, with
+        boundaries at multiples of ``SHARD_ALIGN`` elements per replica.  A layout other than the present one gathers
+        the present one's state first (:meth:`gather_`), so the state is whole when the new parts are taken; the same
+        layout again changes nothing.  No ranges: not sharded."""
+        rank, world = dist.get_rank(group), dist.get_world_size(group)
+        layout = tuple(sorted((int(gi), tuple(sorted((int(lo), int(hi)) for lo, hi in rs)))
+                              for gi, rs in ranges.items() if rs))
+        spec = (group, rank, world, layout)
+        if self.sharding is not None and self.sharding["spec"] == spec:
+            return
+        self.unshard()
+        if not layout:
+            return
+        dev = self.t.device
+        buckets = []                                                 # (group, lo, hi, own lo, own hi)
+        for gi, rs in layout:
+            g = self.groups[gi]
+            if not g["linear"]:
+                raise ValueError(f"FlatAdamW.shard: group {g['name']} is not a linear group (its weights are read in "
+                                 "fp32 by the forward)")
+            end = 0
+            for lo, hi in rs:
+                if lo < end or hi > g["n"] or hi <= lo or lo % SHARD_ALIGN or (hi - lo) % (SHARD_ALIGN * world):
+                    raise ValueError(f"FlatAdamW.shard: range [{lo}, {hi}) of group {g['name']} (n {g['n']}) "
+                                     f"overlaps another, leaves the buffer or is not cut into {world} parts of "
+                                     f"multiples of {SHARD_ALIGN} elements")
+                c = (hi - lo) // world
+                buckets.append((gi, lo, hi, lo + rank * c, lo + (rank + 1) * c))
+                end = hi
+        owned, replicated = [], []
+        for gi, g in enumerate(self.groups):
+            cut = [(lo, hi, olo, ohi) for bgi, lo, hi, olo, ohi in buckets if bgi == gi]
+            if not cut:
+                replicated.append((gi, None, None))
+                continue
+            owned.append((gi,) + _blocks([(olo, ohi) for _, _, olo, ohi in cut], self.BLOCK, dev))
+            rest, at = [], 0
+            for lo, hi, _, _ in cut:
+                if lo > at:
+                    rest.append((at, lo))
+                at = hi
+            if at < g["n"]:
+                rest.append((at, g["n"]))
+            if rest:
+                replicated.append((gi,) + _blocks(rest, self.BLOCK, dev))
+        # the gradient norms' pieces: a parameter in a split range, its intersection with this replica's part; any
+        # other parameter (its summed gradient on every replica), its rank-th of world consecutive pieces
+        lows = {gi: [b[1] for b in buckets if b[0] == gi] for gi in range(len(self.groups))}
+        rows = {gi: [b for b in buckets if b[0] == gi] for gi in range(len(self.groups))}
+        pieces, slot = [], []
+        for i, (name, (gi, off, k, _)) in enumerate(self.slots.items()):
+            j = bisect.bisect_right(lows[gi], off) - 1
+            inside = j >= 0 and off < rows[gi][j][2]
+            if inside:
+                _, lo, hi, olo, ohi = rows[gi][j]
+                if off + k > hi:
+                    raise ValueError(f"FlatAdamW.shard: {name} crosses the end of the range [{lo}, {hi})")
+                a, z = max(off, olo), min(off + k, ohi)
+            else:
+                if j + 1 < len(rows[gi]) and rows[gi][j + 1][1] < off + k:
+                    raise ValueError(f"FlatAdamW.shard: {name} crosses the start of a range")
+                a, z = off + k * rank // world, off + k * (rank + 1) // world
+            if z > a:
+                pieces.append(self.groups[gi]["flat"]["g"][a:z])
+                slot.append(i)
+        self.sharding = {"spec": spec, "group": group, "rank": rank, "world": world, "buckets": buckets,
+                         "owned": owned, "replicated": replicated, "pieces": pieces,
+                         "piece_slot": torch.tensor(slot, dtype=torch.int64, device=dev),
+                         "stream": torch.cuda.Stream(device=dev)}
+
+    def gather_(self) -> None:
+        """Sharded: bring the weights, moments and moving average of the parts other replicas own from their owners,
+        so that every replica's buffers are whole (and the same): before reading :meth:`state` or the weights in
+        fp32 (a checkpoint, an evaluation, a comparison of replicas).  A collective: every replica calls it.  No-op
+        when not sharded."""
+        sh = self.sharding
+        if sh is None:
+            return
+        keys = ("p", "m", "v") + (("e",) if self.ema else ())
+        with torch.no_grad():
+            for gi, lo, hi, olo, ohi in sh["buckets"]:
+                f = self.groups[gi]["flat"]
+                for k in keys:
+                    dist.all_gather_into_tensor(f[k][lo:hi], f[k][olo:ohi], group=sh["group"])
+        self.stale = False
+
+    def unshard(self) -> None:
+        """Gather the state whole (:meth:`gather_`) and leave the sharded layout: every replica updates everything."""
+        self.gather_()
+        self.sharding = None
+
+    def _gather_bf16(self) -> None:
+        """Sharded: the bf16 values of every split range from the parts' owners (in place, on the current stream)."""
+        sh = self.sharding
+        if sh is None:
+            return
+        for gi, lo, hi, olo, ohi in sh["buckets"]:
+            h = self.groups[gi]["flat"]["h"]
+            dist.all_gather_into_tensor(h[lo:hi], h[olo:ohi], group=sh["group"])
