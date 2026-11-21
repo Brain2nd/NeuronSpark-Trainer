@@ -58,6 +58,8 @@ from typing import Dict, List, Tuple
 import torch
 import torch.distributed as dist
 
+from nstrain.engine import release_graphs
+
 BUCKET_MIN_NUMEL = 1 << 24          # 16 M fp32 elements (64 MB) per bucket at least, consecutive layers merged
 GROUP_MIN_NUMEL = 1 << 24           # a group smaller than this is summed whole in the tail
 HEAD = 1 << 30                      # the bucket of the lookup tables' slices (issued at the readout's input)
@@ -95,6 +97,9 @@ class DataParallel:
         return cls()
 
     def close(self) -> None:
+        """Destroy the process group, every captured graph still alive released first (nstrain.engine.release_graphs:
+        NCCL's teardown waits for the graphs that hold its kernels)."""
+        release_graphs()
         if dist.is_initialized():
             dist.destroy_process_group()
 
@@ -113,7 +118,8 @@ class DataParallel:
         input of every layer of ``model`` (its modules named ``...layers.<i>``); ``stream``: the stream the backward
         runs on."""
         self._stream = stream
-        self.side = torch.cuda.Stream()
+        self.side = torch.cuda.Stream(priority=torch.cuda.Stream.priority_range()[1])   # (the highest: its
+        #                     collectives dispatched ahead of the backward's pending blocks, nstrain.engine.Graph)
         layers, prefix = {}, None                                    # the outermost ``<prefix>layers.<i>`` modules
         for name, mod in model.named_modules():
             m = re.fullmatch(r"(.*?)layers\.(\d+)", name)

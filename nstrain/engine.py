@@ -23,6 +23,10 @@ norm.  The weights read through their bf16 values are updated in parts (the opti
 split it was captured for (another split of the optimizer, or none, needs a new engine).  With one process
 (``data_parallel`` None or of world 1) the engine is the one-GPU step.
 
+The graphs are launched with the priorities of the streams their kernels were captured from (:class:`Graph`): the
+replicas' collectives, captured from side streams of the highest priority, are dispatched ahead of the pending blocks
+of the backward's and the update's kernels they overlap.
+
 The optimizer state is created at construction; the warm-up before capture runs at learning rate 0 (weights unchanged)
 and the optimizer state is restored afterwards (with the bf16 values of the linear operator's weights the optimizer
 keeps, nstrain.flat_adamw, refreshed before the warm-up and after the restore); buffers the forward may write are
@@ -35,12 +39,96 @@ asking the driver for more when the arena has room.
 """
 from __future__ import annotations
 
+import ctypes
 import math
+import weakref
 from typing import Dict, Tuple
 
 import torch
 
 from nstrain.flat_adamw import FlatAdamW
+
+_CU = None                                                       # the CUDA driver, loaded on first use
+AUTO_FREE_ON_LAUNCH, USE_NODE_PRIORITY = 1, 8                    # CUgraphInstantiate_flags
+
+
+def _driver():
+    global _CU
+    if _CU is None:
+        cu = ctypes.CDLL("libcuda.so.1")
+        cu.cuGraphInstantiateWithFlags.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p,
+                                                   ctypes.c_ulonglong]
+        cu.cuGraphLaunch.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        cu.cuGraphExecDestroy.argtypes = [ctypes.c_void_p]
+        for f in (cu.cuGraphInstantiateWithFlags, cu.cuGraphLaunch, cu.cuGraphExecDestroy):
+            f.restype = ctypes.c_int
+        _CU = cu
+    return _CU
+
+
+_LIVE: "weakref.WeakSet" = weakref.WeakSet()                     # every Graph of the process not yet collected
+
+
+def release_graphs() -> None:
+    """Release every graph of the process that is still alive: before the process group is destroyed
+    (nstrain.data_parallel), as NCCL's teardown waits for the graphs that hold its kernels (an engine that was not
+    released, or the graphs of an engine whose construction failed after a capture)."""
+    for g in list(_LIVE):
+        g.release()
+
+
+class Graph:
+    """A captured CUDA graph whose kernels run at the priority of the stream each was captured from.  torch's
+    CUDAGraph instantiates without the driver's node-priority flag, so a replayed kernel runs at the priority of the
+    stream the graph is launched into, and a collective captured from a high-priority side stream (the backward's
+    reductions, nstrain.data_parallel; the step's gathers, nstrain.flat_adamw) is dispatched only after every block of
+    the kernel it was meant to overlap.  torch keeps the captured graph (``keep_graph``) and the memory pool its
+    buffers live in; the executable is instantiated here with torch's flag and the node priority, launched as torch
+    launches a graph (on the current stream of the device it was captured on), and destroyed by :meth:`release` before
+    torch's graph (whose reset gives the pool back), once the device has finished the launches in flight."""
+
+    def __init__(self):
+        self.g = torch.cuda.CUDAGraph(keep_graph=True)
+        self.exec = None
+        self.device = torch.cuda.current_device()
+        _LIVE.add(self)
+
+    def capture_begin(self, pool, capture_error_mode: str) -> None:
+        self.device = torch.cuda.current_device()
+        self.g.capture_begin(pool=pool, capture_error_mode=capture_error_mode)
+
+    def capture_end(self) -> None:
+        self.g.capture_end()
+
+    def instantiate(self) -> None:
+        ex = ctypes.c_void_p()
+        rc = _driver().cuGraphInstantiateWithFlags(ctypes.byref(ex), ctypes.c_void_p(self.g.raw_cuda_graph()),
+                                                   AUTO_FREE_ON_LAUNCH | USE_NODE_PRIORITY)
+        if rc != 0:
+            raise RuntimeError(f"nstrain.engine: cuGraphInstantiateWithFlags failed (CUresult {rc})")
+        self.exec = ex
+
+    def replay(self) -> None:
+        with torch.cuda.device(self.device):
+            rc = _driver().cuGraphLaunch(self.exec, ctypes.c_void_p(torch.cuda.current_stream().cuda_stream))
+        if rc != 0:
+            raise RuntimeError(f"nstrain.engine: cuGraphLaunch failed (CUresult {rc})")
+
+    def release(self) -> None:
+        if self.exec is not None or self.g is not None:
+            torch.cuda.synchronize(self.device)                  # (a launch in flight still uses the pool's memory)
+        if self.exec is not None:
+            _driver().cuGraphExecDestroy(self.exec)
+            self.exec = None
+        if self.g is not None:
+            self.g.reset()
+            self.g = None
+
+    def __del__(self):
+        try:
+            self.release()
+        except Exception:                                        # (the interpreter's exit: the driver may be gone)
+            pass
 
 
 class StepEngine:
@@ -66,7 +154,7 @@ class StepEngine:
         self.gnorms = torch.zeros(len(optimizer.groups), **f32)      # per parameter group (the diagnostic of a
         self.group_names = [g["name"] for g in optimizer.groups]     # spike: nstrain.trainer logs them by name)
         self.gnorm_buckets = torch.zeros(len(optimizer.buckets), **f32)   # per bucket (the model's layers)
-        self.graphs: Dict[str, torch.cuda.CUDAGraph] = {}
+        self.graphs: Dict[str, Graph] = {}
         from nstrain.gpu import Arena
         self.arena = arena if arena is not None else Arena()          # the trainer's: memory it already holds
         if self.rep is not None:
@@ -137,13 +225,14 @@ class StepEngine:
         bodies = [("micro", self._micro)] + ([("micro_last", self._micro_last)] if self.rep is not None else []) + \
             [("norm", self._norm), ("step", self._step)]
         for name, body in bodies:                                    # graph scratch
-            g = torch.cuda.CUDAGraph()
+            g = Graph()
             with torch.cuda.stream(a.stream):
                 g.capture_begin(pool=a.pool.id, capture_error_mode="thread_local")
                 try:
                     body()
                 finally:                                             # (as torch.cuda.graph's exit: a failed body
                     g.capture_end()                                  # still ends the capture)
+            g.instantiate()
             self.graphs[name] = g
         torch.cuda.synchronize()
         self._restore(saved)                                         # undo the warm-up
@@ -242,6 +331,8 @@ class StepEngine:
         self.graphs["micro_last" if last and self.rep is not None else "micro"].replay()
 
     def release(self) -> None:
+        for g in self.graphs.values():
+            g.release()
         self.graphs.clear()
         if self.rep is not None:
             self.rep.detach()

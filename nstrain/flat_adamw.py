@@ -41,7 +41,8 @@ Sharded state (:meth:`shard`, data-parallel replicas, nstrain.data_parallel): ra
 weights the training forward reads only through their bf16 values are split among the replicas in equal parts.  A
 replica updates its part of every such range (its reduction leaves the summed gradient there and zeroes the rest of
 the range) and every range outside them (replicated: every replica holds the summed gradient and updates it); the bf16
-values of the split ranges are then gathered from their owners, so they are whole on every replica after every update.
+values of each split range are gathered from their owners as soon as the owners have updated their parts (range by
+range, while the next range's part is updated), so they are whole on every replica after every update.
 The weights, moments and moving average of the parts other replicas own are left as they were (stale) until
 :meth:`gather_` brings them from the owners.  The gradient norms are the sums of squares of each replica's parts
 (the replicated ranges split among the replicas too), gathered and added in rank order.
@@ -227,8 +228,9 @@ class FlatAdamW:
 
     def step(self, coef: torch.Tensor) -> None:
         """One update with gradients scaled by the device scalar ``coef``; zeroes the gradients; moves the average
-        by ``ema_c``.  Sharded: this replica's parts of the split ranges first, then the replicated ranges while the
-        bf16 values of the split ranges are gathered from their owners (on a side stream the step waits for)."""
+        by ``ema_c``.  Sharded: this replica's part of every split range in turn, each range's bf16 values gathered
+        from the owners of its parts as soon as its part is updated (on a side stream, while the next part and then the
+        replicated ranges are updated; the step waits for the side stream)."""
         self.t.add_(1.0)
         self.bc[0].copy_(1.0 - torch.pow(self.b1, self.t))
         self.bc[1].copy_(torch.sqrt(1.0 - torch.pow(self.b2, self.t)))
@@ -238,12 +240,12 @@ class FlatAdamW:
                 self._update(g, coef)
             return
         self.stale = True                                            # (a replay: the engine marks it)
-        for gi, starts, ends in sh["owned"]:
-            self._update(self.groups[gi], coef, starts, ends)
         cur, side = torch.cuda.current_stream(), sh["stream"]
-        side.wait_stream(cur)
-        with torch.cuda.stream(side):
-            self._gather_bf16()
+        for (gi, starts, ends), rng in zip(sh["owned"], sh["buckets"]):
+            self._update(self.groups[gi], coef, starts, ends)
+            side.wait_stream(cur)
+            with torch.cuda.stream(side):
+                self._gather_range(*rng)
         for gi, starts, ends in sh["replicated"]:
             self._update(self.groups[gi], coef, starts, ends)
         cur.wait_stream(side)
@@ -397,15 +399,15 @@ class FlatAdamW:
                 c = (hi - lo) // world
                 buckets.append((gi, lo, hi, lo + rank * c, lo + (rank + 1) * c))
                 end = hi
-        owned, replicated = [], []
+        owned = [(gi,) + _blocks([(olo, ohi)], self.BLOCK, dev) for gi, _, _, olo, ohi in buckets]   # (per range)
+        replicated = []
         for gi, g in enumerate(self.groups):
-            cut = [(lo, hi, olo, ohi) for bgi, lo, hi, olo, ohi in buckets if bgi == gi]
+            cut = [(lo, hi) for bgi, lo, hi, _, _ in buckets if bgi == gi]
             if not cut:
                 replicated.append((gi, None, None))
                 continue
-            owned.append((gi,) + _blocks([(olo, ohi) for _, _, olo, ohi in cut], self.BLOCK, dev))
             rest, at = [], 0
-            for lo, hi, _, _ in cut:
+            for lo, hi in cut:
                 if lo > at:
                     rest.append((at, lo))
                 at = hi
@@ -436,7 +438,8 @@ class FlatAdamW:
         self.sharding = {"spec": spec, "group": group, "rank": rank, "world": world, "buckets": buckets,
                          "owned": owned, "replicated": replicated, "pieces": pieces,
                          "piece_slot": torch.tensor(slot, dtype=torch.int64, device=dev),
-                         "stream": torch.cuda.Stream(device=dev)}
+                         "stream": torch.cuda.Stream(device=dev, priority=torch.cuda.Stream.priority_range()[1])}
+        #                (the highest: the gathers dispatched ahead of the update's pending blocks, nstrain.engine.Graph)
 
     def gather_(self) -> None:
         """Sharded: bring the weights, moments and moving average of the parts other replicas own from their owners,
@@ -464,6 +467,11 @@ class FlatAdamW:
         sh = self.sharding
         if sh is None:
             return
-        for gi, lo, hi, olo, ohi in sh["buckets"]:
-            h = self.groups[gi]["flat"]["h"]
-            dist.all_gather_into_tensor(h[lo:hi], h[olo:ohi], group=sh["group"])
+        for rng in sh["buckets"]:
+            self._gather_range(*rng)
+
+    def _gather_range(self, gi: int, lo: int, hi: int, olo: int, ohi: int) -> None:
+        """The bf16 values of the split range [lo, hi) of group gi (this replica's part [olo, ohi)) from the owners of
+        its parts (in place, on the current stream)."""
+        h = self.groups[gi]["flat"]["h"]
+        dist.all_gather_into_tensor(h[lo:hi], h[olo:ohi], group=self.sharding["group"])
