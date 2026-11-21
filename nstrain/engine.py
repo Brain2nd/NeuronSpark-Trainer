@@ -10,7 +10,10 @@ Four graphs share one memory pool:
   ``written_first`` (the projections and the tied embedding: the linear operator's GEMM writes each one's gradient
   before anything else in the backward) are armed (``neuronspark.ops.linear.arm_grad_overwrite_``), so their first
   GEMM writes the gradient instead of adding it into zeros, and the step does not zero their part of the buffers;
-  the capture refuses a ``micro_first`` that leaves one of them armed (a weight its backward did not reach).
+  the capture refuses a ``micro_first`` that leaves one of them armed (a weight its backward did not reach).  The
+  gradients autograd itself accumulates (every parameter the linear operator does not write: the vectors, the
+  lexical tables, the matrices read in fp32) are added by multi-tensor kernels instead of one add per parameter
+  (:class:`FusedAccumulation`).
 * ``norm``: the gradient norms (fp32) into static tensors: the groups' and the buckets' (the model's layers,
   nstrain.flat_adamw) and the global one.  The host reads them once per update: a non-finite global norm skips the
   update (the gradients are zeroed, the optimizer and the weights are untouched).
@@ -50,7 +53,8 @@ from __future__ import annotations
 import ctypes
 import math
 import weakref
-from typing import Dict, Tuple
+from functools import partial
+from typing import Dict, List, Tuple
 
 import torch
 
@@ -139,6 +143,61 @@ class Graph:
             pass
 
 
+class FusedAccumulation:
+    """The gradients autograd hands the AccumulateGrad nodes of ``params`` in a backward, added into the parameters'
+    ``.grad`` (views of the optimizer's flat buffers) by ``torch._foreach_add_`` instead of one add per parameter.
+
+    :meth:`arm`, after a forward and before its backward, puts a pre-hook on the AccumulateGrad node of every one of
+    ``params`` that requires a gradient (the node of this forward's graph: autograd makes the nodes in the forward, on
+    its stream, and frees them with the graph); the hook keeps the dense gradient it is handed and replaces it with
+    none, so the node adds nothing.  The node still calls the parameter's post-accumulate hook (torch 2.9: after an
+    undefined gradient too), before the kept gradient is added: a hook that reads ``.grad`` must :meth:`flush` first, as
+    nstrain.data_parallel does before every collective.  Left to the node: no gradient (a weight whose gradient the
+    linear operator writes itself, :func:`neuronspark.ops.linear.bind_grad_`), a sparse one, and any gradient of a
+    parameter without ``.grad``.  The kept gradients are added by :meth:`flush`: when they reach ``limit`` elements, when
+    a collective is about to read the buffers and in :meth:`disarm` after the backward (which removes the hooks even if
+    the additions fail).  The same fp32 additions as the nodes', so the buffers hold the same bits.  The forward and
+    the backward run on one stream, and no AccumulateGrad node of ``params`` is kept alive from another stream (e.g. by
+    ``torch.autograd.graph.get_gradient_edge``): the additions are ordered on the stream current at the flush.  Under a
+    CUDA-graph capture the hooks run and the additions are captured; a replay runs only the kernels."""
+
+    def __init__(self, params: List[torch.Tensor], limit: int = 1 << 22):
+        self.params, self.limit = list(params), int(limit)
+        self._kept: List[Tuple[torch.Tensor, torch.Tensor]] = []
+        self._held = 0
+        self._handles: list = []
+
+    def arm(self) -> None:
+        for p in self.params:
+            if p.requires_grad:
+                node = p.view_as(p).grad_fn.next_functions[0][0]
+                self._handles.append(node.register_prehook(partial(self._keep, p)))
+
+    def _keep(self, p: torch.Tensor, grads):
+        g = grads[0]
+        if g is None or g.layout != torch.strided or p.grad is None:   # (none: also kept by an earlier hook)
+            return None
+        self._kept.append((p, g))
+        self._held += g.numel()
+        if self._held >= self.limit:
+            self.flush()
+        return (None,)
+
+    def flush(self) -> None:
+        if self._kept:
+            kept, self._kept, self._held = self._kept, [], 0
+            torch._foreach_add_([p.grad for p, _ in kept], [g for _, g in kept])
+
+    def disarm(self) -> None:
+        try:
+            self.flush()
+        finally:
+            for h in self._handles:
+                h.remove()
+            self._handles = []
+            self._kept, self._held = [], 0
+
+
 class StepEngine:
     def __init__(self, model, optimizer: FlatAdamW, rows: int, seq_len: int, accum: int,
                  grad_clip: float = 1.0, warmup_iters: int = 3, compile: bool = False, arena=None,
@@ -164,28 +223,38 @@ class StepEngine:
         self.gnorm_buckets = torch.zeros(len(optimizer.buckets), **f32)   # per bucket (the model's layers)
         self.graphs: Dict[str, Graph] = {}
         self.first = optimizer.written_first()                       # armed in an update's first micro-batch
+        self.fused = FusedAccumulation(optimizer.params)             # (a bound weight's node gets no gradient)
         from nstrain.gpu import Arena
         self.arena = arena if arena is not None else Arena()          # the trainer's: memory it already holds
         if self.rep is not None:
-            self.rep.attach(model, optimizer, self.arena.stream, overwrite=bool(self.first))
+            self.rep.attach(model, optimizer, self.arena.stream, overwrite=bool(self.first), fused=self.fused)
         self.sharding = optimizer.sharding                           # the split the graphs are captured for
         self.bf16_at = optimizer.bf16_buffers()                      # and the bf16 buffers they read and write
         self._capture(warmup_iters, before_capture)
 
     # ------------------------------------------------------------------ bodies (eager and captured)
     def _backward(self, loss: torch.Tensor, first: bool) -> None:
-        """``loss.backward()``; ``first``: the update's first micro-batch, the ``written_first`` weights armed (their
-        first GEMM writes the gradient) and refused if one is left armed."""
+        """``loss.backward()`` with autograd's accumulation fused (:class:`FusedAccumulation`); ``first``: the update's
+        first micro-batch, the ``written_first`` weights armed (their first GEMM writes the gradient) and refused if
+        one is left armed."""
         if not (first and self.first):
-            loss.backward()
+            try:
+                self.fused.arm()
+                loss.backward()
+            finally:
+                self.fused.disarm()
             return
         from neuronspark.ops.linear import arm_grad_overwrite_, armed_grad_overwrites
         arm_grad_overwrite_(self.first)
         try:
+            self.fused.arm()
             loss.backward()
         finally:
-            left = armed_grad_overwrites(self.first)
-            arm_grad_overwrite_(left, armed=False)
+            try:
+                self.fused.disarm()
+            finally:
+                left = armed_grad_overwrites(self.first)
+                arm_grad_overwrite_(left, armed=False)
         if left:
             names = {id(p): n for n, p in self.model.named_parameters()}
             raise RuntimeError(f"StepEngine: {len(left)} weight(s) the optimizer lists as written first got no "

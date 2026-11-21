@@ -97,6 +97,7 @@ class DataParallel:
         self._left: List[int] = []                                   # per early part: gradients still to accumulate
         self._seen: set = set()                                      # the early parts' parameters accumulated
         self._handles: list = []                                     # the module hooks (removed by detach)
+        self.fused = None                                            # the engine's fused accumulation (attach)
 
     @classmethod
     def from_env(cls) -> "DataParallel":
@@ -123,14 +124,17 @@ class DataParallel:
         dist.all_reduce(t, group=self.group)
 
     # ------------------------------------------------------------------ the reduction hidden behind the backward
-    def attach(self, model, opt, stream, overwrite: bool = False) -> None:
+    def attach(self, model, opt, stream, overwrite: bool = False, fused=None) -> None:
         """Cut the flat gradient buffers of ``opt`` into the layers' buckets and the tail, split the linear group's
         layer buckets among the replicas (``opt``'s layout, :meth:`nstrain.flat_adamw.FlatAdamW.shard`), and hook the
         input of every layer of ``model`` (its modules named ``...layers.<i>``); ``stream``: the stream the backward
         runs on; ``overwrite``: the caller arms the optimizer's ``written_first`` weights in every update's first
         backward (their gradients written, not added), so a split bucket of theirs leaves the rest of the bucket as it
-        is after its reduce-scatter."""
+        is after its reduce-scatter; ``fused``: the caller's :class:`nstrain.engine.FusedAccumulation`, which keeps
+        autograd's gradients and adds them later: its kept gradients are added before every collective (a kept
+        gradient's post-accumulate hook runs when it is kept, before it is added)."""
         self._stream = stream
+        self.fused = fused
         self.side = torch.cuda.Stream(priority=torch.cuda.Stream.priority_range()[1])   # (the highest: its
         #                     collectives dispatched ahead of the backward's pending blocks, nstrain.engine.Graph)
         layers, prefix = {}, None                                    # the outermost ``<prefix>layers.<i>`` modules
@@ -247,6 +251,7 @@ class DataParallel:
         optimizer keeps its split layout: a new engine of the same layout continues it, another layout gathers it
         first (:meth:`nstrain.flat_adamw.FlatAdamW.shard`)."""
         self._unhook()
+        self.fused = None                                            # (it holds the engine's parameters)
 
     def _unhook(self) -> None:
         for h in self._handles:
@@ -288,9 +293,10 @@ class DataParallel:
         return None
 
     def _accumulated(self, i, name, param) -> None:
-        """Autograd has accumulated ``name``'s gradient into its view of the buffer: the early part ``i`` holding it is
-        issued once every gradient in it is.  Autograd calls this on the stream it ran the accumulation on (the
-        accumulator's, current here), which the side stream waits for as well as for the backward's."""
+        """Autograd has accumulated ``name``'s gradient into its view of the buffer, or the engine's fused accumulation
+        has kept it (added in :meth:`_issue`, before the sum): the early part ``i`` holding it is issued once every
+        gradient in it is.  Autograd calls this on the stream it ran the accumulation on (the accumulator's, current
+        here), which the side stream waits for as well as for the backward's."""
         if not self._armed:
             return
         if name in self._seen:                                       # (the part would be issued before the second)
@@ -305,9 +311,12 @@ class DataParallel:
         once the backward's stream (and ``after``, when given) has reached this point: a split view by a reduce-scatter
         (this replica's part of the sum stays in its part of the view; the rest of the view, this replica's own
         gradient, is zeroed for the next update unless the next update's first backward writes it), any other by an
-        all-reduce."""
+        all-reduce.  The gradients the engine's fused accumulation holds are added first, on the current stream."""
         if not views:
             return
+        if self.fused is not None:                                   # (the gradients it kept: added before the sum,
+            self.fused.flush()                                       # on the stream current here)
+            after = after if after is not None else torch.cuda.current_stream()
         self.order.append(what)
         self.side.wait_stream(self._stream)
         if after is not None and after != self._stream:
