@@ -109,8 +109,8 @@ class StepEngine:
 
     # ------------------------------------------------------------------ capture
     def _capture(self, warmup_iters: int, before_capture=None) -> None:
-        # the warm-up runs real steps at learning rate 0; a non-finite warm-up gradient would still reach the weights
-        # (0 x NaN), so the parameters are restored too
+        # the warm-up runs real steps at learning rate 0 and moving-average step 0; a non-finite warm-up gradient would
+        # still reach the weights, the moments and the moving average (0 x NaN), so all of them are restored
         # everything in the arena (the copies, the warm-up, the captures): memory it holds, no new driver memory;
         # captured without torch.cuda.graph, whose entry empties the allocator's cache (it would give the memory
         # back to the driver, for any process to take), thread-local (the prefetch thread may pin host memory)
@@ -154,11 +154,12 @@ class StepEngine:
 
     def _snapshot(self) -> dict:
         """The state the warm-up (and the validation before the capture) may change, copied to the host: the
-        optimizer's flat buffers (the trainable weights ``p`` and the moments ``m``, ``v``, one contiguous copy per
-        group), the parameters outside them (none trainable), the model's buffers, the step count and the learning
-        rate."""
+        optimizer's flat buffers (the trainable weights ``p``, the moments ``m``, ``v`` and, with ``ema``, the moving
+        average ``e``, one contiguous copy per group), the parameters outside them (none trainable), the model's
+        buffers, the step count and the learning rate."""
         torch.cuda.synchronize()                                     # (the last engine's work on them: done)
-        flat = [{k: g["flat"][k].to("cpu") for k in ("p", "m", "v")} for g in self.opt.groups]
+        keys = ("p", "m", "v") + (("e",) if self.opt.ema else ())
+        flat = [{k: g["flat"][k].to("cpu") for k in keys} for g in self.opt.groups]
         others = {n: p.detach().to("cpu") for n, p in self.model.named_parameters() if n not in self.opt.slots}
         bufs = {n: b.detach().to("cpu") for n, b in self.model.named_buffers()}
         torch.cuda.synchronize()
@@ -168,8 +169,8 @@ class StepEngine:
     @torch.no_grad()
     def _restore(self, saved: dict) -> None:
         for g, h in zip(self.opt.groups, saved["flat"]):
-            for k in ("p", "m", "v"):
-                g["flat"][k].copy_(h[k])
+            for k, v in h.items():
+                g["flat"][k].copy_(v)
         params = dict(self.model.named_parameters())
         for n, q in saved["others"].items():
             params[n].copy_(q)
