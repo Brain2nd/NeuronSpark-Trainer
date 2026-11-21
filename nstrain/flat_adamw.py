@@ -3,9 +3,10 @@
 Every parameter group gets four flat fp32 buffers: parameters, gradients, first and second moments (and, with
 ``ema``, a fifth: the exponential moving average of the parameters).  The model's parameters become views into the
 parameter buffer and their ``.grad`` views into the gradient buffer (offsets padded to 64 elements), so autograd
-accumulates straight into the flat gradients, the gradient norms are one pass over the buffers (per parameter
-tensor, fused; the groups' and any bucketing of the tensors -- the model's layers -- are sums of squares of those in
-a fixed order, :meth:`FlatAdamW.grad_norms`) and the update is one kernel per group that reads the gradient once:
+accumulates straight into the flat gradients, the gradient norms are one pass over the buffers (each parameter's sum of
+squares from chunks of its slice, a program per chunk; the groups' and any bucketing of the parameters -- the model's
+layers -- are sums of those in a fixed order, :meth:`FlatAdamW.grad_norms`) and the update is one kernel per group
+that reads the gradient once:
 clip coefficient, moments, decoupled weight decay, bias-corrected step, the moving average, and the gradient zeroed for
 the next update.
 An ``nn.Embedding`` of the model whose weight is held here is set to ``sparse``: the gradient of its lookup is then the
@@ -72,6 +73,8 @@ import triton.language as tl
 
 ALIGN = 64
 SHARD_ALIGN = 16                    # the boundaries of the replicas' parts: multiples of 16 elements
+NORM_CHUNK = 16384                  # the gradient norms' pass: elements per program (at most; one parameter's)
+NORM_BLOCK = 2048                   # and per step of a program
 
 
 @triton.jit
@@ -111,6 +114,35 @@ def _adamw_kernel(P, G, M, V, E, H, n, starts, ends, lr_ptr, wd_ptr, c_ptr, coef
         tl.store(E + offs, e + c * (p - e), mask=mask)
 
 
+@triton.jit
+def _sumsq_kernel(G, starts, ends, out, CHUNK: tl.constexpr, BLOCK: tl.constexpr):
+    """out[pid]: the sum of squares of the chunk [start, end) of the flat buffer G (multiples of 16, at most CHUNK
+    elements), its elements added in BLOCK-wide steps, then the BLOCK lanes summed: a fixed order."""
+    pid = tl.program_id(0).to(tl.int64)
+    lo = tl.multiple_of(tl.load(starts + pid), 16)
+    hi = tl.multiple_of(tl.load(ends + pid), 16)
+    acc = tl.zeros([BLOCK], dtype=tl.float32)
+    for i in tl.static_range(0, CHUNK, BLOCK):
+        offs = lo + i + tl.arange(0, BLOCK)
+        x = tl.load(G + offs, mask=offs < hi, other=0.0)
+        acc += x * x
+    tl.store(out + pid, tl.sum(acc, axis=0))
+
+
+@triton.jit
+def _slot_sums_kernel(part, first, last, sq, BLOCK: tl.constexpr):
+    """sq[s]: the sum of slot s's chunk sums part[first[s]:last[s]], added in BLOCK-wide steps, then the lanes (0 for a
+    slot with no chunk)."""
+    s = tl.program_id(0)
+    c0 = tl.load(first + s)
+    c1 = tl.load(last + s)
+    acc = tl.zeros([BLOCK], dtype=tl.float32)
+    for c in range(c0, c1, BLOCK):
+        offs = c + tl.arange(0, BLOCK)
+        acc += tl.load(part + offs, mask=offs < c1, other=0.0)
+    tl.store(sq + s, tl.sum(acc, axis=0))
+
+
 def _segments(ids: List[int], n: int, dev) -> torch.Tensor:
     """(n, longest) int64: row s lists the positions i with ``ids[i] == s``, padded with ``len(ids)``; a sum over the
     rows of a vector gathered with it adds every segment's values in a fixed order (unlike ``index_add_``, whose
@@ -126,6 +158,32 @@ def _blocks(ranges: List[Tuple[int, int]], block: int, dev) -> Tuple[torch.Tenso
     starts = [torch.arange(lo, hi, block, dtype=torch.int64) for lo, hi in ranges]
     ends = [torch.clamp(s + block, max=hi) for s, (_, hi) in zip(starts, ranges)]
     return torch.cat(starts).to(dev), torch.cat(ends).to(dev)
+
+
+def _norm_pass(pieces: List[Tuple[int, int, int, int]], n_slots: int, dev) -> dict:
+    """The gradient norms' pass over ``pieces`` (group, first element, end, slot; at most one piece per slot, the first
+    element a multiple of 16): every piece cut into chunks of at most NORM_CHUNK elements, the piece's end rounded up
+    to a multiple of 16 (into its slot's padding, whose gradient stays zero); per group the chunks' starts and ends and
+    where in ``part`` their sums go, per slot the range of its chunks' sums (none: the slot's sum is 0), and ``sq``,
+    the slots' sums of squares."""
+    first, last = [0] * n_slots, [0] * n_slots
+    groups, c = [], 0
+    for gi in sorted({p[0] for p in pieces}):
+        se, base = [], c
+        for _, a, z, s in sorted(p for p in pieces if p[0] == gi):
+            if a % 16:
+                raise ValueError(f"FlatAdamW: a piece of the gradient norms' pass starts at {a}, not a multiple of 16")
+            z = -(-z // 16) * 16
+            st = torch.arange(a, z, NORM_CHUNK, dtype=torch.int64)
+            se.append(torch.stack([st, torch.clamp(st + NORM_CHUNK, max=z)]))
+            first[s], c = c, c + st.numel()
+            last[s] = c
+        se = torch.cat(se, dim=1).to(dev)
+        groups.append((gi, se[0].contiguous(), se[1].contiguous(), base, c - base))
+    return {"groups": groups, "part": torch.empty(max(c, 1), dtype=torch.float32, device=dev),
+            "first": torch.tensor(first, dtype=torch.int32, device=dev),
+            "last": torch.tensor(last, dtype=torch.int32, device=dev),
+            "sq": torch.empty(n_slots, dtype=torch.float32, device=dev)}
 
 
 class _PeerBuffers:
@@ -241,8 +299,9 @@ class FlatAdamW:
             if isinstance(m, torch.nn.Embedding) and id(m.weight) in held and m.padding_idx is None \
                     and m.max_norm is None and not m.scale_grad_by_freq:
                 m.sparse = True
-        # the gradient norms' pieces: every parameter's slice of its group's gradient buffer, its group, its bucket
-        self._slices = [self.groups[gi]["flat"]["g"][off:off + k] for gi, off, k, _ in self.slots.values()]
+        # the gradient norms' pass over every parameter's slice of its group's gradient buffer; its group, its bucket
+        self._norm = _norm_pass([(gi, off, off + k, s) for s, (gi, off, k, _) in enumerate(self.slots.values())],
+                                len(self.slots), dev)
         self._slice_group = _segments([gi for gi, _, _, _ in self.slots.values()], len(self.groups), dev)
         self.buckets: List[str] = []
         self.slot_bucket: Dict[str, str] = {}
@@ -255,19 +314,23 @@ class FlatAdamW:
     # ------------------------------------------------------------------ captured pieces
     def grad_norms(self) -> Tuple[torch.Tensor, torch.Tensor]:
         """(the gradient norm of every group in the groups' order, the norm of every bucket in ``buckets``' order),
-        fp32: one fused pass over the parameters' slices of the gradient buffers (``torch._foreach_norm``), the
-        groups' and the buckets' norms the square roots of the sums of squares.  Sharded: the pass is over this
-        replica's pieces of the parameters (:meth:`shard`), and every parameter's sum of squares is the sum of the
-        replicas' in rank order (an all-gather: the same values on every replica)."""
+        fp32: one pass over the parameters' slices of the gradient buffers (:func:`_norm_pass`: per group a program
+        per chunk of at most NORM_CHUNK elements of one parameter, :func:`_sumsq_kernel`; then each parameter's chunk
+        sums added, :func:`_slot_sums_kernel`; every sum in a fixed order), the groups' and the buckets' norms the
+        square roots of the sums of the parameters' sums of squares.  Sharded: the pass is over this replica's pieces
+        of the parameters (:meth:`shard`), and every parameter's sum of squares is the sum of the replicas' in rank
+        order (an all-gather: the same values on every replica)."""
         sh = self.sharding
-        if sh is None:
-            sq = torch.stack(torch._foreach_norm(self._slices)).square()
-        else:
-            mine = torch.zeros(len(self._slices), dtype=torch.float32, device=self.t.device)
-            if sh["pieces"]:
-                mine.index_copy_(0, sh["piece_slot"], torch.stack(torch._foreach_norm(sh["pieces"])).square())
-            every = torch.empty(sh["world"] * mine.numel(), dtype=torch.float32, device=mine.device)
-            dist.all_gather_into_tensor(every, mine, group=sh["group"])
+        plan = self._norm if sh is None else sh["norm"]
+        for gi, starts, ends, base, n in plan["groups"]:
+            _sumsq_kernel[(n,)](self.groups[gi]["flat"]["g"], starts, ends, plan["part"][base:], CHUNK=NORM_CHUNK,
+                                BLOCK=NORM_BLOCK, num_warps=8)
+        sq = plan["sq"]
+        if sq.numel():
+            _slot_sums_kernel[(sq.numel(),)](plan["part"], plan["first"], plan["last"], sq, BLOCK=1024, num_warps=4)
+        if sh is not None:
+            every = torch.empty(sh["world"] * sq.numel(), dtype=torch.float32, device=sq.device)
+            dist.all_gather_into_tensor(every, sq, group=sh["group"])
             every = every.view(sh["world"], -1)
             sq = every[0]
             for r in range(1, sh["world"]):
@@ -494,10 +557,11 @@ class FlatAdamW:
             if rest:
                 replicated.append((gi,) + _blocks(rest, self.BLOCK, dev))
         # the gradient norms' pieces: a parameter in a split range, its intersection with this replica's part; any
-        # other parameter (its summed gradient on every replica), its rank-th of world consecutive pieces
+        # other parameter (its summed gradient on every replica), its rank-th of world consecutive pieces, cut at
+        # multiples of 16 elements (the pass's alignment)
         lows = {gi: [b[1] for b in buckets if b[0] == gi] for gi in range(len(self.groups))}
         rows = {gi: [b for b in buckets if b[0] == gi] for gi in range(len(self.groups))}
-        pieces, slot = [], []
+        pieces = []
         for i, (name, (gi, off, k, _)) in enumerate(self.slots.items()):
             j = bisect.bisect_right(lows[gi], off) - 1
             inside = j >= 0 and off < rows[gi][j][2]
@@ -509,14 +573,14 @@ class FlatAdamW:
             else:
                 if j + 1 < len(rows[gi]) and rows[gi][j + 1][1] < off + k:
                     raise ValueError(f"FlatAdamW.shard: {name} crosses the start of a range")
-                a, z = off + k * rank // world, off + k * (rank + 1) // world
+                cut = [off + k * r // world // SHARD_ALIGN * SHARD_ALIGN for r in range(world)] + [off + k]
+                a, z = cut[rank], cut[rank + 1]
             if z > a:
-                pieces.append(self.groups[gi]["flat"]["g"][a:z])
-                slot.append(i)
+                pieces.append((gi, a, z, i))
         push = self._push_setup(group, rank, sorted({gi for gi, _ in layout})) if world == 2 else None
         self.sharding = {"spec": spec, "group": group, "rank": rank, "world": world, "buckets": buckets,
-                         "owned": owned, "replicated": replicated, "pieces": pieces,
-                         "piece_slot": torch.tensor(slot, dtype=torch.int64, device=dev), "push": push,
+                         "owned": owned, "replicated": replicated, "norm": _norm_pass(pieces, len(self.slots), dev),
+                         "push": push,
                          "stream": torch.cuda.Stream(device=dev, priority=torch.cuda.Stream.priority_range()[1])}
         #                (the highest: the gathers dispatched ahead of the update's pending blocks, nstrain.engine.Graph)
 
