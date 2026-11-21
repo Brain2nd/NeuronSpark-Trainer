@@ -13,10 +13,11 @@ Three graphs share one memory pool:
   average by the device scalar ``ema_c``, set per update); the sums are zeroed.
 
 Data-parallel replicas (``data_parallel``: nstrain.data_parallel, more than one process): the loss scale is
-``1 / (accum * world)`` and a fourth graph, ``reduce``, replayed after the update's last micro-batch, sums every
-group's flat gradient buffer and the loss sums across the replicas; the earlier micro-batches reduce nothing.  The
-loss sums are then divided by ``world``: the metrics are the global batch's, and every replica takes the same decision
-on a non-finite norm.  With one process (``data_parallel`` None or of world 1) the engine is the one-GPU step.
+``1 / (accum * world)`` and a fourth graph, ``micro_last``, replaces ``micro`` for the update's last micro-batch: its
+backward sums the flat gradient buffers across the replicas bucket by bucket as the layers' gradients are written,
+then the rest of the buffers and the loss sums; the earlier micro-batches reduce nothing.  The loss sums are then
+divided by ``world``: the metrics are the global batch's, and every replica takes the same decision on a non-finite
+norm.  With one process (``data_parallel`` None or of world 1) the engine is the one-GPU step.
 
 The optimizer state is created at construction; the warm-up before capture runs at learning rate 0 (weights unchanged)
 and the optimizer state is restored afterwards (with the bf16 values of the linear operator's weights the optimizer
@@ -61,6 +62,8 @@ class StepEngine:
         self.graphs: Dict[str, torch.cuda.CUDAGraph] = {}
         from nstrain.gpu import Arena
         self.arena = arena if arena is not None else Arena()          # the trainer's: memory it already holds
+        if self.rep is not None:
+            self.rep.attach(model, optimizer, self.arena.stream)
         self._capture(warmup_iters, before_capture)
 
     # ------------------------------------------------------------------ bodies (eager and captured)
@@ -71,9 +74,15 @@ class StepEngine:
         self.ce_sum.add_(out.ce.detach())
         self.aux_sum.add_(out.aux.detach())
 
-    def _reduce(self) -> None:
-        self.rep.reduce_grads(self.opt)
-        self.rep.all_reduce_(self.sums)
+    def _micro_last(self) -> None:
+        self.rep.begin()
+        out = self.loss_fn(self.x, self.y)
+        self.rep.forward_done()
+        (out.loss * self.inv_accum).backward()
+        self.loss_sum.add_(out.loss.detach())
+        self.ce_sum.add_(out.ce.detach())
+        self.aux_sum.add_(out.aux.detach())
+        self.rep.finish(self.sums)
         self.sums.mul_(1.0 / self.world)
 
     def _norm(self) -> None:
@@ -105,16 +114,18 @@ class StepEngine:
             self.opt.lr.zero_()                                      # the launch calibration); warm-up steps leave the
             self.opt.ema_c.zero_()                                   # weights unchanged, and the moving average
             for _ in range(warmup_iters):
-                for _ in range(min(2, self.accum)):
+                if self.rep is None:
+                    for _ in range(min(2, self.accum)):
+                        self._micro()
+                else:
                     self._micro()
-                if self.rep is not None:
-                    self._reduce()
+                    self._micro_last()
                 self._norm()
                 self._step()
         torch.cuda.synchronize()
         if before_capture is not None:                               # eager work whose first-call caches must be
             before_capture()                                         # live before the arena's free blocks become
-        bodies = [("micro", self._micro)] + ([("reduce", self._reduce)] if self.rep is not None else []) + \
+        bodies = [("micro", self._micro)] + ([("micro_last", self._micro_last)] if self.rep is not None else []) + \
             [("norm", self._norm), ("step", self._step)]
         for name, body in bodies:                                    # graph scratch
             g = torch.cuda.CUDAGraph()
@@ -203,13 +214,13 @@ class StepEngine:
 
     def micro_batch(self, x: torch.Tensor, y: torch.Tensor, last: bool) -> None:
         """Forward and backward of one micro-batch of pinned (rows, L) inputs / targets, its gradient added into the
-        flat gradient buffers; ``last``: the update's last micro-batch, after which the replicas' gradients are summed
-        (nothing is reduced after the others)."""
+        flat gradient buffers; ``last``: the update's last micro-batch, whose backward sums the replicas' gradients
+        (nothing is reduced in the others)."""
         self.x.copy_(x, non_blocking=True)
         self.y.copy_(y, non_blocking=True)
-        self.graphs["micro"].replay()
-        if last and self.rep is not None:
-            self.graphs["reduce"].replay()
+        self.graphs["micro_last" if last and self.rep is not None else "micro"].replay()
 
     def release(self) -> None:
         self.graphs.clear()
+        if self.rep is not None:
+            self.rep.detach()
