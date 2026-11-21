@@ -41,11 +41,24 @@ Sharded state (:meth:`shard`, data-parallel replicas, nstrain.data_parallel): ra
 weights the training forward reads only through their bf16 values are split among the replicas in equal parts.  A
 replica updates its part of every such range (its reduction leaves the summed gradient there and zeroes the rest of
 the range) and every range outside them (replicated: every replica holds the summed gradient and updates it); the bf16
-values of each split range are gathered from their owners as soon as the owners have updated their parts (range by
-range, while the next range's part is updated), so they are whole on every replica after every update.
+values of each split range reach the other replicas as soon as their owner has updated its part (range by range, while
+the next range's part is updated), so they are whole on every replica after every update.
 The weights, moments and moving average of the parts other replicas own are left as they were (stale) until
 :meth:`gather_` brings them from the owners.  The gradient norms are the sums of squares of each replica's parts
 (the replicated ranges split among the replicas too), gathered and added in rank order.
+
+How the bf16 values travel.  Two replicas (the whole job) whose GPUs map each other's memory keep the bf16 buffers of
+the split groups in symmetric memory (``torch.distributed._symmetric_memory``: each replica's buffer mapped into the
+other's address space; moved there by the first split, which engines captured before refuse, nstrain.engine): a
+replica copies its part of a range into the other replica's buffer at the same offsets (``Tensor.copy_``: a copy
+engine's copy, which takes no SM from the update beside it) between two barriers of the two
+(``neuronspark.ops.triton.tp_bulk.tp_fence`` on a flag word in symmetric memory: a replica stores the next epoch into
+the other's word, then waits until its own word holds it).  The first, before a replica's first copy of the step,
+passes once both have finished everything they queued before their step, their forward and backward among it, so no
+copy reaches a buffer the other still reads; the second, at the end of the step, once both replicas' copies have
+landed, after which both buffers are whole.  Each update writes only its own parts.  Any other layout of the replicas
+(more than two, no peer access, the GPUs numbered differently by the two processes, no symmetric memory to be had)
+gathers each range from its owners with NCCL's all-gather.
 """
 from __future__ import annotations
 
@@ -115,6 +128,48 @@ def _blocks(ranges: List[Tuple[int, int]], block: int, dev) -> Tuple[torch.Tenso
     return torch.cat(starts).to(dev), torch.cat(ends).to(dev)
 
 
+class _PeerBuffers:
+    """The symmetric memory of two replicas (:meth:`FlatAdamW._push_setup`): this replica's bf16 buffers of the split
+    groups and the flag word of the step's barriers (``torch.distributed._symmetric_memory`` allocations), their
+    rendezvous handles, the views of the other replica's buffers and flag word, and the step's epoch (on the device).
+    torch aborts the process when a symmetric allocation is freed before its rendezvous handle (``CUDA driver error:
+    invalid argument`` in the handle's destruction), so this replica's allocations are held here until the views and
+    the handles have gone (:meth:`close`, when the holder goes)."""
+
+    def __init__(self, pg, peer: int, flag: torch.Tensor):
+        """``pg``: the two replicas' process group (the holder serves that group object only); ``flag``: this
+        replica's flag word, a zeroed symmetric allocation of one int64 (a collective: both replicas create their
+        holders together)."""
+        import torch.distributed._symmetric_memory as symm_mem
+        self.pg, self.group, self.peer = pg, pg.group_name, peer
+        self.local: Dict[Optional[int], torch.Tensor] = {}             # None: the flag word; gi: group gi's buffer
+        self.handles: Dict[Optional[int], object] = {}
+        self.remote: Dict[int, torch.Tensor] = {}                      # gi: the other replica's buffer of group gi
+        self.flag = flag
+        self.local[None] = flag
+        self.handles[None] = symm_mem.rendezvous(flag, self.group)
+        self.flag_peer = self.handles[None].get_buffer(peer, (1,), torch.int64)
+        self.epoch = torch.zeros(1, dtype=torch.int64, device=flag.device)
+
+    def add(self, gi: int, h: torch.Tensor) -> None:
+        """Group gi's bf16 buffer ``h`` (a symmetric allocation of this replica): its handle and the other replica's
+        buffer mapped here (a collective: both replicas add the same groups in the same order)."""
+        import torch.distributed._symmetric_memory as symm_mem
+        self.local[gi] = h
+        self.handles[gi] = symm_mem.rendezvous(h, self.group)
+        self.remote[gi] = self.handles[gi].get_buffer(self.peer, tuple(h.shape), h.dtype)
+
+    def close(self) -> None:
+        """The views of the other replica's memory, then the handles, then this replica's allocations (which live on
+        as long as anything else holds them)."""
+        self.remote, self.flag_peer = {}, None
+        self.handles = {}
+        self.local, self.flag = {}, None
+
+    def __del__(self):
+        self.close()
+
+
 class FlatAdamW:
     BLOCK = 2048
 
@@ -138,6 +193,8 @@ class FlatAdamW:
         self.groups = []
         self.slots: Dict[str, tuple] = {}                                # name -> (group index, offset, numel, shape)
         self.sharding: Optional[dict] = None                             # the replicas' parts (:meth:`shard`)
+        self._symm: Optional[_PeerBuffers] = None                        # two replicas: the symmetric buffers and the
+        #                                                                  step's barrier (:meth:`_push_setup`)
         self.stale = False                                               # split: the parts other replicas own have
         #                                                                  been updated since the last gather_
         keys = ("p", "g", "m", "v") + (("e",) if self.ema else ())
@@ -228,9 +285,12 @@ class FlatAdamW:
 
     def step(self, coef: torch.Tensor) -> None:
         """One update with gradients scaled by the device scalar ``coef``; zeroes the gradients; moves the average
-        by ``ema_c``.  Sharded: this replica's part of every split range in turn, each range's bf16 values gathered
-        from the owners of its parts as soon as its part is updated (on a side stream, while the next part and then the
-        replicated ranges are updated; the step waits for the side stream)."""
+        by ``ema_c``.  Sharded: this replica's part of every split range in turn, each range's bf16 values brought to
+        the other replicas as soon as its part is updated (on a side stream, while the next part and then the
+        replicated ranges are updated; the step waits for the side stream): two replicas copy their part into the
+        other's buffer between two barriers of theirs (before the first copy: both have finished everything they
+        queued before the step, their backward among it; at the end: every copy has landed), more gather each range
+        from its owners (module docstring)."""
         self.t.add_(1.0)
         self.bc[0].copy_(1.0 - torch.pow(self.b1, self.t))
         self.bc[1].copy_(torch.sqrt(1.0 - torch.pow(self.b2, self.t)))
@@ -241,14 +301,27 @@ class FlatAdamW:
             return
         self.stale = True                                            # (a replay: the engine marks it)
         cur, side = torch.cuda.current_stream(), sh["stream"]
-        for (gi, starts, ends), rng in zip(sh["owned"], sh["buckets"]):
+        push = sh["push"]
+        if push is not None:
+            from neuronspark.ops.triton.tp_bulk import tp_fence
+        for i, ((gi, starts, ends), rng) in enumerate(zip(sh["owned"], sh["buckets"])):
             self._update(self.groups[gi], coef, starts, ends)
             side.wait_stream(cur)
             with torch.cuda.stream(side):
-                self._gather_range(*rng)
+                if push is None:
+                    self._gather_range(*rng)
+                else:                                                # (this replica's part into the other's buffer)
+                    if i == 0:
+                        push.epoch.add_(1)
+                        tp_fence(push.flag_peer, push.flag, push.epoch)
+                    _, _, _, olo, ohi = rng
+                    push.remote[gi][olo:ohi].copy_(self.groups[gi]["flat"]["h"][olo:ohi])
         for gi, starts, ends in sh["replicated"]:
             self._update(self.groups[gi], coef, starts, ends)
         cur.wait_stream(side)
+        if push is not None:
+            push.epoch.add_(1)
+            tp_fence(push.flag_peer, push.flag, push.epoch)
 
     def _update(self, g: dict, coef: torch.Tensor, starts: Optional[torch.Tensor] = None,
                 ends: Optional[torch.Tensor] = None) -> None:
@@ -296,6 +369,11 @@ class FlatAdamW:
     def bf16_copies(self) -> Dict[str, Tuple[torch.Tensor, torch.Tensor]]:
         """Per parameter name of the linear groups: (the parameter, its bf16 part ``(padded N, K)``)."""
         return {self._names[id(p)]: (p, part) for g in self.groups for p, part in g["bf16"]}
+
+    def bf16_buffers(self) -> Tuple[int, ...]:
+        """The addresses of the linear groups' bf16 buffers (the first split among two replicas moves them into
+        symmetric memory, :meth:`shard`: nstrain.engine refuses graphs captured on the old ones)."""
+        return tuple(g["flat"]["h"].data_ptr() for g in self.groups if g["linear"])
 
     # ------------------------------------------------------------------ the moving average
     def ema_init(self) -> None:
@@ -435,11 +513,106 @@ class FlatAdamW:
             if z > a:
                 pieces.append(self.groups[gi]["flat"]["g"][a:z])
                 slot.append(i)
+        push = self._push_setup(group, rank, sorted({gi for gi, _ in layout})) if world == 2 else None
         self.sharding = {"spec": spec, "group": group, "rank": rank, "world": world, "buckets": buckets,
                          "owned": owned, "replicated": replicated, "pieces": pieces,
-                         "piece_slot": torch.tensor(slot, dtype=torch.int64, device=dev),
+                         "piece_slot": torch.tensor(slot, dtype=torch.int64, device=dev), "push": push,
                          "stream": torch.cuda.Stream(device=dev, priority=torch.cuda.Stream.priority_range()[1])}
         #                (the highest: the gathers dispatched ahead of the update's pending blocks, nstrain.engine.Graph)
+
+    def _push_setup(self, group, rank: int, gis: List[int]) -> Optional[_PeerBuffers]:
+        """Two replicas that are the whole job, on two GPUs of one host that map each other's memory and that both
+        processes number alike (both agree, collectives): the bf16 buffer of every linear group in ``gis`` moved into
+        symmetric memory, its values taken from the fp32 weights (whole here: :meth:`shard` has gathered them; as
+        :meth:`refresh_bf16`) and the weights' bf16 parts bound to the new buffer, with the other replica's buffer
+        mapped here, and the words of the step's barriers (a flag word in symmetric memory, the epoch on the device),
+        all held by a :class:`_PeerBuffers` kept for the optimizer's life (a later layout of the same process group
+        object reuses it; when the two processes' holders differ, both start anew).  Every new allocation is made
+        before any is shared, both replicas agree that all were made, and a new holder's view of the other process's
+        flag word is checked to be that process's word.  None otherwise: the step gathers with NCCL (module
+        docstring)."""
+        import warnings
+
+        import torch.distributed._symmetric_memory as symm_mem
+        from neuronspark.ops.linear import bind_train_bf16_
+        dev = self.t.device
+        pg = group if group is not None else dist.group.WORLD
+        with torch.cuda.device(dev):                                 # (the collectives on this replica's device)
+            # torch's rendezvous of symmetric memory counts the rendezvous of each process (not of each group) and
+            # refuses two buffers on GPUs of the same host with the same index: the job is these two processes, and
+            # both see the same GPUs in the same order
+            seen = [str(torch.cuda.get_device_properties(i).uuid) for i in range(torch.cuda.device_count())]
+            s = self._symm if self._symm is not None and self._symm.pg is pg else None
+            views: List[Optional[tuple]] = [None, None]
+            dist.all_gather_object(views, (seen, dev.index, sorted(s.remote) if s is not None else None), group=pg)
+            other = views[1 - rank][1]
+            ok = (dist.get_world_size() == 2 and views[0][0] == views[1][0] and other != dev.index
+                  and torch.cuda.can_device_access_peer(dev.index, other))
+            if not self._agree(ok, pg, dev):
+                return None
+            if views[0][2] != views[1][2]:                           # (the holders' histories differ, an optimizer
+                s = None                                             # built again on one side: both start anew, so
+            new = [gi for gi in gis if s is None or gi not in s.remote]   # both rendezvous the same allocations)
+            fresh: Dict[Optional[int], torch.Tensor] = {}
+            failed = None
+            try:
+                if s is None:
+                    fresh[None] = symm_mem.empty(1, dtype=torch.int64, device=dev)
+                for gi in new:
+                    fresh[gi] = symm_mem.empty(self.groups[gi]["n"], dtype=torch.bfloat16, device=dev)
+            except (torch.OutOfMemoryError, RuntimeError) as e:
+                fresh, failed = {}, e
+            if not self._agree(failed is None, pg, dev):             # (nothing shared yet: dropped as it is)
+                warnings.warn("nstrain.flat_adamw: no symmetric memory for the split groups' bf16 buffers "
+                              f"({failed or 'on the other process'}); the replicas gather them with NCCL")
+                return None
+            with torch.no_grad():
+                if s is None:
+                    fresh[None].zero_()
+                    s = _PeerBuffers(pg, 1 - rank, fresh[None])
+                    if not self._peer_check(s, rank, pg, dev):
+                        self._symm = None
+                        warnings.warn("nstrain.flat_adamw: the symmetric memory of this process group does not map "
+                                      "the other process's memory (a process group created again under a name torch "
+                                      "had given an earlier one?); the replicas gather with NCCL")
+                        return None
+                    self._symm = s
+                for gi in new:
+                    g = self.groups[gi]
+                    old, h = g["flat"]["h"], fresh[gi]
+                    h.copy_(g["flat"]["p"])
+                    s.add(gi, h)
+                    g["flat"]["h"] = h
+                    at = [part.storage_offset() - old.storage_offset() for _, part in g["bf16"]]
+                    g["bf16"] = [(p, h[a:a + part.numel()].view(part.shape)) for (p, part), a in zip(g["bf16"], at)]
+                    for p, part in g["bf16"]:
+                        bind_train_bf16_(p, part)
+                    g["bf16_versions"] = [p._version for p, _ in g["bf16"]]
+            torch.cuda.synchronize(dev)
+            dist.barrier(group=pg, device_ids=[dev.index])
+        return s
+
+    @staticmethod
+    def _agree(ok: bool, pg, dev: torch.device) -> bool:
+        """Whether every process of ``pg`` has ``ok`` (a collective)."""
+        t = torch.tensor([int(bool(ok))], device=dev)
+        dist.all_reduce(t, op=dist.ReduceOp.MIN, group=pg)
+        return bool(t.item())
+
+    @staticmethod
+    def _peer_check(s: _PeerBuffers, rank: int, pg, dev: torch.device) -> bool:
+        """Whether the holder's view of the other process's flag word is that process's word (both agree, a
+        collective): each process writes a mark of its own into its word and reads the other's through the view, then
+        clears its word.  torch keeps a process group's ranks and store under the group's name, which a group created
+        again in the same processes can reuse."""
+        s.flag.fill_(1000 + rank)
+        torch.cuda.synchronize(dev)
+        dist.barrier(group=pg, device_ids=[dev.index])
+        ok = int(s.flag_peer.item()) == 1000 + (1 - rank)
+        dist.barrier(group=pg, device_ids=[dev.index])
+        s.flag.zero_()
+        torch.cuda.synchronize(dev)
+        return FlatAdamW._agree(ok, pg, dev)
 
     def gather_(self) -> None:
         """Sharded: bring the weights, moments and moving average of the parts other replicas own from their owners,

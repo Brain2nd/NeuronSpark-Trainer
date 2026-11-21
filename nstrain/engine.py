@@ -160,6 +160,7 @@ class StepEngine:
         if self.rep is not None:
             self.rep.attach(model, optimizer, self.arena.stream)
         self.sharding = optimizer.sharding                           # the split the graphs are captured for
+        self.bf16_at = optimizer.bf16_buffers()                      # and the bf16 buffers they read and write
         self._capture(warmup_iters, before_capture)
 
     # ------------------------------------------------------------------ bodies (eager and captured)
@@ -309,11 +310,14 @@ class StepEngine:
         return metrics, True
 
     def _check_split(self) -> None:
-        """Refuse to replay graphs captured for another split of the optimizer among the replicas: they would reduce
-        and update the old parts while the optimizer reads the new ones."""
-        if self.opt.sharding is not self.sharding:
-            raise RuntimeError("StepEngine: the optimizer's split among the data-parallel replicas changed since this "
-                               "engine was captured (FlatAdamW.shard / unshard): release it and build a new engine")
+        """Refuse to replay graphs captured for another split of the optimizer among the replicas, or for bf16
+        buffers the optimizer no longer uses (a split moves them into symmetric memory, and unsharding leaves them
+        there): they would reduce and update the old parts while the optimizer reads the new ones, or read and write
+        memory that is no longer the weights'."""
+        if self.opt.sharding is not self.sharding or self.opt.bf16_buffers() != self.bf16_at:
+            raise RuntimeError("StepEngine: the optimizer's split among the data-parallel replicas or its bf16 buffers "
+                               "changed since this engine was captured (FlatAdamW.shard / unshard): release it and "
+                               "build a new engine")
 
     def set_accum(self, accum: int) -> None:
         """The number of micro-batches of the next update (per replica): the loss scale ``1 / (accum * world)``."""
