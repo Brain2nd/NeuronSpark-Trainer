@@ -30,11 +30,15 @@ gradient comes only from nodes created after it, so when the node that produced 
 created after it -- every operation of that layer and of the layers above, the readout and the losses -- has run and
 issued its kernels (the weight gradients of the linear operator written by its own GEMM, the others by autograd's
 accumulation, which runs as soon as it is ready).  A hook on the input of every layer (attached during the forward,
-not during a recomputation in the backward) issues the buckets of that layer.  Everything else -- the groups too small
-to cut, the parts of a buffer outside the layers (the tied embedding, whose lookup gradient is the backward's last
-write), and the layers' vectors (a joined dendritic pre-norm gain is written by the layer below) -- is the tail,
-summed with the loss sums after the backward returns.  Every collective is issued on the one side stream, in the same
-order on every process; the capture stream waits for it before the norms.
+not during a recomputation in the backward) issues the buckets of that layer.  The rest of the buffers -- the groups
+too small to cut, the parts of a buffer outside the layers, and the layers' vectors (a joined dendritic pre-norm gain
+is written by the layer below) -- is summed by parts: a part none of whose weights the linear operator writes itself
+(their gradients all autograd's accumulation: the lexical tables, the vectors) as soon as autograd has accumulated
+every gradient in it (a hook after the accumulation on each of its parameters; neuronspark makes the lexical tables'
+lookup just before the first hippocampal layer, so their part is summed behind the backward of the layers below it),
+and the others (the tail: the readout balance's projections) with the loss sums after the backward returns.  Every
+collective is issued on the one side stream, in the same order on every process; the capture stream waits for it
+before the norms.
 
 A lookup table held by the optimizer (an ``nn.Embedding`` set to ``sparse``: the tied embedding) gets its gradient
 from two writers: the readout's GEMM, at the start of the backward, and the lookup, at its very end.  The lookup's
@@ -76,15 +80,20 @@ class DataParallel:
         self.layer_buckets: Dict[int, List[Tuple[torch.Tensor, bool]]] = {}   # layer -> its input hook's buckets
         #                                                              (a bucket: its view, whether it is split)
         self.tail: List[torch.Tensor] = []
+        self.early: List[Tuple[torch.Tensor, Tuple[str, ...]]] = []  # the parts summed once autograd has accumulated
+        #                                                              every gradient in them (view, parameter names)
         self.head: List[torch.Tensor] = []                           # the lookup tables' slices (the readout's input)
         self.lookups: Dict[str, torch.Tensor] = {}                   # weight name -> its (rows, cols) gradient view
         self._rows: Dict[str, torch.Tensor] = {}                     # weight name -> the lookup's sparse gradient
         self.bucket_numels: List[int] = []                           # in issue order (the tail last)
         self.split_numel = 0                                         # elements of the split buckets
+        self.order: List[str] = []                                   # what the last armed backward issued, in order
         self._stream = None
         self._watch = False                                          # attach the input hooks (the forward)
         self._armed = False                                          # the hooks issue their buckets
         self._issued: set = set()
+        self._left: List[int] = []                                   # per early part: gradients still to accumulate
+        self._seen: set = set()                                      # the early parts' parameters accumulated
         self._handles: list = []                                     # the module hooks (removed by detach)
 
     @classmethod
@@ -137,15 +146,25 @@ class DataParallel:
         # holding the layers lists (the weights of neuronspark.ops.linear); none listed, nothing is split
         listed = trunk.inference_linear_weights() if hasattr(trunk, "inference_linear_weights") else []
         projections = {names[id(q)] for _, q in listed if id(q) in names}
+        # the weights whose gradients the linear operator adds into their buffers itself (bound by the optimizer):
+        # autograd never accumulates them; every other weight's gradient is autograd's accumulation
+        bound = {names[id(q)] for g in opt.groups for q, _ in g["bf16"] if id(q) in names}
         buckets: Dict[int, List[Tuple[torch.Tensor, bool]]] = {}
         tail: List[torch.Tensor] = []
+        early: List[Tuple[torch.Tensor, Tuple[str, ...]]] = []
         head: List[torch.Tensor] = []
         split: Dict[int, List[Tuple[int, int]]] = {}                 # group -> its split buckets' ranges
+
+        def outside(view, held):                                     # a part outside the layers' buckets (an empty
+            if not held or any(name in bound for name in held):      # group: no hook would issue it)
+                tail.append(view)
+            else:
+                early.append((view, tuple(held)))
         for gi, g in enumerate(opt.groups):
             buf, n = g["flat"]["g"], g["n"]
             slots = sorted((off, name) for name, (sgi, off, _, _) in opt.slots.items() if sgi == gi)
-            runs: List[Tuple[Tuple[int, bool], int, int]] = []        # ((layer or -1, split), lo, hi): consecutive
-            for i, (off, name) in enumerate(slots):                  # slots
+            runs: List[Tuple[Tuple[int, bool], int, int, Tuple[str, ...]]] = []   # ((layer or -1, split), lo, hi,
+            for i, (off, name) in enumerate(slots):                  # names): consecutive slots
                 m = of_layer.match(name)
                 layer = int(m.group(1)) if m and not name.endswith(CROSS_LAYER) else -1
                 if name in tables:
@@ -154,11 +173,11 @@ class DataParallel:
                 hi = slots[i + 1][0] if i + 1 < len(slots) else n
                 lo = 0 if i == 0 else off
                 if runs and runs[-1][0] == kind:
-                    runs[-1] = (kind, runs[-1][1], hi)
+                    runs[-1] = (kind, runs[-1][1], hi, runs[-1][3] + (name,))
                 else:
-                    runs.append((kind, lo, hi))
+                    runs.append((kind, lo, hi, (name,)))
             if n < GROUP_MIN_NUMEL and not any(r[0][0] == HEAD for r in runs):
-                tail.append(buf)
+                outside(buf, [name for r in runs for name in r[3]])
                 continue
             # merge consecutive layers from the top: a bucket is issued by the hook of its lowest layer; a bucket holds
             # projection weights only (split among the replicas) or none (all-reduced): weights read in fp32 (the
@@ -170,7 +189,7 @@ class DataParallel:
                 if cur[3]:
                     split.setdefault(gi, []).append((cur[1], cur[2]))
             cur = None                                               # [lowest layer, lo, hi, split]
-            for (layer, part), lo, hi in reversed(runs):
+            for (layer, part), lo, hi, held in reversed(runs):
                 if layer == HEAD:                                    # (a slot of its own: a table and its padding)
                     if cur is not None:
                         close(cur)
@@ -181,7 +200,7 @@ class DataParallel:
                     if cur is not None:
                         close(cur)
                         cur = None
-                    tail.append(buf[lo:hi])
+                    outside(buf[lo:hi], held)
                     continue
                 if cur is not None and cur[3] == part and cur[1] == hi and cur[2] - cur[1] < BUCKET_MIN_NUMEL:
                     cur = [layer, lo, cur[2], part]
@@ -191,10 +210,11 @@ class DataParallel:
                     cur = [layer, lo, hi, part]
             if cur is not None:
                 close(cur)
-        covered = sum(v.numel() for vs in buckets.values() for v, _ in vs) + sum(v.numel() for v in tail + head)
+        covered = sum(v.numel() for vs in buckets.values() for v, _ in vs) + \
+            sum(v.numel() for v in tail + head + [v for v, _ in early])
         if covered != sum(g["n"] for g in opt.groups):
             raise RuntimeError("DataParallel: the buckets do not cover the gradient buffers exactly once")
-        self.layer_buckets, self.tail, self.head = buckets, tail, head
+        self.layer_buckets, self.tail, self.head, self.early = buckets, tail, head, early
         self.bucket_numels = [v.numel() for v in head] + \
             [v.numel() for j in sorted(buckets, reverse=True) for v, _ in buckets[j]] + [sum(v.numel() for v in tail)]
         self.split_numel = sum(hi - lo for rs in split.values() for lo, hi in rs)
@@ -202,6 +222,11 @@ class DataParallel:
         opt.shard(self.group, split)                                 # (a new layout gathers the present one first)
         for j, mod in layers.items():
             self._handles.append(mod.register_forward_pre_hook(partial(self._forward_pre_hook, j)))
+        params = dict(model.named_parameters())
+        for i, (_, held) in enumerate(early):
+            for name in held:
+                self._handles.append(params[name].register_post_accumulate_grad_hook(
+                    partial(self._accumulated, i, name)))
         self.lookups = {}
         if head:
             self._handles.append(trunk.register_forward_hook(self._trunk_output))
@@ -249,16 +274,36 @@ class DataParallel:
         """The node that produced ``layer``'s input runs: every gradient of the layer (and above) is issued."""
         if self._armed and layer not in self._issued:
             self._issued.add(layer)
-            self._issue([(v, False) for v in self.head] if layer == HEAD else self.layer_buckets.get(layer, ()))
+            if layer == HEAD:
+                self._issue([(v, False) for v in self.head], "head")
+            else:
+                self._issue(self.layer_buckets.get(layer, ()), f"layer {layer}")
         return None
 
-    def _issue(self, views) -> None:
-        """Sum the (view, split) pairs ``views`` across the replicas, in order, on the side stream: a split view by a
-        reduce-scatter (this replica's part of the sum stays in its part of the view; the rest of the view, this
-        replica's own gradient, is zeroed for the next update), any other by an all-reduce."""
+    def _accumulated(self, i, name, param) -> None:
+        """Autograd has accumulated ``name``'s gradient into its view of the buffer: the early part ``i`` holding it is
+        issued once every gradient in it is.  Autograd calls this on the stream it ran the accumulation on (the
+        accumulator's, current here), which the side stream waits for as well as for the backward's."""
+        if not self._armed:
+            return
+        if name in self._seen:                                       # (the part would be issued before the second)
+            raise RuntimeError(f"DataParallel: {name}'s gradient was accumulated twice in one backward")
+        self._seen.add(name)
+        self._left[i] -= 1
+        if self._left[i] == 0:
+            self._issue([(self.early[i][0], False)], f"early {i}", after=torch.cuda.current_stream())
+
+    def _issue(self, views, what: str, after=None) -> None:
+        """Sum the (view, split) pairs ``views`` across the replicas, in order, on the side stream, once the backward's
+        stream (and ``after``, when given) has reached this point: a split view by a reduce-scatter (this replica's
+        part of the sum stays in its part of the view; the rest of the view, this replica's own gradient, is zeroed for
+        the next update), any other by an all-reduce."""
         if not views:
             return
+        self.order.append(what)
         self.side.wait_stream(self._stream)
+        if after is not None and after != self._stream:
+            self.side.wait_stream(after)
         with torch.cuda.stream(self.side):
             for v, split in views:
                 if not split:
@@ -275,6 +320,9 @@ class DataParallel:
         """Before the forward of an update's last micro-batch: hook the layers' inputs, issue buckets when ready."""
         self._issued = set()
         self._rows = {}
+        self._left = [len(held) for _, held in self.early]
+        self._seen = set()
+        self.order = []
         self._watch = self._armed = True
 
     def forward_done(self) -> None:
@@ -285,16 +333,18 @@ class DataParallel:
         """After that backward: the tail and ``sums`` summed; the backward's stream waits for every collective."""
         self._armed = False
         missing = [j for j in list(self.layer_buckets) + ([HEAD] if self.head else []) if j not in self._issued]
-        if missing or set(self._rows) != set(self.lookups):
-            raise RuntimeError(f"DataParallel: buckets not issued {sorted(missing)}, lookup gradients "
-                               f"{sorted(self._rows)} of {sorted(self.lookups)}")
+        unaccumulated = sorted(name for _, held in self.early for name in held if name not in self._seen)
+        if missing or unaccumulated or set(self._rows) != set(self.lookups):
+            raise RuntimeError(f"DataParallel: buckets not issued {sorted(missing)}, gradients autograd did not "
+                               f"accumulate {unaccumulated}, lookup gradients {sorted(self._rows)} of "
+                               f"{sorted(self.lookups)}")
         gathered = []
         for name in sorted(self.lookups):                            # (allocated on the backward's stream)
             g = self._rows[name]
             idx, val = g._indices()[0].contiguous(), g._values().contiguous()
             gathered.append((name, idx, val, idx.new_empty(self.world * idx.numel()),
                              val.new_empty((self.world * val.shape[0],) + tuple(val.shape[1:]))))
-        self._issue([(v, False) for v in self.tail + [sums]])
+        self._issue([(v, False) for v in self.tail + [sums]], "tail")
         if gathered:
             self.side.wait_stream(self._stream)
             with torch.cuda.stream(self.side):
@@ -373,8 +423,10 @@ class DataParallel:
         return all(torch.equal(every[0], e) for e in every[1:])
 
     def describe(self) -> dict:
-        """The reduction's layout: the layers' buckets (elements, in issue order), the tail's elements and the elements
-        of the split buckets (reduce-scattered, updated in parts)."""
+        """The reduction's layout: the layers' buckets (elements, in issue order), the early parts (elements and
+        parameter names, issued once autograd has accumulated every gradient in them), the tail's elements and the
+        elements of the split buckets (reduce-scattered, updated in parts)."""
         sizes = self.bucket_numels or [0]
         return {"world": self.world, "buckets": len(sizes) - 1, "bucket_numel": sizes[:-1], "tail_numel": sizes[-1],
+                "early_numel": [v.numel() for v, _ in self.early], "early_params": [list(h) for _, h in self.early],
                 "split_numel": self.split_numel}
