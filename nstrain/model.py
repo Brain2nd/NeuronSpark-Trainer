@@ -104,7 +104,8 @@ def param_groups(model, weight_decay: float = WEIGHT_DECAY, lexical_lr_mult: flo
     ``written_first`` counts those projection weights (the tied embedding among them): the linear operator's GEMM is
     the first writer of each one's gradient in every backward (the tied embedding's readout runs before its lookup
     adds the rows), so the step can leave their gradients for the next update's first backward to write
-    (nstrain.flat_adamw, nstrain.engine)."""
+    (nstrain.flat_adamw, nstrain.engine).  The lexical tables' group is marked ``bound``: the whole-row read adds the
+    rows of their gradients into their gradient buffers itself (neuronspark.ops.triton.lex_train)."""
     named = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
     lexical = {id(p) for p in model.backbone.lexical_memory.tables}
     dvec = {id(p) for n, p in named if ".mixer_a." in n and n.rsplit(".", 1)[-1] in DENDRITIC_DECAYED_VECTORS}
@@ -117,7 +118,7 @@ def param_groups(model, weight_decay: float = WEIGHT_DECAY, lexical_lr_mult: flo
         {"params": [p for n, p in named if p.ndim < 2 and id(p) not in lexical and id(p) not in dvec],
          "weight_decay": 0.0, "lr_mult": 1.0, "name": "vectors"},
         {"params": [p for n, p in named if id(p) in lexical], "weight_decay": 0.0, "lr_mult": float(lexical_lr_mult),
-         "name": "lexical_tables"},
+         "name": "lexical_tables", "bound": True},
         {"params": [p for n, p in named if id(p) in dvec], "weight_decay": weight_decay, "lr_mult": 1.0,
          "name": "dendritic_vectors"},
     ]

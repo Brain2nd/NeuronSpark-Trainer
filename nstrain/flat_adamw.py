@@ -32,6 +32,11 @@ follows every write of the weights made here (the update, :meth:`swap_ema`); aft
 :meth:`refresh_bf16` (the step engine does before it captures and after it restores its snapshot, and refuses an
 update when a weight was written in place through its parameter since, :meth:`check_bf16`).
 
+A group with ``"bound": True`` (the lexical n-gram tables, nstrain.model.param_groups) has its 2-D parameters bound
+with ``bind_grad_`` as well: their whole-row read adds the rows of their gradients into the flat gradient buffer itself
+(``neuronspark.ops.triton.lex_train``: no dense gradient of the whole table, no add over it), the rows read several
+times summed in a fixed order.  The update zeroes their gradients like any other's.
+
 Update rule (torch.optim.AdamW, decoupled weight decay)::
 
     g = g * clip;  m = b1 m + (1 - b1) g;  v = b2 v + (1 - b2) g^2
@@ -271,7 +276,8 @@ class FlatAdamW:
         for gi, g in enumerate(groups):
             params = g["params"]
             linear = bool(g.get("linear"))
-            if linear:
+            bound = bool(g.get("bound"))
+            if linear or bound:
                 from neuronspark.ops.linear import bind_grad_, padded_extent
             offs, o = [], 0
             for p in params:
@@ -303,6 +309,10 @@ class FlatAdamW:
                         bind_grad_(p)
                         rows = padded_extent(p.shape[0])
                         bf16.append((p, flat["h"][off:off + rows * p.shape[1]].view(rows, p.shape[1])))
+            elif bound:
+                for p in params:
+                    if p.ndim == 2:
+                        bind_grad_(p)
             self.groups.append({"name": g.get("name", str(gi)), "flat": flat, "n": n,
                                 "lr_mult": float(g.get("lr_mult", 1.0)), "wd": float(g.get("weight_decay", 0.0)),
                                 "params": params, "linear": linear, "bf16": bf16, "bf16_versions": [],
