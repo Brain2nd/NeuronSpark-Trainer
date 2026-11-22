@@ -79,6 +79,7 @@ def _driver():
 
 
 _LIVE: "weakref.WeakSet" = weakref.WeakSet()                     # every Graph of the process not yet collected
+_CAPTURING = None                                                # the Graph whose capture is in progress
 
 
 def release_graphs() -> None:
@@ -87,6 +88,15 @@ def release_graphs() -> None:
     released, or the graphs of an engine whose construction failed after a capture)."""
     for g in list(_LIVE):
         g.release()
+
+
+def capturing_graph():
+    """The :class:`Graph` being captured in this process (between its capture_begin and capture_end), or None.  Kept
+    for the process, not the thread: a captured backward runs on autograd's device thread, and the reductions it
+    issues there (nstrain.data_parallel) belong to the capture begun on the engine's thread.  One Graph captures at a
+    time (the engine captures its graphs one after another); a capture outside Graph made on another thread while a
+    Graph captures would be counted as that Graph's."""
+    return _CAPTURING
 
 
 class Graph:
@@ -106,10 +116,14 @@ class Graph:
         _LIVE.add(self)
 
     def capture_begin(self, pool, capture_error_mode: str) -> None:
+        global _CAPTURING
         self.device = torch.cuda.current_device()
         self.g.capture_begin(pool=pool, capture_error_mode=capture_error_mode)
+        _CAPTURING = self
 
     def capture_end(self) -> None:
+        global _CAPTURING
+        _CAPTURING = None
         self.g.capture_end()
 
     def instantiate(self) -> None:
@@ -125,6 +139,10 @@ class Graph:
             rc = _driver().cuGraphLaunch(self.exec, ctypes.c_void_p(torch.cuda.current_stream().cuda_stream))
         if rc != 0:
             raise RuntimeError(f"nstrain.engine: cuGraphLaunch failed (CUresult {rc})")
+
+    def alive(self) -> bool:
+        """Whether the graph may still be launched (not released)."""
+        return self.exec is not None or self.g is not None
 
     def release(self) -> None:
         if self.exec is not None or self.g is not None:

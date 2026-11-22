@@ -53,23 +53,129 @@ same way.
 The process group is NCCL over the GPUs of one host (``torchrun``'s environment: ``RANK``, ``WORLD_SIZE``,
 ``LOCAL_RANK``); it is created eagerly (bound to this process's GPU), so the communicator exists before any graph is
 captured.
+
+The split buckets' reduce-scatter by the copy engines.  When the optimizer's bf16 values travel by copies between
+replicas that map each other's memory (:mod:`nstrain.flat_adamw`, "How the bf16 values travel"), a split bucket is
+summed without NCCL as well: every replica copies each other replica's part of the bucket into that replica's staging
+memory (``Tensor.copy_`` into the mapped view: a copy engine's copy, which takes no SM from the backward beside it;
+replica s writes slot (s - o - 1) mod N of replica o's N - 1 slots of the bucket), then passes a barrier of all the
+replicas on the bucket's row of flag words (``neuronspark.ops.triton.tp_bulk.tp_fence``: it stores the update's epoch
+into its word of every other replica's row, then waits until every other word of its own row holds it, so every other
+replica's copies into this one have landed), and one kernel adds the N values of its part in rank order into its part
+of the bucket.  The epoch is a device counter advanced once per update before the first split bucket (inside the
+captured graph as well), equal on every replica, and the flag words are compared with >=, so they are never cleared.
+A bucket's slots are written again only in the next update, which every replica starts after the tail's all-reduce of
+this one, which no replica passes before every replica has issued it on the side stream, after its sums of this
+update's buckets.  As with NCCL's collectives, every replica issues the same buckets in the same order, and an update
+that fails on one replica after its first copy leaves the others waiting: the replicas are out of step, the update is
+not retried (:meth:`DataParallel.begin` refuses) and the job ends.  Two replicas add the same two values as NCCL;
+more add in rank order, the same on every run, which NCCL's ring need not.  The staging is made by every replica
+together (the same parts, a token drawn in common, every allocation made before any is shared), kept while the parts
+stay the same, and a staging no longer used is freed once every graph that may address it is gone, on every replica
+alike.  Other layouts sum split buckets with NCCL's reduce-scatter.
 """
 from __future__ import annotations
 
 import os
 import re
+import uuid
+import weakref
 from functools import partial
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
+import triton
+import triton.language as tl
 
-from nstrain.engine import release_graphs
+from nstrain.engine import capturing_graph, release_graphs
 
 BUCKET_MIN_NUMEL = 1 << 24          # 16 M fp32 elements (64 MB) per bucket at least, consecutive layers merged
 GROUP_MIN_NUMEL = 1 << 24           # a group smaller than this is summed whole in the tail
 HEAD = 1 << 30                      # the bucket of the lookup tables' slices (issued at the readout's input)
 CROSS_LAYER = (".pre_norm_gain",)   # a layer's parameters the layer below writes (a joined dendritic pre-norm): tail
+SUM_BLOCK = 4096                    # the rank-order sum of a split bucket's part: elements per program
+SUM_WARPS = 8
+
+
+@triton.jit
+def _rank_sum_kernel(OWN, STG, c, RANK: tl.constexpr, NR: tl.constexpr, BLOCK: tl.constexpr):
+    """OWN[i] = the NR replicas' values of element i of this replica's part (c fp32), added in rank order: this
+    replica's own in OWN, replica s's in slot (s - RANK - 1) mod NR of the staging STG (slots of c elements)."""
+    o = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+    m = o < c
+    own = tl.load(OWN + o, mask=m)
+    if RANK == 0:
+        acc = own
+    else:
+        acc = tl.load(STG + tl.full([], (NR - RANK - 1) % NR, tl.int64) * c + o, mask=m)
+    for s in tl.static_range(1, NR):
+        if s == RANK:
+            acc = acc + own
+        else:
+            acc = acc + tl.load(STG + tl.full([], (s - RANK - 1 + NR) % NR, tl.int64) * c + o, mask=m)
+    tl.store(OWN + o, acc, mask=m)
+
+
+class _ScatterBuffers:
+    """The symmetric memory of the split buckets' reduce-scatter by the copy engines (module docstring): this replica's
+    staging (N - 1 slots of each split bucket's part, in issue order) and flag rows (N int64 words per split bucket),
+    their rendezvous handles, the views of every other replica's staging and rows, the epoch (on the device) and the
+    token the replicas drew together when they shared it.  torch aborts the process when a symmetric allocation is
+    freed before its rendezvous handle, so the allocations are held here until the views and handles have gone
+    (:meth:`close`)."""
+
+    def __init__(self, dev: torch.device, rank: int, world: int, parts: List[int]):
+        """This replica's allocations on ``dev`` for ``parts``, the elements of each split bucket's part (its numel /
+        world) in issue order; nothing is shared yet (:meth:`share`)."""
+        import torch.distributed._symmetric_memory as symm_mem
+        self.rank, self.world = rank, world
+        self.peers = [j for j in range(world) if j != rank]
+        self.offsets, at = [], 0                                     # each bucket's first staging element
+        for c in parts:
+            self.offsets.append(at)
+            at += (world - 1) * c
+        self.parts = list(parts)
+        self.stage = symm_mem.empty(max(at, 1), dtype=torch.float32, device=dev)
+        self.flag = symm_mem.empty(len(parts) * world, dtype=torch.int64, device=dev)
+        self.epoch = torch.zeros(1, dtype=torch.int64, device=dev)
+        self.handles: list = []
+        self.remote: Dict[int, torch.Tensor] = {}
+        self.flags: List[torch.Tensor] = []
+        self.token: Optional[str] = None
+        self.graphs: weakref.WeakSet = weakref.WeakSet()           # the nstrain graphs captured with it
+        self.pinned = False                                          # captured outside nstrain's graphs: kept
+
+    def share(self, pg, token: str) -> None:
+        """Map every other replica's staging and rows here (a collective: every replica shares the holder it made
+        for the same parts, with the same ``token``).  This replica's rows are cleared and the device synchronized
+        first, so no other replica can store into a row before it is clear."""
+        import torch.distributed._symmetric_memory as symm_mem
+        self.flag.zero_()
+        torch.cuda.synchronize(self.flag.device)
+        self.token = token
+        self.handles = [symm_mem.rendezvous(self.stage, pg.group_name), symm_mem.rendezvous(self.flag, pg.group_name)]
+        self.remote = {j: self.handles[0].get_buffer(j, tuple(self.stage.shape), torch.float32) for j in self.peers}
+        self.flags = [self.flag if j == self.rank else
+                      self.handles[1].get_buffer(j, tuple(self.flag.shape), torch.int64) for j in range(self.world)]
+
+    def rows(self, b: int) -> List[torch.Tensor]:
+        """Bucket b's row of flag words of every replica (this one's at ``rank``)."""
+        return [f[b * self.world:(b + 1) * self.world] for f in self.flags]
+
+    def slot(self, j: int, b: int) -> torch.Tensor:
+        """The slot of bucket b that this replica writes in replica j's staging (mapped here)."""
+        c = self.parts[b]
+        at = self.offsets[b] + ((self.rank - j - 1) % self.world) * c
+        return self.remote[j][at:at + c]
+
+    def close(self) -> None:
+        self.remote, self.flags = {}, []
+        self.handles = []
+        self.stage = self.flag = None
+
+    def __del__(self):
+        self.close()
 
 
 class DataParallel:
@@ -98,6 +204,11 @@ class DataParallel:
         self._seen: set = set()                                      # the early parts' parameters accumulated
         self._handles: list = []                                     # the module hooks (removed by detach)
         self.fused = None                                            # the engine's fused accumulation (attach)
+        self.scatter: Optional[_ScatterBuffers] = None               # the copy engines' reduce-scatter (attach)
+        self._retired: List[_ScatterBuffers] = []                    # holders no longer used (_prune_retired)
+        self._bucket: Dict[int, int] = {}                            # a split view's data_ptr -> its bucket index
+        self._epoch_due = False                                      # the update's epoch not yet advanced
+        self._broken = False                                         # a reduction failed after its first copy
 
     @classmethod
     def from_env(cls) -> "DataParallel":
@@ -110,10 +221,73 @@ class DataParallel:
 
     def close(self) -> None:
         """Destroy the process group, every captured graph still alive released first (nstrain.engine.release_graphs:
-        NCCL's teardown waits for the graphs that hold its kernels)."""
+        NCCL's teardown waits for the graphs that hold its kernels) and the reduce-scatter's symmetric memory let go
+        (its handles' teardown needs the group)."""
         release_graphs()
+        self._retire_scatter()
+        torch.cuda.synchronize()
+        for s in self._retired:
+            s.close()
+        self._retired = []
         if dist.is_initialized():
             dist.destroy_process_group()
+
+    def _retire_scatter(self) -> None:
+        """The reduce-scatter's holder no longer used, kept while a graph captured with it may still be launched
+        (:meth:`_prune_retired`) or until :meth:`close`."""
+        if self.scatter is not None:
+            self._retired.append(self.scatter)
+            self.scatter = None
+        self._bucket = {}
+
+    def _prune_retired(self) -> None:
+        """Free the retired holders that no graph may address any more (every nstrain graph captured with it released
+        or collected; none captured otherwise) on every replica (a collective: a holder is freed only where every
+        replica can free it)."""
+        free = [s.token for s in self._retired if not s.pinned and not any(g.alive() for g in s.graphs)]
+        every: List[Optional[list]] = [None] * self.world
+        dist.all_gather_object(every, free, group=self.group)
+        gone = set(free).intersection(*(set(e) for e in every))
+        if not gone:
+            return
+        torch.cuda.synchronize(self.device)                          # (launches in flight may still use them)
+        for s in self._retired:
+            if s.token in gone:
+                s.close()
+        self._retired = [s for s in self._retired if s.token not in gone]
+
+    def _set_scatter(self, parts: Optional[List[int]]) -> None:
+        """The copy engines' reduce-scatter for split buckets of ``parts`` elements per replica (None: NCCL's), decided
+        by every replica together (a collective): the present holder kept when every replica holds the same one for
+        these parts, else a new one that every replica makes (every allocation made, then agreed, before any is
+        shared) and the present one retired."""
+        cur = self.scatter
+        mine = (cur.token, cur.parts) if cur is not None else None
+        every: List[Optional[tuple]] = [None] * self.world
+        dist.all_gather_object(every, (parts, mine), group=self.group)
+        if parts is not None and mine is not None and cur.parts == parts and all(e == every[0] for e in every):
+            return
+        self._retire_scatter()
+        if parts is None or any(e[0] != parts for e in every):
+            return
+        failed = None
+        try:
+            with torch.cuda.device(self.device):
+                s = _ScatterBuffers(self.device, self.rank, self.world, parts)
+        except (torch.OutOfMemoryError, RuntimeError) as e:
+            s, failed = None, e
+        ok = torch.tensor([int(failed is None)], device=self.device)
+        dist.all_reduce(ok, op=dist.ReduceOp.MIN, group=self.group)
+        if not bool(ok.item()):                                      # (nothing shared yet: dropped as it is)
+            import warnings
+            warnings.warn("nstrain.data_parallel: no symmetric memory for the split buckets' reduce-scatter "
+                          f"({failed or 'on another process'}); the replicas sum them with NCCL")
+            return
+        tokens: List[Optional[str]] = [None] * self.world
+        dist.all_gather_object(tokens, uuid.uuid4().hex, group=self.group)
+        with torch.cuda.device(self.device):
+            s.share(self.group if self.group is not None else dist.group.WORLD, tokens[0])
+        self.scatter = s
 
     # ------------------------------------------------------------------ collectives
     def barrier(self) -> None:
@@ -231,6 +405,16 @@ class DataParallel:
         self.split_numel = sum(hi - lo for rs in split.values() for lo, hi in rs)
         self._unhook()
         opt.shard(self.group, split)                                 # (a new layout gathers the present one first)
+        # the copy engines' reduce-scatter where the optimizer's bf16 values travel by copies (the same layout of the
+        # replicas, agreed by every replica in FlatAdamW._push_setup): the split buckets in issue order; the staging and
+        # flags of the same buckets kept (a later engine's graphs address the same memory), others made by every
+        # replica together; the holders no graph addresses any more freed
+        sh = opt.sharding
+        views = [v for j in sorted(buckets, reverse=True) for v, s, _ in buckets[j] if s]
+        parts = [v.numel() // self.world for v in views]
+        self._prune_retired()
+        self._set_scatter(parts if sh is not None and sh.get("push") is not None else None)
+        self._bucket = {v.data_ptr(): b for b, v in enumerate(views)} if self.scatter is not None else {}
         for j, mod in layers.items():
             self._handles.append(mod.register_forward_pre_hook(partial(self._forward_pre_hook, j)))
         params = dict(model.named_parameters())
@@ -310,8 +494,9 @@ class DataParallel:
         """Sum the (view, split, zero the rest) triples ``views`` across the replicas, in order, on the side stream,
         once the backward's stream (and ``after``, when given) has reached this point: a split view by a reduce-scatter
         (this replica's part of the sum stays in its part of the view; the rest of the view, this replica's own
-        gradient, is zeroed for the next update unless the next update's first backward writes it), any other by an
-        all-reduce.  The gradients the engine's fused accumulation holds are added first, on the current stream."""
+        gradient, is zeroed for the next update unless the next update's first backward writes it; by the copy engines
+        where the replicas map each other's memory, module docstring), any other by an all-reduce.  The gradients the
+        engine's fused accumulation holds are added first, on the current stream."""
         if not views:
             return
         if self.fused is not None:                                   # (the gradients it kept: added before the sum,
@@ -327,14 +512,51 @@ class DataParallel:
                     dist.all_reduce(v, group=self.group)
                     continue
                 c = v.numel() // self.world
-                dist.reduce_scatter_tensor(v[self.rank * c:(self.rank + 1) * c], v, group=self.group)
+                if self.scatter is None:
+                    dist.reduce_scatter_tensor(v[self.rank * c:(self.rank + 1) * c], v, group=self.group)
+                else:
+                    self._scatter(v, c)
                 if zero_rest and self.rank > 0:
                     v[:self.rank * c].zero_()
                 if zero_rest and self.rank < self.world - 1:
                     v[(self.rank + 1) * c:].zero_()
 
+    def _scatter(self, v: torch.Tensor, c: int) -> None:
+        """The reduce-scatter of the split bucket ``v`` by the copy engines (module docstring), on the current stream:
+        every other replica's part copied into its slot of the bucket on that replica, the barrier on the bucket's
+        row, the N values of this replica's part added in rank order into its part of ``v``."""
+        from neuronspark.ops.triton.tp_bulk import tp_fence
+        s = self.scatter
+        b = self._bucket.get(v.data_ptr())
+        if b is None or s.parts[b] != c:
+            raise RuntimeError("DataParallel: a split bucket the reduce-scatter's staging was not made for")
+        if torch.cuda.is_current_stream_capturing():                 # (the graphs that will address it)
+            g = capturing_graph()
+            if g is None:
+                s.pinned = True
+            else:
+                s.graphs.add(g)
+        try:
+            if self._epoch_due:                                      # (once per update, before its first bucket)
+                s.epoch.add_(1)
+                self._epoch_due = False
+            for j in s.peers:
+                s.slot(j, b).copy_(v[j * c:(j + 1) * c])
+            tp_fence(s.rows(b), self.rank, s.epoch)
+            stage = s.stage[s.offsets[b]:s.offsets[b] + (self.world - 1) * c]
+            _rank_sum_kernel[(triton.cdiv(c, SUM_BLOCK),)](v[self.rank * c:(self.rank + 1) * c], stage, c,
+                                                           RANK=self.rank, NR=self.world, BLOCK=SUM_BLOCK,
+                                                           num_warps=SUM_WARPS)
+        except BaseException:                                        # (the replicas are out of step: module docstring)
+            self._broken = True
+            raise
+
     def begin(self) -> None:
         """Before the forward of an update's last micro-batch: hook the layers' inputs, issue buckets when ready."""
+        if self._broken:
+            raise RuntimeError("DataParallel: an earlier update failed in the middle of its reduction; the replicas "
+                               "are out of step (module docstring): end the job")
+        self._epoch_due = True
         self._issued = set()
         self._rows = {}
         self._left = [len(held) for _, held in self.early]
