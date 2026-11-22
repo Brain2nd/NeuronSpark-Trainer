@@ -2,7 +2,8 @@
 the parameter groups of AdamW (the recipe of the repository's training benchmark).
 
 Model presets: ``nstrain/presets/models/<name>.json`` (NeuronSparkConfig fields): ``ns-2b`` (2048 x 24, the production
-model), ``ns-1p3b`` (the repository's 1.3B), ``tiny-32k`` (8 layers, for quick runs).  Presets and the run defaults per
+model), ``ns-4b`` (2048 x 52: the 2B's layers, 39 dendritic and 13 hippocampal; 4.07B parameters), ``ns-1p3b`` (the
+repository's 1.3B), ``tiny-32k`` (8 layers, for quick runs).  Presets and the run defaults per
 preset (:data:`RUN_DEFAULTS`: engine settings per sequence length, tokens per update, warmup) are templates of
 ``nstrain new``: a line's run.json holds the resolved values, so a later change of a preset never changes a line.
 """
@@ -20,6 +21,10 @@ OPTIMIZER = {"betas": [0.9, 0.95], "eps": 1e-8, "weight_decay": 0.1, "lexical_lr
 # what `nstrain new` writes for a preset (shapes measured on a GB300)
 RUN_DEFAULTS: Dict[str, dict] = {
     "ns-2b": {"tokens_per_update": 1048576,
+              "lengths": {"4096": {"micro_rows": 4, "activation_checkpointing": False},
+                          "32768": {"micro_rows": 1, "activation_checkpointing": True}},
+              "warmup_tokens": 2e9},
+    "ns-4b": {"tokens_per_update": 1048576,
               "lengths": {"4096": {"micro_rows": 4, "activation_checkpointing": False},
                           "32768": {"micro_rows": 1, "activation_checkpointing": True}},
               "warmup_tokens": 2e9},

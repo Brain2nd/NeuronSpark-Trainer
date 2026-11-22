@@ -136,7 +136,7 @@ fails.
 nstrain data init --work /data/lines/trunk --eos-id 1 --cycle-tokens 2e10
 nstrain data val --work /data/lines/trunk
 
-# a training line from a model preset (ns-2b, ns-1p3b, tiny-32k)
+# a training line from a model preset (ns-2b, ns-4b, ns-1p3b, tiny-32k)
 nstrain new runs/trunk --model ns-2b --data /data/lines/trunk --peak-lr 3e-4
 # ... with a batch-size ramp whose weight decay follows the batch (0.1 at 1M tokens per update)
 nstrain new runs/trunk --model ns-2b --data /data/lines/trunk \
