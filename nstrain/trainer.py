@@ -198,9 +198,9 @@ class Trainer:
         self.replicas = None                                         # a line on several GPUs (nstrain.replicas)
         gpus = replicas.world()
         if gpus > 1:
-            if c.guards.allow_shared_gpu or self.reserve is not None or c.ema is not None:
+            if c.guards.allow_shared_gpu or self.reserve is not None:
                 raise NeedsOperator(f"{replicas.ENV}={gpus}: a line on several GPUs has its GPUs to itself (no "
-                                    "guards.share_reserve_gb, no guards.allow_shared_gpu) and no moving average (ema)")
+                                    "guards.share_reserve_gb, no guards.allow_shared_gpu)")
             self.replicas = replicas.Replicas(run, gpus)
             print(f"line {c.name}: {gpus} data-parallel replicas (followers: "
                   f"{[q.pid for q in self.replicas.procs]})", flush=True)
@@ -781,8 +781,7 @@ class Trainer:
         source (the first row of its largest stratum; ``ema/val_<P>/...``)."""
         out = {}
         self._beat("validation of the moving average")
-        with self.arena.use():
-            self.opt.swap_ema()
+        self._swap_ema()
         try:
             lengths = [(L, self._val_batch(L), False)]
             if self.probe_len > L:
@@ -806,9 +805,17 @@ class Trainer:
                 out[f"{key}/mix"] = sum(got[n] * w for n, w in mine.items()) / sum(mine.values())
                 out[f"{key}/mean"] = sum(got[n] for n in mine) / len(mine)
         finally:
-            with self.arena.use():
-                self.opt.swap_ema()
+            self._swap_ema()
         return out
+
+    def _swap_ema(self) -> None:
+        """The parameters and their moving average exchanged (on every replica of a line on several GPUs: the swap
+        gathers the split state and the bf16 values, collectives)."""
+        with self.arena.use():
+            if self.replicas is not None:
+                self.replicas.swap_ema(self.opt)
+            else:
+                self.opt.swap_ema()
 
     @torch.no_grad()
     def _probe_long(self, seg: int, recipe: dict) -> dict:
@@ -966,8 +973,11 @@ class Trainer:
             ema_c = 0.0
             if c.ema is not None:                                    # the parameters' moving average
                 if not self.ema_started and self.tokens >= c.ema.from_tokens:
-                    with self.arena.use():
-                        self.opt.ema_init()                          # starts as a copy of the parameters
+                    with self.arena.use():                           # starts as a copy of the parameters (on
+                        if self.replicas is not None:                # every replica, their split state whole)
+                            self.replicas.ema_init(self.opt)
+                        else:
+                            self.opt.ema_init()
                     self.ema_started = True
                     print(f"update {self.update}: the parameters' moving average starts ({self.tokens} tokens; "
                           f"horizon {c.ema.horizon_tokens:.0f} tokens)", flush=True)

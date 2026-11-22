@@ -20,6 +20,10 @@ command's tensors; NCCL, in the one order every replica follows):
     PROBE    the loss of one micro-batch computed by every replica (no gradient) and compared: once, before the
              leader's first update (a replica whose forward differs -- a buffer, a flag set when a state is loaded
              -- would train another model than the one the checkpoints hold)
+    EMA_INIT the parameters' moving average started on every replica as a copy of the whole parameters
+             (``FlatAdamW.gather_`` then ``ema_init``), at the update the line's ``ema.from_tokens`` is reached
+    EMA_SWAP the parameters and their average exchanged on every replica (``FlatAdamW.swap_ema``: the split state and
+             the bf16 values are gathered, collectives): before and after the leader's validation of the average
 
 What a checkpoint of a line on N GPUs holds is what a one-GPU checkpoint holds, written by the leader after GATHER and
 CHECK: the fp32 weights and the buffers, the moments and the step count, the data position, the counters, the W&B
@@ -42,8 +46,9 @@ every follower is alive before each command and ends as a failure when one is no
 again from its last checkpoint).  ``NSTRAIN_REPLICA_CPUS="a-b,c-d;e-f,g-h"``: the CPUs of rank 0; rank 1; ... (the
 NUMA node of each GPU), applied by each process to itself.
 
-Not with a GPU shared with other processes (``guards.share_reserve_gb``, ``guards.allow_shared_gpu``) and not with
-the parameters' moving average (``ema``): both are refused at the start.
+Not with a GPU shared with other processes (``guards.share_reserve_gb``, ``guards.allow_shared_gpu``): refused at
+the start.  The parameters' moving average (``ema``) is kept on every replica (its step is part of the captured
+update; the split ranges' average is updated by their owners and gathered with the weights and the moments).
 """
 from __future__ import annotations
 
@@ -61,7 +66,7 @@ import torch.distributed as dist
 ENV = "NSTRAIN_GPUS"
 CPUS_ENV = "NSTRAIN_REPLICA_CPUS"
 LEADER = "NSTRAIN_LEADER_PID"
-STATE, ENGINE, UPDATE, GATHER, EXIT, CHECK, PROBE = 1, 2, 3, 4, 5, 6, 7
+STATE, ENGINE, UPDATE, GATHER, EXIT, CHECK, PROBE, EMA_INIT, EMA_SWAP = 1, 2, 3, 4, 5, 6, 7, 8, 9
 PROBE_RTOL = 1e-4                    # the replicas' loss on one micro-batch: equal up to the kernels' fp32 sums
 LIVE: list = []                      # the leader's Replicas whose followers may be alive (kill_all)
 EXIT_WAIT_S = 120.0
@@ -193,6 +198,17 @@ class Replicas:
             raise RuntimeError(f"the data-parallel replicas compute different losses on the same micro-batch: {every}")
         return every
 
+    def ema_init(self, opt) -> None:
+        """The moving average started on every replica (the caller in the trainer's arena)."""
+        self.tell(EMA_INIT)
+        opt.gather_()
+        opt.ema_init()
+
+    def swap_ema(self, opt) -> None:
+        """The parameters and their average exchanged on every replica (the caller in the trainer's arena)."""
+        self.tell(EMA_SWAP)
+        opt.swap_ema()
+
     def consistent(self, opt, gnorm: torch.Tensor) -> bool:
         """Whether every replica holds the same weights and optimizer state (a collective on every replica)."""
         self.tell(CHECK)
@@ -286,6 +302,13 @@ def follow(run) -> int:
         elif op == CHECK:
             with arena.use():
                 rep.consistent(opt, engine.gnorm)
+        elif op == EMA_INIT:
+            with arena.use():
+                opt.gather_()
+                opt.ema_init()
+        elif op == EMA_SWAP:
+            with arena.use():
+                opt.swap_ema()
         elif op == PROBE:
             buf = torch.empty((2, int(a), int(b)), dtype=torch.int64, device=dev)
             dist.broadcast(buf, 0, group=rep.group)

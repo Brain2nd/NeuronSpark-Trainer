@@ -24,7 +24,15 @@
  },
  "data_work": "/data/lines/trunk",
  "val_work": "/data/lines/trunk",
- "tokens_per_update": 1048576,
+ "tokens_per_update": [
+  {"from": 0, "to": 4700000000.0, "tokens": 262144},
+  {"from": 4700000000.0, "to": 11700000000.0, "tokens": 393216},
+  {"from": 11700000000.0, "to": 29000000000.0, "tokens": 524288},
+  {"from": 29000000000.0, "to": 74000000000.0, "tokens": 786432},
+  {"from": 74000000000.0, "to": 181000000000.0, "tokens": 1048576},
+  {"from": 181000000000.0, "to": 447000000000.0, "tokens": 1572864},
+  {"from": 447000000000.0, "to": null, "tokens": 2097152}
+ ],
  "lengths": {
   "4096": {
    "micro_rows": 8,
@@ -45,7 +53,8 @@
   "eps": 1e-08,
   "weight_decay": 0.1,
   "lexical_lr_mult": 8.0,
-  "grad_clip": 1.0
+  "grad_clip": 1.0,
+  "weight_decay_batch": 1048576
  },
  "schedule": [
   {
@@ -63,6 +72,10 @@
   "project": "ns-pretrain",
   "entity": null,
   "retry_s": 7200.0
+ },
+ "ema": {
+  "horizon_tokens": 2000000000.0,
+  "from_tokens": 2000000000.0
  },
  "seed": 0,
  "data_seed": 0,
@@ -96,6 +109,7 @@
    "rayon": 8
   }
  },
+ "metrics": "2026-11-03",
  "allow_changes": [],
  "print_every": 10
 }

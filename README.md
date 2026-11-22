@@ -222,7 +222,7 @@ start.  The schedule only grows at its end.
   wrote it: a line continues on another N.  Before every checkpoint the replicas are compared bit for bit (a
   difference ends the run before anything is written), and before the first update of a start their loss on one
   micro-batch.  `NSTRAIN_REPLICA_CPUS="0-47,96-143;48-95,144-191"` puts each replica on the CPUs of its GPU's NUMA
-  node.  Not beside other processes (`guards.share_reserve_gb`) and not with the moving average (`ema`).
+  node.  Not beside other processes (`guards.share_reserve_gb`).  The moving average (`ema`) is kept on every replica.
 
 ## Recovery
 

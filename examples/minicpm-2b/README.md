@@ -56,7 +56,11 @@ nstrain run runs/b0
 
 ## Settings in `run.json`
 
-* **Update:** 1,048,576 tokens (256 rows of 4,096).  `nstrain tune` measured whole updates on the GB300 and chose
+* **Update:** the tokens per update grow with the tokens trained (the trunk's settings, `tokens_per_update`): 262,144
+  up to 4.7B tokens, then 393,216 (to 11.7B), 524,288 (to 29B), 786,432 (to 74B), 1,048,576 (to 181B), 1,572,864 (to
+  447B) and 2,097,152 after; the weight decay follows the batch (`optimizer.weight_decay_batch` 1,048,576: 0.1 at
+  that size); the parameters' moving average starts at 2B tokens with a horizon of 2B tokens (`ema`); metric set
+  `2026-11-03`.  `nstrain tune` measured whole updates of 1,048,576 tokens on the GB300 and chose
   8 rows per micro-batch with the first dendritic neuron layer recomputed (peak 236.8 GiB):
 
   | Micro-batch | Recomputed layers | Tokens / s | Peak reserved |
