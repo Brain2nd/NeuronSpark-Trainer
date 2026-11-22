@@ -76,6 +76,7 @@ alike.  Other layouts sum split buckets with NCCL's reduce-scatter.
 """
 from __future__ import annotations
 
+import datetime
 import os
 import re
 import uuid
@@ -90,6 +91,7 @@ import triton.language as tl
 
 from nstrain.engine import capturing_graph, release_graphs
 
+COLLECTIVE_TIMEOUT = datetime.timedelta(days=3650)   # (from_env)
 BUCKET_MIN_NUMEL = 1 << 24          # 16 M fp32 elements (64 MB) per bucket at least, consecutive layers merged
 GROUP_MIN_NUMEL = 1 << 24           # a group smaller than this is summed whole in the tail
 HEAD = 1 << 30                      # the bucket of the lookup tables' slices (issued at the readout's input)
@@ -216,7 +218,10 @@ class DataParallel:
         local = int(os.environ.get("LOCAL_RANK", "0"))
         torch.cuda.set_device(local)
         if not dist.is_initialized():
-            dist.init_process_group("nccl", device_id=torch.device("cuda", local))
+            # no time limit on a collective: a replica waits in one for as long as another replica needs before it
+            # joins (a line's follower for the leader's next command: the launch calibration, a validation, a wait
+            # for data; torch's default ends the waiting process after 10 minutes)
+            dist.init_process_group("nccl", device_id=torch.device("cuda", local), timeout=COLLECTIVE_TIMEOUT)
         return cls()
 
     def close(self) -> None:
