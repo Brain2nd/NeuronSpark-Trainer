@@ -149,7 +149,8 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--final-lr-frac", type=float, default=0.05)
     _workers(p)
     for name, h in (("check", "start checks without a GPU"), ("run", "the line under supervision"),
-                    ("train", "one trainer process")):
+                    ("train", "one trainer process"),
+                    ("follow", "a data-parallel follower of a trainer on several GPUs (started by it)")):
         p = sub.add_parser(name, help=h)
         p.add_argument("run")
         if name == "run":
@@ -342,6 +343,9 @@ def _dispatch(a) -> int:
         die_with_parent(SUPERVISOR, signal.SIGTERM)                 # before the heavy imports
         from nstrain.trainer import main as train
         return train(a.run)
+    if a.cmd == "follow":
+        from nstrain.replicas import follow
+        return follow(a.run)
     if a.cmd == "run":
         if a.hf_key:
             from nstrain import backup

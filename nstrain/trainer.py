@@ -83,6 +83,7 @@ import torch
 from nstrain import config as C
 from nstrain import exits
 from nstrain import model as M
+from nstrain import replicas
 from nstrain import schedule as sched
 from nstrain.checks import preflight, start_problems
 from nstrain.ckpt import Checkpoints, snapshot
@@ -194,6 +195,15 @@ class Trainer:
         problems = preflight(c)
         if problems:                                                 # a configuration to fix: no relaunch helps
             raise NeedsOperator("cannot start: " + "; ".join(problems))
+        self.replicas = None                                         # a line on several GPUs (nstrain.replicas)
+        gpus = replicas.world()
+        if gpus > 1:
+            if c.guards.allow_shared_gpu or self.reserve is not None or c.ema is not None:
+                raise NeedsOperator(f"{replicas.ENV}={gpus}: a line on several GPUs has its GPUs to itself (no "
+                                    "guards.share_reserve_gb, no guards.allow_shared_gpu) and no moving average (ema)")
+            self.replicas = replicas.Replicas(run, gpus)
+            print(f"line {c.name}: {gpus} data-parallel replicas (followers: "
+                  f"{[q.pid for q in self.replicas.procs]})", flush=True)
         if c.metrics is None:
             print(f"warning: run.json names no metric set (metrics); this nstrain records {METRICS_VERSION!r}",
                   flush=True)
@@ -511,15 +521,26 @@ class Trainer:
         if self.shared:
             self._slack_out()
             self._hold(self._others(others), slack_gib=CAPTURE_SLACK_GIB, reclaim=True)
-        else:
-            self._hold_all()
+        elif self.replicas is None:                                  # (several GPUs: after the engine has taken the
+            self._hold_all()                                         # replicas' memory outside the allocator, below)
         self._beat(f"capturing the {L} engine")
         s, accum = c.length(L, self.shared), c.accum(L, self.shared, self.tokens)
         M.recompute(self.model, s.activation_checkpointing)
         t0 = time.time()
+        rep = None
+        if self.replicas is not None:                                # each replica: its share of the micro-batches
+            try:
+                accum = self.replicas.split(accum)
+            except ValueError as e:
+                raise NeedsOperator(str(e)) from None
+            self.replicas.sync(self.model, self.opt)
+            self.replicas.engine(L, accum)
+            rep = self.replicas.rep
         self.engine = StepEngine(self.model, self.opt, s.micro_rows, L, accum, c.optimizer.grad_clip,
-                                 arena=self.arena, before_capture=lambda: self._warm_validation(L))
-        print(f"engine {accum} x {s.micro_rows} x {L}{' (beside other processes)' if self.shared else ''} captured "
+                                 arena=self.arena, before_capture=lambda: self._warm_validation(L), data_parallel=rep,
+                                 after_attach=None if rep is None else self._hold_all)
+        print(f"engine {'' if rep is None else f'{rep.world} GPUs x '}{accum} x {s.micro_rows} x {L}"
+              f"{' (beside other processes)' if self.shared else ''} captured "
               f"in {time.time() - t0:.0f} s, {torch.cuda.memory_allocated() / 2**30:.1f} GiB", flush=True)
         torch.cuda.empty_cache()                                     # blocks freed outside the arena since the last
         if self.shared:                                              # release (a closed arena's, a pool's) back to
@@ -584,6 +605,7 @@ class Trainer:
         """A checkpoint of the current state whose data progress is (cycle, sample)."""
         if not self._room(1):
             raise NeedsOperator(self._space_message(1))
+        self._whole(check=True)
         ms, os_ = snapshot(self.model, self.opt.state())
         c = self.cfg
         rows, self.rows = [r for r in self.rows if r[0] <= self.update], []
@@ -593,13 +615,34 @@ class Trainer:
                 "data": {"work": c.data_work, "cycle": cycle, "sample": sample, "manifest_sha256": sha,
                          "seed": c.data_seed, "order": ORDER_FORMAT, "order_digest": order},
                 "shape": shape, "run": c.to_dict(), "model_config": self.model_cfg, "code": self.code,
+                "gpus": 1 if self.replicas is None else self.replicas.world,
                 "wandb_run": run_id, "time": time.time()}
         self.ckpts.save(self.update, ms, os_, meta, keep=keep, background=background)
         self.last_ckpt = self.update
 
+    def _whole(self, check: bool = False) -> None:
+        """On several GPUs: the optimizer's split state made whole on this replica (before its fp32 weights or
+        moments are read: a checkpoint, a validation); ``check``: the replicas compared bit for bit first (their
+        bf16 values, replicated ranges, moments, step count), a difference ends the run before anything is written.
+        In the arena (the comparison's scratch: memory the trainer holds)."""
+        if self.replicas is None:
+            return
+        with self.arena.use():
+            self.replicas.gather(self.opt)
+            same = not check or self.engine is None or self.replicas.consistent(self.opt, self.engine.gnorm)
+        if not same:
+            raise RuntimeError(f"update {self.update}: the data-parallel replicas hold different weights or optimizer "
+                               f"state; no checkpoint is written past update {self.last_ckpt}")
+
+    def _shape(self, eng) -> dict:
+        """The update's shape as a checkpoint records it: micro-batch rows, length, micro-batches of the whole
+        update (over every replica)."""
+        n = 1 if self.replicas is None else self.replicas.world
+        return {"rows": eng.rows, "seq_len": eng.L, "accum": eng.accum * n}
+
     def _checkpoint(self, u, keep: bool, background: bool = True) -> None:
         """A checkpoint after update ``u``."""
-        shape = {"rows": self.engine.rows, "seq_len": self.engine.L, "accum": self.engine.accum}
+        shape = self._shape(self.engine)
         if u.cycle_end:
             self._save(u.cycle + 1, 0, "", "", keep, background, shape, self.run_id)
         else:
@@ -930,12 +973,18 @@ class Trainer:
                           f"horizon {c.ema.horizon_tokens:.0f} tokens)", flush=True)
                 if self.ema_started:
                     ema_c = u.inputs.numel() / float(c.ema.horizon_tokens)
-            metrics, applied = eng.update(u.inputs, u.targets, lr, wd_scale, ema_c)
+            x, y = u.inputs, u.targets
+            if self.replicas is not None:                            # the followers get the rows; this replica's part
+                if not self.replicas.probed:                         # once: the same forward on every replica
+                    losses = self.replicas.same_forward(self.model, self.arena, x[:eng.rows], y[:eng.rows])
+                    print(f"update {self.update}: the replicas' loss on the same micro-batch: {losses}", flush=True)
+                x, y = self.replicas.update(x, y, lr, wd_scale, ema_c)
+            metrics, applied = eng.update(x, y, lr, wd_scale, ema_c)
             self.update += 1
             self.tokens += u.inputs.numel()
             self.skipped += 0 if applied else 1
             self.in_a_row = 0 if applied else self.in_a_row + 1
-            self.prev_shape = {"rows": eng.rows, "seq_len": eng.L, "accum": eng.accum}
+            self.prev_shape = self._shape(eng)
             eng = None                                               # (no reference left on the engine: a switch of
             last_u = u                                               # mode below frees it with the arena)
             now = time.time()
@@ -958,6 +1007,7 @@ class Trainer:
                 self.mix[name] = (a + o, b + e)
             validated = self.tokens >= next_val
             if validated:
+                self._whole()
                 row.update(self._validate(u.seq_len, u.recipe))
                 if self.probe_len > u.seq_len:
                     row.update(self._probe_long(u.seq_len, u.recipe))
@@ -1034,6 +1084,9 @@ class Trainer:
             self._checkpoint(last_u, keep=False, background=False)
         self.ckpts.wait()
         self.wb.finish(exit_code=rc)
+        if self.replicas is not None:
+            self.replicas.close(self.engine)
+            self.engine = None
         self._honor_stop()
         return rc
 
@@ -1047,9 +1100,34 @@ class Trainer:
             self._beat(exits.SIGNAL_STOP)
 
 
-def main(run) -> int:
+def _main(run) -> int:
+    """The trainer; on several GPUs a failure ends the followers first and leaves without the interpreter's teardown
+    (the process group's would wait for followers that are gone)."""
     try:
         return Trainer(run).run()
+    except BaseException as e:
+        if not replicas.LIVE:
+            raise
+        import sys
+        import traceback
+        replicas.kill_all()
+        if isinstance(e, GpuBusy):
+            rc, msg = exits.GPU_BUSY, f"trainer: {e}"
+        elif isinstance(e, LineBusy):
+            rc, msg = exits.LINE_BUSY, f"trainer: {e}"
+        elif isinstance(e, NeedsOperator):
+            rc, msg = exits.NEEDS_OPERATOR, f"trainer: {e}"
+        else:
+            rc, msg = exits.FAILURE, traceback.format_exc()
+        print(msg, flush=True)
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(rc)
+
+
+def main(run) -> int:
+    try:
+        return _main(run)
     except GpuBusy as e:
         print(f"trainer: {e}", flush=True)
         return exits.GPU_BUSY

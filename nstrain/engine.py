@@ -219,7 +219,7 @@ class FusedAccumulation:
 class StepEngine:
     def __init__(self, model, optimizer: FlatAdamW, rows: int, seq_len: int, accum: int,
                  grad_clip: float = 1.0, warmup_iters: int = 3, compile: bool = False, arena=None,
-                 before_capture=None, data_parallel=None):
+                 before_capture=None, data_parallel=None, after_attach=None):
         self.model, self.opt = model, optimizer
         self.rep = data_parallel if data_parallel is not None and data_parallel.world > 1 else None
         if self.rep is None and optimizer.sharding is not None:
@@ -246,6 +246,9 @@ class StepEngine:
         self.arena = arena if arena is not None else Arena()          # the trainer's: memory it already holds
         if self.rep is not None:
             self.rep.attach(model, optimizer, self.arena.stream, overwrite=bool(self.first), fused=self.fused)
+        if after_attach is not None:                                 # the replicas' memory outside the allocator (the
+            after_attach()                                           # reduction's staging, the bf16 buffers) is taken:
+                                                                     # the trainer holds the rest of the GPU now
         self.sharding = optimizer.sharding                           # the split the graphs are captured for
         self.bf16_at = optimizer.bf16_buffers()                      # and the bf16 buffers they read and write
         self._capture(warmup_iters, before_capture)

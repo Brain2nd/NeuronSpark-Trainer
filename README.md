@@ -214,6 +214,15 @@ start.  The schedule only grows at its end.
   so far: the long rows' allocations are larger than any of a training step's).
 * **One line per GPU.** The GPU lease is the trainer's: between a trainer's crash and its relaunch (seconds) another
   line's supervisor waiting for the GPU may take it.  Lines that share a GPU wait for each other; none has priority.
+* **A line on several GPUs.** `NSTRAIN_GPUS=N` (with `CUDA_VISIBLE_DEVICES` naming at least N GPUs of one host) in the
+  environment of `nstrain run`: the trainer leads N data-parallel replicas of the step (`nstrain.replicas`,
+  `nstrain.data_parallel`), one follower process per further GPU, each running 1 / N of an update's micro-batches;
+  the gradients are summed inside the step.  The line's settings do not change (the same tokens per update, the same
+  micro-batch rows; an update's micro-batches must divide by N), and a checkpoint holds the whole state whatever N
+  wrote it: a line continues on another N.  Before every checkpoint the replicas are compared bit for bit (a
+  difference ends the run before anything is written), and before the first update of a start their loss on one
+  micro-batch.  `NSTRAIN_REPLICA_CPUS="0-47,96-143;48-95,144-191"` puts each replica on the CPUs of its GPU's NUMA
+  node.  Not beside other processes (`guards.share_reserve_gb`) and not with the moving average (`ema`).
 
 ## Recovery
 
